@@ -1,0 +1,31 @@
+# build products / kernel trees
+linux-*/
+kernel/
+*.o
+*.ko
+*.cmd
+*.mod
+*.mod.c
+*.dtb
+*.img
+bootimg-*/
+
+# blobs and dumps (never publish: vendor-signed or device-unique)
+fw/
+images/
+device-backup/
+debug-backup/
+vendor-extract/
+*.mbn
+*.mdt
+*.b0*
+
+# logs and captures
+logs/
+*.log
+*.out
+pstore*.raw
+core.*
+*.wav
+*.png
+!docs/glissando-keyboard-2026-10-28.png
