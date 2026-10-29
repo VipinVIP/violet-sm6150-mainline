@@ -1,0 +1,1855 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/*
+ * Xiaomi Redmi Note 7 Pro (violet)
+ *
+ * SM6150 / Snapdragon 675 — internal MSM codename "Talos", which is the name
+ * mainline uses for this SoC (shared with QCS615).  So the SoC description is
+ * arch/arm64/boot/dts/qcom/talos.dtsi and this file only has to describe the
+ * *board*.
+ *
+ * Status (mainline 7.2.10, booted via kexec from the downstream kernel):
+ *   [x] reserved memory (ramoops console, GPU PIL region)
+ *   [x] console on uart0, eMMC, USB peripheral (high-speed only, QUSB2 PHY)
+ *   [x] GPU: Adreno 612 renders (RGMU, zap shader), needs
+ *       msm.separate_gpu_kms=1 (keeps the GPU a separate DRM device)
+ *   [~] PMIC rails: values from the vendor tables, only consumers modelled
+ *   [x] display chain: DSI PHY + NT36672A "shenchao" panel + WLED, DSI-1
+ *       connected 1080x2340, picture confirmed working (panel repaired 2026-10-25);
+ *       WLED must carry qcom,num-strings = <2> or the backlight OVP IRQ storms
+ *       at ~1150/s for as long as the panel is lit
+ *   [x] touchscreen: novatek @ i2c 0x01 (0x62 is the HW command window)
+ *   [x] GPU: Adreno 612 via freedreno (FD612), devfreq 435-845 MHz
+ *   [x] eMMC: 8-bit, non-removable, no CQE, HS200
+ *   [ ] audio (WCD9375 + AudioReach), camera, sensors, modem
+ *   [~] wifi (WCN3990 via ath10k_snoc): nodes added, needs the module +
+ *       ath10k firmware; see the notes at the end of this file
+ *   [!] known bug: a real graphical session (login) hard-locks the SoC after
+ *       ~30-40 s.  Storage, GPU runtime-PM, CPUs 5-7 and the WLED storm have
+ *       all been eliminated; the display frame-done IRQ stops being delivered.
+ *
+ * TZ/xPU quirks that shaped this file: the first four TLMM pins and the QoS
+ * registers of aggre1_noc hang the CPU when touched (see the notes at the
+ * bottom), and Linux must not enable the TZ SHM bridge on this SoC.
+ */
+
+/dts-v1/;
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/input/input.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/iio/qcom,spmi-vadc.h>
+#include <dt-bindings/regulator/qcom,rpmh-regulator.h>
+#include <dt-bindings/firmware/qcom,scm.h>
+#include <dt-bindings/soc/qcom,apr.h>
+#include <dt-bindings/sound/qcom,q6afe.h>
+#include <dt-bindings/sound/qcom,q6asm.h>
+
+#include "talos.dtsi"
+#include "pm6150.dtsi"
+#include "pm6150l.dtsi"
+
+/ {
+	model = "Xiaomi Redmi Note 7 Pro";
+	compatible = "xiaomi,violet", "qcom,sm6150";
+	chassis-type = "handset";
+
+	/*
+	 * The bootloader supplies and fills RAM.  Two measured facts:
+	 *  - the vendor DTB that boots has a node named exactly "memory" (NO unit
+	 *    address) with a zero/placeholder size, and ABL fills it in.
+	 *  - mainline's talos.dtsi names it "memory@80000000" and comments
+	 *    "We expect the bootloader to fill in the size" -- the u-boot convention.
+	 * ABL looks the node up by NAME, so "memory@80000000" is not found and
+	 * neither is no node at all: both make it refuse the image.  Measured:
+	 *  - zero-size memory@80000000  -> refused
+	 *  - no memory node at all      -> refused
+	 * So use the vendor's exact name and let ABL fill it.
+	 */
+	/delete-node/ memory@80000000;
+
+	memory {
+		device_type = "memory";
+		reg = <0 0x80000000 0 0>;
+	};
+
+	aliases {
+		serial0 = &uart0;
+		mmc0 = &sdhc_1;
+	};
+
+	chosen {
+		stdout-path = "serial0:115200n8";
+	};
+
+	/*
+	 * talos.dtsi references both of these; the board has to provide them.
+	 * The standard SM6150 pair, exactly as the QCS615 EVK declares them.
+	 */
+	clocks {
+		sleep_clk: sleep-clk {
+			compatible = "fixed-clock";
+			clock-frequency = <32000>;
+			#clock-cells = <0>;
+		};
+
+		xo_board_clk: xo-board-clk {
+			compatible = "fixed-clock";
+			clock-frequency = <38400000>;
+			#clock-cells = <0>;
+		};
+	};
+};
+
+/*
+ * violet's OWN reserved-memory map.  The QCS615 EVK puts pil_gpu_mem at
+ * 0x97715000; violet's is at 0x97115000, so the SoC node has to be overridden
+ * (a wrong address here hands the zap/GPU region over to the allocator).
+ * The remaining remoteproc regions follow in later iterations.
+ */
+&{/reserved-memory} {
+	/delete-node/ pil-gpu@97715000;
+
+	ramoops: ramoops@a1600000 {
+		compatible = "ramoops";
+		reg = <0x0 0xa1600000 0x0 0x800000>;
+		/*
+		 * record-size is what makes a panic produce dmesg-ramoops-N.
+		 * Without it only console-ramoops-0 exists, so a hard reset or
+		 * a panic leaves no kernel log behind (STATUS.md, "Crash
+		 * evidence").  2 MB console + 1 MB pmsg + 1 MB record of the
+		 * 8 MB region leaves headroom.
+		 */
+		record-size = <0x100000>;
+		console-size = <0x200000>;
+		pmsg-size = <0x100000>;
+	};
+
+	pil_gpu_mem: pil-gpu@97115000 {
+		reg = <0x0 0x97115000 0x0 0x2000>;
+		no-map;
+	};
+};
+
+/*
+ * ---------------------------------------------------------------------------
+ * Nodes this device's bootloader patches BY NAME.
+ *
+ * Qualcomm ABL edits the boot image's DTB on every boot: it fills the memory
+ * map, records "removed" memory, writes the Android firmware metadata and the
+ * imem fields.  Violet's vendor DTB -- the one ABL actually boots -- carries all
+ * of these; mainline's soc DTS does not.  Measured: with the arm64 header fully
+ * matched, __symbols__ present and a dtbo that applies cleanly, ABL still
+ * refuses our DTB, which is why the missing vendor nodes are the prime suspect.
+ *
+ * Names, compatible strings and addresses are copied verbatim from violet's own
+ * vendor DTB (read back off the device).  Regions that mainline's talos.dtsi
+ * already declares under a different name are left alone: an extra reservation
+ * costs a little RAM and is harmless, while a missing node ABL expects is fatal.
+ * ---------------------------------------------------------------------------
+ */
+&{/reserved-memory} {
+	hyp_region@85700000 {
+		compatible = "removed-dma-pool";
+		no-map;
+		reg = <0x0 0x85700000 0x0 0x600000>;
+	};
+
+	xbl_aop_mem@85e00000 {
+		compatible = "removed-dma-pool";
+		no-map;
+		reg = <0x0 0x85e00000 0x0 0x140000>;
+	};
+
+	sec_apps_region@85fff000 {
+		compatible = "removed-dma-pool";
+		no-map;
+		reg = <0x0 0x85fff000 0x0 0x1000>;
+	};
+
+	/* ABL keeps its "removed memory" record here; 45 MB, the largest gap */
+	removed_region@86200000 {
+		compatible = "removed-dma-pool";
+		no-map;
+		reg = <0x0 0x86200000 0x0 0x2d00000>;
+	};
+
+	camera_region@8ab00000 {
+		compatible = "removed-dma-pool";
+		no-map;
+		reg = <0x0 0x8ab00000 0x0 0x500000>;
+	};
+
+	modem_mem: modem@8b000000 {
+		compatible = "removed-dma-pool";
+		no-map;
+		reg = <0x0 0x8b000000 0x0 0x7e00000>;
+	};
+
+	/*
+	 * IPA firmware / GSI carve-outs (vendor ipa_fw_region@97100000 and
+	 * ipa_gsi_region@97110000).  With "modem-init" the modem loads the GSI
+	 * firmware itself and writes here; if the kernel owns this memory the
+	 * modem corrupts it and the SoC resets ~16 s after "modem is now up".
+	 */
+	ipa_fw_mem: ipa-fw@97100000 {
+		reg = <0x0 0x97100000 0x0 0x10000>;
+		no-map;
+	};
+
+	ipa_gsi_mem: ipa-gsi@97110000 {
+		reg = <0x0 0x97110000 0x0 0x5000>;
+		no-map;
+	};
+
+	/*
+	 * rmtfs shared memory.  The modem asks the AP for files (its own
+	 * firmware tiles, calibration, the WLAN board data) through this
+	 * region via the rmtfs daemon.  The vendor allocates it DYNAMICALLY
+	 * (qcom,sharedmem-uio reg = <0 size> means "allocate"), so there is no
+	 * vendor address; the earlier "rmtfs@0" at physical address 0 was
+	 * not DRAM at all.  This one is real RAM just above ramoops, with the
+	 * usual guard pages (Fairphone 4 pattern) and the MSS_MSA VMID.
+	 */
+	rmtfs_mem: rmtfs@a1e00000 {
+		compatible = "qcom,rmtfs-mem";
+		reg = <0x0 0xa1e00000 0x0 0x280000>;
+		no-map;
+		qcom,client-id = <1>;
+		qcom,vmid = <QCOM_SCM_VMID_MSS_MSA>;
+	};
+
+	wlan_msa_mem: wlan_msa_mem@93300000 {
+		compatible = "removed-dma-pool";
+		no-map;
+		/*
+		 * 2 MB, exactly the vendor's own carve-out
+		 * (dt/ref/violet-sm6150-memory.dtsi: 0x93300000 + 0x200000).
+		 *
+		 * This used to be 1 MB with a note saying pil-video@93400000
+		 * would overlap it - but that is talos' map, not violet's.
+		 * Violet puts video at 0x92e00000 and the next region after
+		 * the MSA starts at 0x93500000 (cdsp), so the full 2 MB is
+		 * free.  A truncated MSA is a wrong memory map handed to the
+		 * WLAN firmware.
+		 */
+		reg = <0x0 0x93300000 0x0 0x200000>;
+	};
+
+	/*
+	 * The ADSP/CDSP/IPA carve-outs that used to be declared here duplicated
+	 * (at different addresses) the ones talos.dtsi already defines -
+	 * rproc-cdsp@93b00000, rproc-adsp@95900000 - and the overlaps made the
+	 * kernel drop the regions.  rproc_adsp_mem@95900000 is the one
+	 * remoteproc_adsp references, so keep upstream's and drop these.
+	 */
+
+	qseecom_region@9e400000 {
+		compatible = "shared-dma-pool";
+		no-map;
+		reg = <0x0 0x9e400000 0x0 0x1400000>;
+	};
+
+	cdsp_sec_mem@9f800000 {
+		compatible = "removed-dma-pool";
+		no-map;
+		reg = <0x0 0x9f800000 0x0 0x1e00000>;
+	};
+
+	cont_splash_region@9c000000 {
+		reg = <0x0 0x9c000000 0x0 0xf00000>;
+	};
+
+	dfps_data_region@9d000000 {
+		reg = <0x0 0x9d000000 0x0 0x100000>;
+	};
+
+	disp_rdump_region@9d100000 {
+		reg = <0x0 0x9d100000 0x0 0x1000000>;
+	};
+};
+
+/*
+ * imem: mainline declares sram@14680000; violet's is qcom,msm-imem@146aa000 and
+ * the vendor DTB exposes the sub-blocks ABL and the Android bootloader use
+ * (restart reason, boot stats, KASLR offset, the PIL/dload scratch areas).
+ */
+&soc {
+	qcom_msm_imem: imem@146aa000 {
+		compatible = "qcom,msm-imem";
+		/* mainline's /soc is 2 address + 2 size cells */
+		reg = <0x0 0x146aa000 0x0 0x1000>;
+		ranges = <0x0 0x0 0x146aa000 0x1000>;
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		imem_mem_dump_table: mem_dump_table@10 {
+			compatible = "qcom,msm-imem-mem_dump_table";
+			reg = <0x10 0x8>;
+		};
+
+		imem_restart_reason: restart_reason@65c {
+			compatible = "qcom,msm-imem-restart_reason";
+			reg = <0x65c 0x4>;
+		};
+
+		imem_dload_type: dload_type@1c {
+			compatible = "qcom,msm-imem-dload-type";
+			reg = <0x1c 0x4>;
+		};
+
+		imem_boot_stats: boot_stats@6b0 {
+			compatible = "qcom,msm-imem-boot_stats";
+			reg = <0x6b0 0x20>;
+		};
+
+		imem_kaslr_offset: kaslr_offset@6d0 {
+			compatible = "qcom,msm-imem-kaslr_offset";
+			reg = <0x6d0 0xc>;
+		};
+
+		imem_pil: pil@94c {
+			compatible = "qcom,msm-imem-pil";
+			reg = <0x94c 0xc8>;
+		};
+
+		imem_diag_dload: diag_dload@c8 {
+			compatible = "qcom,msm-imem-diag-dload";
+			reg = <0xc8 0xc8>;
+		};
+	};
+};
+
+/*
+ * ABL writes the Android firmware metadata into /firmware/android on every boot
+ * (the "boot_devices", vbmeta parts and fstab).  Violet's vendor DTB has it;
+ * mainline's does not.
+ */
+&{/firmware} {
+	android {
+		compatible = "android,firmware";
+
+		boot_devices = "soc/7c4000.sdhci";
+
+		vbmeta {
+			compatible = "android,vbmeta";
+			parts = "vbmeta,boot,recovery,system,vendor,dtbo";
+		};
+
+		fstab {
+			compatible = "android,fstab";
+
+			vendor {
+				compatible = "android,vendor";
+				dev = "/dev/block/platform/soc/1d84000.ufshc/by-name/vendor";
+				type = "ext4";
+				mnt_flags = "ro,barrier=1,discard";
+				fsmgr_flags = "wait,slotselect,avb";
+				status = "disabled";
+			};
+		};
+	};
+};
+
+/* the debug UART: serial@880000, matching violet's downstream earlycon */
+&uart0 {
+	status = "okay";
+};
+
+/*
+ * eMMC.  violet's vendor DT declares no vmmc/vddio for sdhc_1 at all -- the
+ * rails are left enabled by the bootloader -- and mainline treats those supplies
+ * as optional, so the node does not need them.
+ *
+ * It does need the two properties the EVK-oriented talos.dtsi leaves to the
+ * board, and their absence was not harmless: without bus-width the controller
+ * runs 1-bit, and without non-removable mmc treats the eMMC as a removable
+ * card, so a command timeout takes the rescan/re-init path instead of retrying.
+ * Under write load (a login) that produced
+ *   mmc0: Timeout waiting for hardware cmd interrupt
+ * followed by an RCU stall, a CPU pinned with IRQs off, and a system-wide hang.
+ * The vendor DT has qcom,bus-width = <8> and qcom,nonremovable.
+ */
+&sdhc_1 {
+	status = "okay";
+	bus-width = <8>;
+	non-removable;
+
+	/*
+	 * With 8-bit enabled the controller also advertised and initialised the
+	 * Command Queue Engine, and the freeze got *worse*: it arrived ~21 s
+	 * after login instead of ~60 s, with no console output at all (the
+	 * pstore dump ends at 33 s, so printk had already stopped).  CQE was
+	 * never active in the broken 1-bit configuration, so it is the new
+	 * variable - drop it for now.
+	 */
+	/delete-property/ supports-cqe;
+
+	/*
+	 * And let the bus run at its proper HS200 clock.  Do NOT cap this with
+	 * max-frequency: the mmc core still selects HS200 mode (host capability,
+	 * not DT-controlled), so capping the clock to 52 MHz leaves the
+	 * controller running HS200 *timing* at a quarter of the frequency it
+	 * requires - an out-of-spec combination that produces data errors and
+	 * command timeouts.  Observed: deaths right after adding the cap came at
+	 * 107 s / 77 s / 155 s, versus 321 s without it.
+	 */
+};
+
+/*
+ * The Adreno 612.  Everything it needs is already in talos.dtsi (gpucc core
+ * clock, RPMHPD_CX, adreno_smmu, the mobile OPP table 845..290 MHz), so the
+ * board only has to turn it on.  Firmware to have in /lib/firmware:
+ *   a612_rgmu.bin, a630_sqe.fw  (mainline names, both installed already)
+ *   the signed zap -- the single-file .mbn form mainline requests is the
+ *   ROM's a612_zap.elf (already extracted from violet's own vendor image)
+ */
+/*
+ * QCS615/SM6150 GCC GDSCs are backed by the RPMh CX rail.  Without this link a
+ * consumer of a GCC-provided GDSC can enable its local domain without the CX
+ * vote ever being held, which is why GPUCC's parents (GPLL0 and
+ * GCC_GPU_GPLL0_DIV_CLK_SRC) come up dead and gpu_cc_gx_gfx3d_clk_src reports
+ * "RCG did not turn on" at 0.234s.  Upstream added this property in commit
+ * 5ad7eb6a944e, which is newer than our 7.2.10 base.
+ */
+&gcc {
+	power-domains = <&rpmhpd RPMHPD_CX>;
+};
+
+&gpu {
+	status = "okay";
+};
+
+/*
+ * mainline requires the zap firmware name to come from the DT for new targets
+ * ("the firmware is signed with a (potentially) device specific key, having the
+ * name come from gpulist was a bad idea").  request_firmware_direct() uses this
+ * string verbatim -- no qcom/ fallback probing.
+ *
+ * Install the DEVICE-SIGNED single-file zap at /lib/firmware/qcom/a612_zap.mbn:
+ * that is the ROM's a612_zap.elf (14240 B).  Do NOT use the upstream
+ * linux-firmware qcs615 blob (14256 B) -- it is signed for a sibling part and
+ * TrustZone rejects it, which is measured behaviour on this device.
+ */
+&gpu_zap_shader {
+	firmware-name = "qcom/a612_zap.mdt";
+};
+
+/*
+ * RPMh regulators live under the applications RSC, not the SPMI bus.
+ * `qcom,pmic-id` is the PMIC's SPMI USID as a letter: pm6150 -> "a", pm6150l -> "e".
+ * Child node names must be the vreg resource names from
+ * qcom-rpmh-regulator.c (RPMH_VREG("ldo1", ...) etc.).
+ * Values below are violet's, from the vendor sm6150-regulator.dtsi.
+ */
+&apps_rsc {
+	regulators-0 {
+		compatible = "qcom,pm6150-rpmh-regulators";
+		qcom,pmic-id = "a";
+
+		vreg_l1a_1p2: ldo1 {
+			regulator-min-microvolt = <1200000>;
+			regulator-max-microvolt = <1252000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l2a_1p0: ldo2 {
+			regulator-min-microvolt = <1000000>;
+			regulator-max-microvolt = <1050000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l3a_1p0: ldo3 {
+			regulator-min-microvolt = <1000000>;
+			regulator-max-microvolt = <1060000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l4a_0p8: ldo4 {
+			regulator-min-microvolt = <925000>;	/* DSI PHY: r10 runs it at 925 mV */
+			regulator-max-microvolt = <975000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l5a_2p5: ldo5 {
+			regulator-min-microvolt = <2500000>;
+			regulator-max-microvolt = <2970000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l6a_0p6: ldo6 {
+			regulator-min-microvolt = <600000>;
+			regulator-max-microvolt = <650000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l9a_0p4: ldo9 {
+			regulator-min-microvolt = <400000>;
+			regulator-max-microvolt = <728000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l10a_1p8: ldo10 {
+			regulator-min-microvolt = <1800000>;
+			regulator-max-microvolt = <1829000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l11a_1p8: ldo11 {
+			regulator-min-microvolt = <1800000>;
+			regulator-max-microvolt = <1890000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l12a_1p8: ldo12 {
+			regulator-min-microvolt = <1800000>;
+			regulator-max-microvolt = <1950000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l13a_1p8: ldo13 {
+			regulator-min-microvolt = <1800000>;
+			regulator-max-microvolt = <1900000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l14a_1p8: ldo14 {
+			regulator-min-microvolt = <1800000>;
+			regulator-max-microvolt = <1850000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l15a_1p8: ldo15 {
+			regulator-min-microvolt = <1800000>;
+			regulator-max-microvolt = <1900000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l16a_2p4: ldo16 {
+			regulator-always-on;
+			regulator-min-microvolt = <2430000>;
+			regulator-max-microvolt = <2970000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l17a_3p0: ldo17 {
+			regulator-always-on;
+			regulator-min-microvolt = <3000000>;
+			regulator-max-microvolt = <3230000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l18a_3p0: ldo18 {
+			regulator-always-on;
+			regulator-min-microvolt = <3000000>;
+			regulator-max-microvolt = <3008000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l19a_2p7: ldo19 {
+			regulator-always-on;
+			regulator-min-microvolt = <2700000>;
+			regulator-max-microvolt = <3008000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+	};
+
+	regulators-1 {
+		compatible = "qcom,pm6150l-rpmh-regulators";
+		qcom,pmic-id = "c";
+
+		vreg_s1e_1p1: smps1 {
+			regulator-min-microvolt = <1128000>;
+			regulator-max-microvolt = <1128000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_s2e_0p3: smps2 {
+			regulator-min-microvolt = <348000>;
+			regulator-max-microvolt = <648000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_s8e_1p2: smps8 {
+			regulator-min-microvolt = <1200000>;
+			regulator-max-microvolt = <1400000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l1e_1p8: ldo1 {
+			regulator-min-microvolt = <1800000>;
+			regulator-max-microvolt = <1900000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l2e_1p3: ldo2 {
+			regulator-min-microvolt = <1304000>;
+			regulator-max-microvolt = <1304000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l3e_1p2: ldo3 {
+			regulator-min-microvolt = <1232000>;
+			regulator-max-microvolt = <1260000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l4e_1p6: ldo4 {
+			regulator-min-microvolt = <1650000>;
+			regulator-max-microvolt = <2950000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l5e_1p6: ldo5 {
+			regulator-min-microvolt = <1650000>;
+			regulator-max-microvolt = <2950000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l6e_1p6: ldo6 {
+			regulator-min-microvolt = <1650000>;
+			regulator-max-microvolt = <3100000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		/* violet overrides this one: always-on, HPM */
+		vreg_l7e_3p0: ldo7 {
+			regulator-min-microvolt = <3000000>;
+			regulator-max-microvolt = <3312000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+			regulator-always-on;
+		};
+
+		vreg_l8e_1p8: ldo8 {
+			regulator-min-microvolt = <1800000>;
+			regulator-max-microvolt = <1900000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l9e_2p9: ldo9 {
+			regulator-always-on;
+			regulator-min-microvolt = <2950000>;
+			regulator-max-microvolt = <3312000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l10e_3p2: ldo10 {
+			regulator-always-on;
+			regulator-min-microvolt = <3200000>;
+			regulator-max-microvolt = <3312000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l11e_2p9: ldo11 {
+			regulator-min-microvolt = <2950000>;
+			regulator-max-microvolt = <3312000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_bob: bob {
+			regulator-min-microvolt = <3296000>;
+			regulator-max-microvolt = <3960000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+	};
+};
+
+/*
+ * USB (peripheral only).  violet wires the high-speed QUSB2 PHY alone: the vendor
+ * tree sets maximum-speed = "high-speed" and disables usb_qmp_phy.  Supplies are the
+ * vendor's: vdd = pm6150 L4, vdda18 = L11, vdda33 = L17.
+ */
+&usb_1_hsphy {
+	vdd-supply = <&vreg_l4a_0p8>;
+	vdda-pll-supply = <&vreg_l11a_1p8>;
+	vdda-phy-dpdm-supply = <&vreg_l17a_3p0>;
+
+	status = "okay";
+};
+
+&usb_1 {
+	dr_mode = "peripheral";
+	maximum-speed = "high-speed";
+	phys = <&usb_1_hsphy>;
+	phy-names = "usb2-phy";
+	qcom,select-utmi-as-pipe-clk;
+
+	status = "okay";
+};
+
+/*
+ * Probing aggre1_noc hangs the CPU on its first QoS register write (kexec test, run 9-10:
+ * PROBE-START 1700000.interconnect never returns).  With no clocks the driver skips QoS
+ * programming (qos_requires_clocks), which is what we want: the bootloader/downstream
+ * already configured QoS, and Linux writes to these registers are not safe on this firmware.
+ */
+&aggre1_noc {
+	/delete-property/ clocks;
+};
+
+/* TZ-protected pins found by tlmm-bisect.sh (reads hang the CPU) */
+&tlmm {
+	gpio-reserved-ranges = <0 4>;
+
+	/*
+	 * CNSS_WLAN_EN is TLMM gpio98 on violet (vendor pinctrl
+	 * cnss_wlan_en_active / _sleep: function gpio, drive-strength 16 / 2).
+	 * The vendor cnss driver raises this before the WCN3990 boot ROM runs.
+	 * Mainline's ath10k snoc has no enable-gpio property, and without the
+	 * pin asserted the chip never powers up: every WLAN_CE interrupt count
+	 * stays zero, no firmware is requested, and no wlan0 appears - which is
+	 * exactly what we measured on 2026-10-25.  Hog it high so the chip is
+	 * enabled for the whole boot.
+	 */
+	wlan_en_hog: wlan-en-hog {
+		gpio-hog;
+		gpios = <98 GPIO_ACTIVE_HIGH>;
+		output-high;
+		line-name = "cnss-wlan-en";
+	};
+};
+
+
+/*
+ * TrustZone PAS (zap shader) authentication needs a DDR bandwidth vote on behalf of the
+ * crypto engine: the downstream pil-tz does scm_pas_enable_bw() before PAS_INIT_IMAGE, and
+ * without it TZ returns 0xffcfffbb (-3145797) -> -EINVAL.  Mainline models that vote as the
+ * scm node's interconnect path.
+ */
+&{/firmware/scm} {
+	interconnects = <&aggre1_noc MASTER_CRYPTO QCOM_ICC_TAG_ALWAYS
+			 &mc_virt SLAVE_EBI1 QCOM_ICC_TAG_ALWAYS>;
+};
+
+/*
+ * Display: DPU -> DSI0 (4 lanes, video mode) -> Novatek NT36672A "shenchao" panel.
+ *
+ * The panel's AVDD/AVEE come from the PM6150L LCDB (one module enable; the voltages
+ * stay as programmed by the bootloader).  Backlight is the PM6150L WLED.
+ */
+&mdss {
+	status = "okay";
+};
+
+&mdss_dsi0 {
+	/* DSI controller analog rail is PM6150L L3 (vendor "vdda-1p2", 1.232 V); L4A is the PHY's */
+	vdda-supply = <&vreg_l3e_1p2>;
+
+	status = "okay";
+
+	panel@0 {
+		compatible = "novatek,nt36672a-shenchao";
+		reg = <0>;
+
+		vddi-supply = <&vreg_l13a_1p8>;
+		avdd-supply = <&pm6150l_lcdb>;
+		avee-supply = <&pm6150l_lcdb>;
+
+		reset-gpios = <&tlmm 91 GPIO_ACTIVE_HIGH>;
+		backlight = <&pm6150l_wled>;
+
+		port {
+			panel_in: endpoint {
+				remote-endpoint = <&mdss_dsi0_out>;
+			};
+		};
+	};
+};
+
+&mdss_dsi0_out {
+	remote-endpoint = <&panel_in>;
+	data-lanes = <1 2 3 0>;
+};
+
+&mdss_dsi0_phy {
+	vcca-supply = <&vreg_l4a_0p8>;
+
+	status = "okay";
+};
+
+&pm6150l_wled {
+	qcom,current-limit-microamp = <25000>;
+	qcom,cabc;
+
+	/*
+	 * Mainline's WLED5 defaults are num_strings = 4 with enabled_strings
+	 * {0,1,2,3}.  violet's panel does not populate four strings, and driving
+	 * an enabled-but-open string makes the boost converter trip OVP in a
+	 * retry loop: measured 1150 wled_ovp_irq/s the whole time the panel is
+	 * lit (onset exactly at dpms On), ~2300 SPMI transactions/s on the bus
+	 * that carries every other PMIC interrupt.  Vendor DT leaves the string
+	 * count at the downstream default rather than asking for four.
+	 */
+	qcom,num-strings = <2>;
+
+	status = "okay";
+};
+
+&pm6150l_lsid5 {
+	/* LCD bias: the panel's AVDD/AVEE.  r10 switches it off before kexec. */
+	pm6150l_lcdb: regulator@ec00 {
+		compatible = "qcom,pm6150l-lcdb";
+		reg = <0xec00>;
+		regulator-name = "lcdb";
+	};
+};
+
+/*
+ * Touchscreen: Novatek NT36672A TDDI controller on QUP SE1 = i2c1 @ 0x884000.
+ * Values taken from the vendor DT node /soc/i2c@884000/novatek@62 on a working
+ * downstream boot: compatible "novatek,NVT-ts", reg 0x62, irq gpio 89,
+ * reset gpio 88.  The vendor node carries no supply properties (the rails are
+ * always-on in the vendor regulator setup), while mainline's novatek-nvt-ts
+ * requires both "vcc" and "iovcc" by name, hence the two fixed always-on
+ * regulators below.  Replace them with the real PMIC LDOs once identified;
+ * as written they only tell the driver "you are powered" and vote nothing.
+ */
+
+/* QUP wrappers are "disabled" in talos.dtsi; without these the i2c1 child below
+ * is never instantiated and no i2c adapter appears at all (the SoC file leaves the
+ * GENI wrapper off so boards opt in).  gpi_dma0 is the DMA engine i2c1's dmas point at.
+ */
+&gpi_dma0 {
+	status = "okay";
+};
+
+&qupv3_id_0 {
+	status = "okay";
+};
+
+&i2c1 {
+	status = "okay";
+	clock-frequency = <400000>;
+
+	touchscreen@1 {
+		/* ADDRESS 0x01, not 0x62. Oracle: the vendor driver's own header
+		 * (nvt_touch_f7b/nt36xxx.h) defines I2C_FW_Address 0x01 (the register map,
+		 * used for every data read/write including chip id) and I2C_HW_Address 0x62
+		 * (only the 2-byte hardware commands: 0x69 bootloader reset, 0xA5 idle).
+		 * Mainline reads its 0x78 parameter block at 0x62 and gets a clean NACK.
+		 * The vendor DT's reg=<0x62> is decorative: that driver hardcodes the address
+		 * per transfer and never looks at client->addr.
+		 */
+		/* A/B v2: supply rails are now forced always-on, so this isolates
+		 * the remaining difference from the working vendor kernel, which
+		 * leaves pin 88 MUX+GPIO UNCLAIMED (oracle: vendor pinctrl
+		 * debugfs) - mainline drives it as an output instead.
+		 */
+		compatible = "novatek,nt36672a-ts";
+		reg = <0x01>;
+		interrupt-parent = <&tlmm>;
+		interrupts = <89 IRQ_TYPE_EDGE_FALLING>;
+		/* ACTIVE_LOW on purpose: the controller is running with the RESET line HIGH
+	 * (vendor nt36xxx.c does gpio_set_value(reset_gpio, 1) on power-on), while
+	 * novatek-nvt-ts treats logical 0 as "out of reset" in nvt_ts_start().
+	 * ACTIVE_LOW therefore maps logical 0 -> physical HIGH, which is what the
+	 * hardware wants.  ACTIVE_HIGH leaves the chip held in reset.
+	 */
+		reset-gpios = <&tlmm 88 GPIO_ACTIVE_LOW>;
+		/* Rails taken from the r10-vs-mainline regulator diff, not guessed:
+		 * on the working vendor kernel pm6150l_l11 (2.95V) is enabled and it is
+		 * the only 2.9-3.1V rail that mainline leaves off (use=0), while
+		 * pm6150_l13 (1.8V) is what the vendor's commented-out
+		 * "vcc_i2c-supply" pointed at - i.e. the touch IO rail.
+		 */
+		/* Blueprint: mainline's working NT36672A port (sdm845-xiaomi-beryllium-tianma.dts)
+		 * feeds touch VCC from the PANEL BIAS rail ("lab" there), not from a generic PMIC
+		 * LDO.  On violet the panel bias is pm6150l LCDB (the panel's own avdd/avee), so the
+		 * controller has been on the wrong rail all along.  iovcc stays on the 1.8V DSI rail
+		 * (beryllium: vreg_l14a_1p8 = the same role).
+		 */
+		vcc-supply = <&pm6150l_lcdb>;
+		iovcc-supply = <&vreg_l13a_1p8>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&touch_reset_default &touch_irq_default>;
+	};
+};
+
+/* Touch reset/irq pins: the vendor tree leaves these to the default mux, but on mainline
+ * the reset line must be an explicit output driven low, otherwise the chip can be left
+ * held in reset and never ACKs on i2c (probe fails -110 at 0x78).
+ */
+&tlmm {
+	touch_reset_default: touch-reset-default-state {
+		/* high-Z on purpose: the working kernel has this pin MUX+GPIO
+		 * UNCLAIMED and the hardware pull decides the level.  No output
+		 * property and no bias == the same electrical state.
+		 */
+		pins = "gpio88";
+		function = "gpio";
+		bias-disable;
+	};
+
+	touch_irq_default: touch-irq-default-state {
+		pins = "gpio89";
+		function = "gpio";
+		bias-pull-up;
+	};
+};
+
+/*
+ * WCN3990 WiFi (ath10k_snoc)
+ * --------------------------
+ * mainline does not use a child WCSS remoteproc on this SoC generation: the MSA
+ * is carved out of a fixed reserved region and secured by the boot firmware, and
+ * ath10k brings the WCSS up itself (qcom,msa-fixed-perm), exactly like sc7180.
+ * Address, iommu SID, CE interrupt numbers and MSA size all come from the vendor
+ * icnss@18800000 node in base-sm6150.dtsi:
+ *   iommus = <&apps_smmu 0x1640 0x1>
+ *   interrupts = GIC SPI 414..425 (CE0..CE11) - note the GIC on this SoC takes
+ *                FOUR cells per interrupt (type, number, trigger, flags); with
+ *                three the parser mis-splits and only one IRQ registers, which
+ *                shows up as "-ENXIO: IRQ index 1 not found"
+ *   qcom,wlan-msa-memory = <0x100000>, qcom,wlan-msa-fixed-region = &wlan_msa_mem
+ *   the MSA region itself is the existing wlan_msa_mem@93300000 above (1 MB)
+ * The vendor also listed four supplies (pm6150_l9 = cx-mx, pm6150l_l1 = 1.8 xo,
+ * pm6150l_l2 = 1.3 rfa, pm6150l_l10 = 3.3 ch0); mainline's pm6150* dtsi files do
+ * not model those LDOs, so they are left to the voltages the bootloader leaves on
+ * until a regulator node exists for them.
+ *
+ * Required userspace bits (the kernel has ATH10K_SNOC as a module and there is
+ * currently no /lib/modules tree for this kernel on the device):
+ *   /lib/firmware/ath10k/WCN3990/hw1.0/firmware-5.bin
+ *   /lib/firmware/ath10k/WCN3990/hw1.0/board-2.bin
+ */
+&soc {
+	wifi@18800000 {
+		compatible = "qcom,wcn3990-wifi";
+		reg = <0x0 0x18800000 0x0 0x800000>;
+		reg-names = "membase";
+
+		iommus = <&apps_smmu 0x1640 0x1>;
+
+		/*
+		 * The WCN3990 is a discrete chip on SNOC: these four rails must be
+		 * actually enabled or the chip's boot ROM never runs and everything
+		 * on the QMI side simply never happens (silently - ath10k registers
+		 * its QMI client and waits forever).  Mapping and voltages are the
+		 * vendor's: pm6150_l9 = cx-mx, pm6150l_l1 = 1.8 XO,
+		 * pm6150l_l2 = 1.3 RFA, pm6150l_l10 = 3.3 CH0.
+		 * There is no vdd-3.3-ch1 on this board.
+		 */
+		vdd-0.8-cx-mx-supply = <&vreg_l9a_0p6>;
+		vdd-1.8-xo-supply = <&vreg_l1c_1p8>;
+		vdd-1.3-rfa-supply = <&vreg_l2c_1p3>;
+		vdd-3.3-ch0-supply = <&vreg_l10c_3p3>;
+
+		interrupts = <GIC_SPI 414 IRQ_TYPE_LEVEL_HIGH 0>,
+			     <GIC_SPI 415 IRQ_TYPE_LEVEL_HIGH 0>,
+			     <GIC_SPI 416 IRQ_TYPE_LEVEL_HIGH 0>,
+			     <GIC_SPI 417 IRQ_TYPE_LEVEL_HIGH 0>,
+			     <GIC_SPI 418 IRQ_TYPE_LEVEL_HIGH 0>,
+			     <GIC_SPI 419 IRQ_TYPE_LEVEL_HIGH 0>,
+			     <GIC_SPI 420 IRQ_TYPE_LEVEL_HIGH 0>,
+			     <GIC_SPI 421 IRQ_TYPE_LEVEL_HIGH 0>,
+			     <GIC_SPI 422 IRQ_TYPE_LEVEL_HIGH 0>,
+			     <GIC_SPI 423 IRQ_TYPE_LEVEL_HIGH 0>,
+			     <GIC_SPI 424 IRQ_TYPE_LEVEL_HIGH 0>,
+			     <GIC_SPI 425 IRQ_TYPE_LEVEL_HIGH 0>;
+
+		memory-region = <&wlan_msa_mem>;
+		/* no qcom,msa-fixed-perm: let ath10k assign the MSA to MSS_MSA like icnss does */
+		/* violet's own bdwlan.bin, packed into board-2.bin under this variant name */
+		qcom,calibration-variant = "xiaomi_violet";
+
+		status = "okay";
+	};
+};
+
+/*
+ * RPMh regulators for the WLAN chip
+ * ---------------------------------
+ * mainline ships "qcom,pm6150-rpmh-regulators" and "qcom,pm6150l-rpmh-regulators"
+ * (drivers/regulator/qcom-rpmh-regulator.c) but no platform had described the
+ * PM6150/PM6150L rails, so ath10k's regulator_bulk_get() fell back to dummy
+ * regulators and the rails were never enabled.  Only the four rails the WCN3990
+ * needs are described here, with the vendor's own limits (base-sm6150-regulator.dtsi):
+ *   pm6150  ldo9 : cx-mx   400000-728000 (vendor init 400 mV, icnss raises it to 640 mV)
+ *   pm6150l ldo1 : 1.8 XO  1800000-1900000
+ *   pm6150l ldo2 : 1.3 RFA 1304000-1304000
+ *   pm6150l ldo10: 3.3 CH0 3200000-3312000
+ * The cx-mx minimum is raised to 640 mV because mainline's ath10k does not read
+ * the vendor's "qcom,vdd-0.8-cx-mx-config" property, so nothing else would ever
+ * ask for that voltage.
+ */
+&apps_rsc {
+	regulators-0 {
+		compatible = "qcom,pm6150-rpmh-regulators";
+		qcom,pmic-id = "a";
+
+		/* WCD9375: cdc-vdd-ldo-rxtx + cdc-vddpx-1 (vendor L10A) */
+		vreg_l10a_1p8: ldo10 {
+			regulator-min-microvolt = <1800000>;
+			regulator-max-microvolt = <1900000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_LPM>;
+		};
+
+		/* WCD9375: cdc-vdd-buck (vendor L15A) */
+		vreg_l15a_1p8: ldo15 {
+			regulator-min-microvolt = <1800000>;
+			regulator-max-microvolt = <1900000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_LPM>;
+		};
+
+		vreg_l9a_0p6: ldo9 {
+			/* the WCN3990's boot ROM must run before ath10k powers it */
+			regulator-always-on;
+			regulator-min-microvolt = <640000>;
+			regulator-max-microvolt = <728000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_LPM>;
+		};
+	};
+
+	regulators-1 {
+		compatible = "qcom,pm6150l-rpmh-regulators";
+		qcom,pmic-id = "c";
+
+		vreg_l1c_1p8: ldo1 {
+			/* the WCN3990's boot ROM must run before ath10k powers it */
+			regulator-always-on;
+			regulator-min-microvolt = <1800000>;
+			regulator-max-microvolt = <1900000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_LPM>;
+		};
+
+		vreg_l2c_1p3: ldo2 {
+			/* the WCN3990's boot ROM must run before ath10k powers it */
+			regulator-always-on;
+			regulator-min-microvolt = <1304000>;
+			regulator-max-microvolt = <1304000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_LPM>;
+		};
+
+		vreg_l10c_3p3: ldo10 {
+			/* the WCN3990's boot ROM must run before ath10k powers it */
+			regulator-always-on;
+			regulator-min-microvolt = <3200000>;
+			regulator-max-microvolt = <3312000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_LPM>;
+		};
+	};
+};
+
+/*
+ * ADSP (the audio/Sensor DSP)
+ * --------------------------
+ * talos.dtsi describes the node but leaves it disabled.  There is no
+ * "qcs615-adsp-pas" in qcom_q6v5_pas.c, so it binds via the second compatible,
+ * "qcom,sm8150-adsp-pas" -> sm8150_adsp_resource, whose firmware name is
+ * "adsp.mdt" - i.e. the SPLIT images (adsp.mdt + adsp.bNN) rather than a
+ * squashed .mbn.  The stock modem partition ships exactly that set, so copy
+ * adsp.mdt/adsp.b* to /lib/firmware/qcom/qcs615/ on the device.
+ */
+/*
+ * ADSP memory window
+ * ------------------
+ * The stock adsp image is RELOCATABLE (its segments carry the
+ * QCOM_MDT_RELOCATABLE flag), so the kernel has to tell TZ the window to load
+ * it into via qcom_scm_pas_mem_setup().  With talos.dtsi's address
+ * (0x95900000) that call came back -22, i.e. TZ refused the range; TZ only
+ * accepts the ADSP window the device was provisioned with, which is the
+ * vendor's: 0x95300000 + 0x1e00000 (ends at 0x97100000, immediately below the
+ * GPU zap shader at 0x97115000).
+ *
+ * CDSP is therefore pulled down to 0x93b00000 + 0x1800000 (24 MB - its stock
+ * firmware is 2.6 MB and we are not bringing CDSP up), so the two carve-outs
+ * stay adjacent and non-overlapping, exactly like the vendor map
+ * (cdsp 0x93500000-0x95300000, adsp 0x95300000-0x97100000).
+ */
+&rproc_cdsp_mem {
+	reg = <0x0 0x93b00000 0x0 0x1800000>;
+};
+
+&rproc_adsp_mem {
+	reg = <0x0 0x95300000 0x0 0x1e00000>;
+};
+
+&remoteproc_adsp {
+	firmware-name = "qcom/qcs615/adsp.mdt";
+	status = "okay";
+};
+
+/* ============================================================================
+ * AUDIO
+ * ----------------------------------------------------------------------------
+ * The stock ADSP firmware on this device speaks the LEGACY APR protocol: once
+ * remoteproc_adsp is up the glink edge offers "apr_audio_svc" (and apr_apps2),
+ * not AudioReach's "adsp_apps".  So this uses the q6core/q6afe/q6asm/q6adm
+ * stack, NOT q6apm, even though talos.dtsi (written for QCS615 boards with
+ * newer firmware) wires the AudioReach nodes.
+ *
+ * Hardware map taken from the vendor sm6150-audio-overlay.dtsi:
+ *   tx_macro@62ec0000 -> swr2 @ 0x62ed0000, irq SPI 137 (wake 623), rx slave 0x01170223
+ *   rx_macro@62ee0000 -> swr1 @ 0x62ef0000, irq SPI 138,            rx slave 0x01170224
+ *   wsa_macro@62f00000 -> swr0: disabled on violet (no WSA speaker amp)
+ *   wcd9375 reset = TLMM gpio 24 (vendor msm_cdc_pinctrl@24)
+ * ==========================================================================*/
+
+&glink_edge {
+	apr {
+		compatible = "qcom,apr-v2";
+		qcom,glink-channels = "apr_audio_svc";
+		qcom,domain = <APR_DOMAIN_ADSP>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		service@3 {
+			compatible = "qcom,q6core";
+			reg = <APR_SVC_ADSP_CORE>;
+		};
+
+		q6afe: service@4 {
+			compatible = "qcom,q6afe";
+			reg = <APR_SVC_AFE>;
+			/*
+			 * Upstream (and every in-tree SoC) declares
+			 *   qcom,protection-domain = "avs/audio", "msm/adsp/audio_pd";
+			 * here.  Adding it on violet makes q6afe defer forever: the PD
+			 * is never registered because there is no QRTR/servreg (see
+			 * docs/PROGRESS.md 14:40 and 15:40).  Without the property the
+			 * card and its PCMs come up; the AFE commands time out anyway.
+			 * Restore the property the moment PDR resolves.
+			 */
+
+			q6afedai: dais {
+				compatible = "qcom,q6afe-dais";
+				#address-cells = <1>;
+				#size-cells = <0>;
+				#sound-dai-cells = <1>;
+			};
+
+			q6afecc: clock-controller {
+				compatible = "qcom,q6afe-clocks";
+				#clock-cells = <2>;
+			};
+		};
+
+		q6asm: service@7 {
+			compatible = "qcom,q6asm";
+			reg = <APR_SVC_ASM>;
+			/* qcom,protection-domain: see q6afe note — PDR unavailable. */
+
+			q6asmdai: dais {
+				compatible = "qcom,q6asm-dais";
+				#address-cells = <1>;
+				#size-cells = <0>;
+				#sound-dai-cells = <1>;
+				/* vendor: &msm_audio_ion { iommus = <&apps_smmu 0x1721 0x0>; qcom,smmu-sid-mask = 0xf } */
+				iommus = <&apps_smmu 0x1721 0x0>;
+
+				/*
+				 * q6asm-dai builds its DAIs from DT children:
+				 * reg = the front-end DAI id, direction selects
+				 * which stream the DAI advertises.
+				 */
+				dai@0 {
+					reg = <MSM_FRONTEND_DAI_MULTIMEDIA1>;
+					direction = <Q6ASM_DAI_TX>;
+				};
+
+				dai@1 {
+					reg = <MSM_FRONTEND_DAI_MULTIMEDIA2>;
+					direction = <Q6ASM_DAI_TX>;
+				};
+
+				dai@2 {
+					reg = <MSM_FRONTEND_DAI_MULTIMEDIA3>;
+					direction = <Q6ASM_DAI_RX>;
+				};
+			};
+		};
+
+		q6adm: service@8 {
+			compatible = "qcom,q6adm";
+			reg = <APR_SVC_ADM>;
+
+			q6routing: routing {
+				compatible = "qcom,q6adm-routing";
+				#sound-dai-cells = <0>;
+			};
+		};
+	};
+};
+
+&soc {
+	/*
+	 * VA macro @0x62f20000 (vendor va-macro).  Its only job here is to
+	 * provide the "fsgen" clock: lpass-rx-macro/tx-macro call
+	 * devm_clk_get(dev, "fsgen") unconditionally and fail with -ENOENT
+	 * without it.
+	 */
+	vamacro: vamacro@62f20000 {
+		compatible = "qcom,sm8250-lpass-va-macro";
+		reg = <0x0 0x62f20000 0x0 0x2000>;
+
+		/*
+		 * audio test `nomacrovote`: the LPASS_HW_MACRO_VOTE clock is
+		 * gone from here too.  It was the last remaining consumer of
+		 * the ADSP clock-vote command at boot - va_macro probes first
+		 * and the vote times out (-110), which aborted va_macro, which
+		 * in turn kept txmacro/rxmacro/soundwire deferred forever.
+		 * "macro" and "dcodec" are optional in lpass-va-macro.c
+		 * (devm_clk_get_optional), so this costs us nothing on a device
+		 * whose WCD9375 path is parked anyway.  The question this test
+		 * answers: with no vote issued at boot, does the AFE answer
+		 * AFE_PARAM_ID_CLOCK_SET, or is it deaf regardless?
+		 */
+		clocks = <&q6afecc LPASS_CLK_ID_TX_CORE_MCLK LPASS_CLK_ATTRIBUTE_COUPLE_NO>;
+		clock-names = "mclk";
+
+		#clock-cells = <0>;
+		clock-output-names = "fsgen";
+		#sound-dai-cells = <1>;
+	};
+
+	txmacro: txmacro@62ec0000 {
+		compatible = "qcom,sm8250-lpass-tx-macro";
+		reg = <0x0 0x62ec0000 0x0 0x1000>;
+
+		clocks = <&q6afecc LPASS_CLK_ID_TX_CORE_MCLK LPASS_CLK_ATTRIBUTE_COUPLE_NO>,
+			 <&q6afecc LPASS_CLK_ID_TX_CORE_NPL_MCLK LPASS_CLK_ATTRIBUTE_COUPLE_NO>,
+			 <&vamacro>;
+		/*
+		 * The stock sm6150 ADSP firmware rejects the LPASS clock-VOTE
+		 * command mainline's q6afe-clocks sends for the "macro" and
+		 * "dcodec" clocks (cmd 0x100f4 -> "Unknown cmd", "AFE failed
+		 * to vote"), which aborted macro probe with -110.  Both are
+		 * optional in the driver, so they are deliberately left out.
+		 */
+		clock-names = "mclk", "npl", "fsgen";
+
+		#sound-dai-cells = <1>;
+		#clock-cells = <0>;
+		clock-output-names = "lpass-tx-mclk";
+	};
+
+	swr2: soundwire@62ed0000 {
+		compatible = "qcom,soundwire-v1.3.0";
+		reg = <0x0 0x62ed0000 0x0 0x2000>;
+		interrupts = <GIC_SPI 137 IRQ_TYPE_LEVEL_HIGH 0>;
+		clocks = <&txmacro>;
+		clock-names = "iface";
+		label = "TX";
+
+		#address-cells = <2>;
+		#size-cells = <0>;
+		#sound-dai-cells = <1>;
+
+		qcom,din-ports = <6>;
+		qcom,dout-ports = <1>;
+		/*
+		 * Port timing from Android's tx_frame_params_wcd937x - the WCD937x
+		 * TX table differs from the WCD938x one (si 3 instead of 31).
+		 */
+		qcom,ports-sinterval-low =	/bits/ 8 <0xff 0x03 0x03 0x03 0x03 0xff 0xff>;
+		qcom,ports-offset1 =	/bits/ 8 <0xff 0x01 0x02 0x01 0x00 0xff 0xff>;
+		qcom,ports-offset2 =	/bits/ 8 <0xff 0x00 0x00 0x00 0x00 0xff 0xff>;
+		qcom,ports-lane-control =	/bits/ 8 <0xff 0x00 0x00 0x00 0x00 0xff 0xff>;
+		qcom,ports-word-length =	/bits/ 8 <0xff 0xff 0xff 0xff 0xff 0xff 0xff>;
+		qcom,ports-block-pack-mode =	/bits/ 8 <0xff 0xff 0xff 0xff 0xff 0xff 0xff>;
+		qcom,ports-hstart =	/bits/ 8 <0xff 0xff 0xff 0xff 0xff 0xff 0xff>;
+		qcom,ports-hstop =	/bits/ 8 <0xff 0xff 0xff 0xff 0xff 0xff 0xff>;
+		qcom,ports-block-group-count =	/bits/ 8 <0xff 0xff 0xff 0xff 0xff 0xff 0xff>;
+
+		wcd937x_tx: codec@0,3 {
+			compatible = "sdw20217010a00";
+			reg = <0 3>;
+			#sound-dai-cells = <0>;
+			qcom,tx-port-mapping = <1 1 2 3>;
+			/* slave ports: adc1, adc2, adc3, mic0, dmic1, mbhc,
+			 * dmic2, dmic3, dmic4, dmic5, dmic6, dmic7
+			 */
+			qcom,tx-channel-mapping = /bits/ 8 <1 2 1 1 2 3 3 4 1 2 3 4>;
+		};
+	};
+
+	rxmacro: rxmacro@62ee0000 {
+		compatible = "qcom,sm8250-lpass-rx-macro";
+		reg = <0x0 0x62ee0000 0x0 0x1000>;
+
+		clocks = <&q6afecc LPASS_CLK_ID_RX_CORE_MCLK LPASS_CLK_ATTRIBUTE_COUPLE_NO>,
+			 <&q6afecc LPASS_CLK_ID_RX_CORE_NPL_MCLK LPASS_CLK_ATTRIBUTE_COUPLE_NO>,
+			 <&vamacro>;
+		/*
+		 * The stock sm6150 ADSP firmware rejects the LPASS clock-VOTE
+		 * command mainline's q6afe-clocks sends for the "macro" and
+		 * "dcodec" clocks (cmd 0x100f4 -> "Unknown cmd", "AFE failed
+		 * to vote"), which aborted macro probe with -110.  Both are
+		 * optional in the driver, so they are deliberately left out.
+		 */
+		clock-names = "mclk", "npl", "fsgen";
+
+		#sound-dai-cells = <1>;
+		#clock-cells = <0>;
+		clock-output-names = "lpass-rx-mclk";
+	};
+
+	swr1: soundwire@62ef0000 {
+		compatible = "qcom,soundwire-v1.3.0";
+		reg = <0x0 0x62ef0000 0x0 0x2000>;
+		interrupts = <GIC_SPI 138 IRQ_TYPE_LEVEL_HIGH 0>;
+		clocks = <&rxmacro>;
+		clock-names = "iface";
+		label = "RX";
+
+		#address-cells = <2>;
+		#size-cells = <0>;
+		#sound-dai-cells = <1>;
+
+		qcom,din-ports = <1>;
+		qcom,dout-ports = <6>;
+		/*
+		 * Port timing from the Android kona tables (kona-port-config.h
+		 * rx_frame_params_default) that the FP4 mainline bring-up used.
+		 * nports = din + dout = 7 on this master, so each array needs 7
+		 * entries - the driver indexes one byte per port and the two
+		 * unconfigured ports made the bus clash (MASTER_CLASH_DET).
+		 */
+		qcom,ports-sinterval-low =	/bits/ 8 <0x03 0x1f 0x1f 0x07 0x00 0xff 0xff>;
+		qcom,ports-offset1 =	/bits/ 8 <0x00 0x00 0x0b 0x01 0x00 0xff 0xff>;
+		qcom,ports-offset2 =	/bits/ 8 <0x00 0x00 0x0b 0x00 0x00 0xff 0xff>;
+		qcom,ports-hstart =	/bits/ 8 <0xff 0x03 0xff 0xff 0xff 0xff 0xff>;
+		qcom,ports-hstop =	/bits/ 8 <0xff 0x06 0xff 0xff 0xff 0xff 0xff>;
+		qcom,ports-word-length =	/bits/ 8 <0x01 0x07 0x04 0xff 0xff 0xff 0xff>;
+		qcom,ports-block-pack-mode =	/bits/ 8 <0xff 0x00 0x01 0xff 0xff 0xff 0xff>;
+		qcom,ports-lane-control =	/bits/ 8 <0x01 0x00 0x00 0x00 0x00 0xff 0xff>;
+		qcom,ports-block-group-count =	/bits/ 8 <0xff 0xff 0xff 0xff 0x00 0xff 0xff>;
+
+		wcd937x_rx: codec@0,4 {
+			compatible = "sdw20217010a00";
+			reg = <0 4>;
+			#sound-dai-cells = <0>;
+			qcom,rx-port-mapping = <1 2 3 4 5>;
+			/* slave ports: hph_l, hph_r, clsh, comp_l, comp_r,
+			 * lo, dsd_r, dsd_l
+			 */
+			qcom,rx-channel-mapping = /bits/ 8 <1 2 1 1 2 1 1 2>;
+		};
+	};
+};
+
+&{/} {
+	wcd9370: audio-codec {
+		compatible = "qcom,wcd9370-codec";
+		reset-gpios = <&tlmm 24 GPIO_ACTIVE_LOW>;
+
+		vdd-buck-supply = <&vreg_l15a_1p8>;
+		vdd-rxtx-supply = <&vreg_l10a_1p8>;
+		vdd-px-supply = <&vreg_l10a_1p8>;
+		vdd-mic-bias-supply = <&vreg_l10c_3p3>;
+
+		qcom,micbias1-microvolt = <1800000>;
+		qcom,micbias2-microvolt = <1800000>;
+		qcom,micbias3-microvolt = <1800000>;
+		qcom,micbias4-microvolt = <1800000>;
+
+		qcom,rx-device = <&wcd937x_rx>;
+		qcom,tx-device = <&wcd937x_tx>;
+
+		#sound-dai-cells = <1>;
+	};
+};
+
+&soc {
+	sound {
+		compatible = "qcom,sm8250-sndcard";
+		model = "Xiaomi Redmi Note 7 Pro";
+
+		/*
+		 * The MI2S pins were never muxed: talos.dtsi defines mi2s1_pins
+		 * (gpio108-111, function mi2s_1, drive 8, bias-disable) and
+		 * talos-evk puts it on the sound node, but we did not.  Driving
+		 * audio out of pins still in GPIO mode is one of the candidate
+		 * causes of the PMIC hard reset on stream start (audio test
+		 * audio1).  mi2s_mclk is deliberately NOT added: a TAS2563
+		 * clocks from BCLK, and gpio122/mclk2 may not be usable here.
+		 */
+		pinctrl-names = "default";
+		pinctrl-0 = <&mi2s1_pins>;
+
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		mm1-dai-link {
+			link-name = "MultiMedia1";
+			cpu {
+				sound-dai = <&q6asmdai MSM_FRONTEND_DAI_MULTIMEDIA1>;
+			};
+		};
+
+		mm2-dai-link {
+			link-name = "MultiMedia2";
+			cpu {
+				sound-dai = <&q6asmdai MSM_FRONTEND_DAI_MULTIMEDIA2>;
+			};
+		};
+
+		/*
+		 * MultiMedia3 is the only front-end whose Playback widget this
+		 * q6asm-dai instance actually registers (the debug trace shows
+		 * "adding MultiMedia1/2 Capture widget" but "MultiMedia3
+		 * Playback widget"), so give it a link and see if it yields a
+		 * playback PCM we can push a tone into.
+		 */
+		mm3-dai-link {
+			link-name = "MultiMedia3";
+			cpu {
+				sound-dai = <&q6asmdai MSM_FRONTEND_DAI_MULTIMEDIA3>;
+			};
+		};
+
+		/*
+		 * The WCD9375 path is parked: its SoundWire slaves go UNATTACHED
+		 * (see PLAN.md) and a codec that fails to probe takes the whole
+		 * card down with it.  Keep this link list working so we can make
+		 * noise through the speaker amp, which is plain I2S off the
+		 * LPASS primary MI2S and needs none of that machinery.
+		 */
+		spk-playback-dai-link {
+			link-name = "Speaker Playback";
+			cpu {
+				sound-dai = <&q6afedai PRIMARY_MI2S_RX>;
+			};
+			platform {
+				sound-dai = <&q6routing>;
+			};
+			codec {
+				sound-dai = <&tas2563>;
+			};
+		};
+
+		/*
+		 * Diagnostic-only BE: starts a real AFE MI2S port (SECONDARY) with
+		 * no codec at all, so ASoC uses the dummy DAI.  Routing MultiMedia3
+		 * here tells us whether an AFE port start alone can reset the PMIC,
+		 * with the TAS2563 nowhere in the path.
+		 */
+		dbg-playback-dai-link {
+			link-name = "Debug Playback";
+			cpu {
+				sound-dai = <&q6afedai QUATERNARY_MI2S_RX>;
+			};
+			platform {
+				sound-dai = <&q6routing>;
+			};
+			/*
+			 * qcom_snd_parse_of() treats a link without a codec as a
+			 * front end, so this BE never existed.  A dummy S/PDIF
+			 * transmitter makes it a real codec-less BE.
+			 */
+			codec {
+				sound-dai = <&dummy_codec>;
+			};
+		};
+
+	};
+};
+
+/*
+ * Speaker amplifier (TI TAS2563) on QUPv3 SE4 / i2c3, address 0x4c.
+ *
+ * The vendor node calls pin 22 "reset-gpio"; mainline's tas2562 driver takes an
+ * optional "shutdown" gpio and drives it with GPIOD_OUT_HIGH, i.e. out of
+ * shutdown, which is the state we want.  TAS2563 is register compatible with
+ * TAS2562, which is the compatible the mainline driver matches on.
+ *
+ * It is fed from the LPASS primary MI2S, so it needs no SoundWire and no
+ * WCD9375 - that is why it is the first path we try to make audible.
+ */
+/*
+ * Speaker amplifier (TI TAS2563), address 0x4c on QUPv3 *wrapper 1* / SE0
+ * (i2c@a80000).  The vendor calls this "SE4" and muxes it to gpio20/gpio21
+ * (function "qup10" downstream = "qup1" here); mainline's i2c4 node already
+ * defaults to exactly those pins, which is why the amp never answered when it
+ * was parked on i2c3 (wrapper 0) - that bus produced a clean NAK, and forcing
+ * the wrapper-1 pins onto the wrapper-0 controller produced a timeout.
+ *
+ * The vendor calls pin 22 "reset-gpio"; mainline's tas2562 driver takes an
+ * optional "shutdown" gpio and drives it GPIOD_OUT_HIGH (out of shutdown).
+ * TAS2563 is register compatible with TAS2562, which is what the driver matches.
+ */
+/*
+ * i2c4 lives in QUPv3 wrapper 1, which (and its GPI DMA) talos.dtsi leaves
+ * disabled.  Without these two the bus never probes and the card just sits in
+ * "codec dai not found" forever.
+ */
+/ {
+	/* Diagnostic dummy codec for the Debug Playback BE (AFE-only tests). */
+	dummy_codec: audio-codec-dummy {
+		compatible = "linux,spdif-dit";
+		#sound-dai-cells = <0>;
+	};
+};
+
+&qupv3_id_1 {
+	status = "okay";
+};
+
+&gpi_dma1 {
+	status = "okay";
+};
+
+&i2c4 {
+	status = "okay";
+
+	tas2563: speaker-amp@4c {
+		/*
+		 * The TAS2563 is NOT register compatible with the TAS2562 that the
+		 * ti,tas2562 binding drives: different boost, different PLL, and a
+		 * DSP.  Driving it with the TAS2562 sequence corrupts its power-up
+		 * and trips the PMIC into a hard reset (PON: "Triggered from Hard
+		 * Reset") the instant a stream starts.  Mainline has a proper
+		 * driver for it: sound/soc/codecs/tas2781-i2c.c.
+		 */
+		compatible = "ti,tas2563";
+		reg = <0x4c>;
+		#sound-dai-cells = <0>;
+		/* driver calls devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_HIGH) */
+		reset-gpios = <&tlmm 22 GPIO_ACTIVE_HIGH>;
+		/*
+		 * TEST audio1: keep this node ENABLED.  Disabling it makes the
+		 * card fail to register ("codec dai not found") because the
+		 * speaker DAI link still points at it, and then there is no PCM
+		 * to test with at all.  With no tas2563RCA1.bin present the
+		 * driver never powers the amp (startup returns -EINVAL), so it
+		 * stays inert unless something opens its DAI - which is exactly
+		 * what we want: stream only to the codec-less "Debug Playback"
+		 * BE (SECONDARY_MI2S_RX) and the amp is out of the picture.
+		 */
+		status = "okay";
+	};
+};
+
+/*
+ * The AFE needs to know which serial-data line each MI2S port uses; without
+ * qcom,sd-lines the port config carries a zero mask and the DSP refuses to
+ * start it:
+ *   qcom-q6afe aprsvc:service:4:4: no line is assigned
+ *   q6afe-dai: fail to prepare AFE port 10
+ *   ASoC error (-22): at snd_soc_dai_prepare() on PRI_MI2S
+ * aplay still "succeeds" because the failure is at prepare, not open - which is
+ * exactly why the card looked healthy while producing no sound.
+ */
+&q6afedai {
+	dai@16 {
+		reg = <PRIMARY_MI2S_RX>;
+		qcom,sd-lines = <0>;
+	};
+
+	dai@18 {
+		reg = <SECONDARY_MI2S_RX>;
+		qcom,sd-lines = <0>;
+	};
+
+	dai@22 {
+		reg = <QUATERNARY_MI2S_RX>;
+		qcom,sd-lines = <0>;
+	};
+};
+
+
+/* ============================================================================
+ * MODEM (MSS)
+ * ----------------------------------------------------------------------------
+ * WiFi is not independent of the modem on this design: ath10k_snoc only
+ * registers a wiphy after the WLFW QMI service answers (qmi_add_lookup in
+ * ath10k_qmi_init), and that service comes from the modem subsystem over
+ * QRTR.  Without mpss there is no wlan0, whatever the WLAN rails do.
+ *
+ * The firmware is the device's own, taken from the "modem" partition
+ * (/image/modem.mdt + modem.b00..b27 -> /lib/firmware/qcom/qcs615/).  There
+ * is no mba.mbn: this is TZ-PAS (pas-id 4), authenticated by TrustZone.
+ *
+ * The memory carve-out is the modem@8b000000 region already declared above.
+ * mpss_resource_init has auto_boot = false, so nothing starts until we ask.
+ * ==========================================================================*/
+&soc {
+	smp2p-mpss {
+		compatible = "qcom,smp2p";
+		qcom,smem = <435>, <428>;
+		interrupts = <GIC_SPI 451 IRQ_TYPE_EDGE_RISING 0>;
+		mboxes = <&apss_shared 14>;
+		qcom,local-pid = <0>;
+		qcom,remote-pid = <1>;
+
+		mpss_smp2p_out: master-kernel {
+			qcom,entry-name = "master-kernel";
+			#qcom,smem-state-cells = <1>;
+		};
+
+		mpss_smp2p_in: slave-kernel {
+			qcom,entry-name = "slave-kernel";
+			interrupt-controller;
+			#interrupt-cells = <2>;
+		};
+
+		/*
+		 * The vendor's modem smp2p block also carries an entry named
+		 * "wlan" (smp2p_wlan_1_in) that icnss uses for
+		 * qcom,smp2p-force-fatal-error / early-crash-ind.  It is the
+		 * channel the modem uses to talk about the WLAN subsystem, so
+		 * without it the modem may never bring its WLFW service up.
+		 */
+		mpss_smp2p_wlan_in: wlan {
+			qcom,entry-name = "wlan";
+			interrupt-controller;
+			#interrupt-cells = <2>;
+		};
+
+		/*
+		 * IPA <-> modem handshake (vendor qcom,smp2p-ipa-1-out/in).  The
+		 * modem asks "ipa-clock-query" and waits for the AP's answer and
+		 * for the AP's IPA to come up; without it its init can stall and
+		 * assert (fatal error at a fixed 40 s).  The sm7150 mainline
+		 * port, which runs its modem + WiFi, describes the same pair.
+		 */
+		mpss_smp2p_ipa_out: ipa-ap-to-modem {
+			qcom,entry-name = "ipa";
+			#qcom,smem-state-cells = <1>;
+		};
+
+		mpss_smp2p_ipa_in: ipa-modem-to-ap {
+			qcom,entry-name = "ipa";
+			interrupt-controller;
+			#interrupt-cells = <2>;
+		};
+	};
+
+	/*
+	 * IPA v4.2 (hw-ver 0x10 = IPA_HW_v4_2, same as sc7180).  No ipa_fws on
+	 * the phone, so the modem loads the GSI firmware ("modem-init").
+	 */
+	ipa: ipa@1e40000 {
+		compatible = "qcom,sc7180-ipa";
+		reg = <0x0 0x01e40000 0x0 0x7000>,
+		      <0x0 0x01e47000 0x0 0x2000>,
+		      <0x0 0x01e04000 0x0 0x2c000>;
+		reg-names = "ipa-reg", "ipa-shared", "gsi";
+
+		iommus = <&apps_smmu 0x1520 0x0>,
+			 <&apps_smmu 0x1522 0x0>;
+
+		interrupts-extended = <&intc GIC_SPI 311 IRQ_TYPE_EDGE_RISING 0>,
+				      <&intc GIC_SPI 432 IRQ_TYPE_LEVEL_HIGH 0>,
+				      <&mpss_smp2p_ipa_in 0 IRQ_TYPE_EDGE_RISING>,
+				      <&mpss_smp2p_ipa_in 1 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "ipa", "gsi", "ipa-clock-query", "ipa-setup-ready";
+
+		clocks = <&rpmhcc RPMH_IPA_CLK>;
+		clock-names = "core";
+
+		interconnects = <&aggre1_noc MASTER_IPA QCOM_ICC_TAG_ALWAYS
+				 &mc_virt SLAVE_EBI1 QCOM_ICC_TAG_ALWAYS>,
+				<&aggre1_noc MASTER_IPA QCOM_ICC_TAG_ALWAYS
+				 &system_noc SLAVE_IMEM QCOM_ICC_TAG_ALWAYS>,
+				<&gem_noc MASTER_APPSS_PROC QCOM_ICC_TAG_ALWAYS
+				 &config_noc SLAVE_IPA_CFG QCOM_ICC_TAG_ALWAYS>;
+		interconnect-names = "memory", "imem", "config";
+
+		qcom,qmp = <&aoss_qmp>;
+
+		qcom,smem-states = <&mpss_smp2p_ipa_out 0>,
+				   <&mpss_smp2p_ipa_out 1>;
+		qcom,smem-state-names = "ipa-clock-enabled-valid",
+					"ipa-clock-enabled";
+
+		modem-init;
+	};
+
+	remoteproc_mpss: remoteproc@4080000 {
+		compatible = "qcom,sm8150-mpss-pas";
+		reg = <0x0 0x04080000 0x0 0x4040>;
+
+		interrupts-extended = <&intc GIC_SPI 266 IRQ_TYPE_EDGE_RISING 0>,
+				      <&mpss_smp2p_in 0 IRQ_TYPE_EDGE_RISING>,
+				      <&mpss_smp2p_in 1 IRQ_TYPE_EDGE_RISING>,
+				      <&mpss_smp2p_in 2 IRQ_TYPE_EDGE_RISING>,
+				      <&mpss_smp2p_in 3 IRQ_TYPE_EDGE_RISING>,
+				      <&mpss_smp2p_in 7 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "wdog",
+				  "fatal",
+				  "ready",
+				  "handover",
+				  "stop-ack",
+				  "shutdown-ack";
+
+		clocks = <&rpmhcc RPMH_CXO_CLK>;
+		clock-names = "xo";
+
+		power-domains = <&rpmhpd RPMHPD_CX>, <&rpmhpd RPMHPD_MSS>;
+		power-domain-names = "cx", "mss";
+
+		memory-region = <&modem_mem>;
+
+		qcom,qmp = <&aoss_qmp>;
+
+		qcom,smem-states = <&mpss_smp2p_out 0>;
+		qcom,smem-state-names = "stop";
+
+		firmware-name = "qcom/qcs615/modem.mdt";
+
+		status = "okay";
+
+		/*
+		 * The modem's glink edge.  Without it the modem's IPCRTR channel
+		 * never appears, so QRTR has no modem node, and ath10k's WLFW
+		 * lookup (qmi_add_lookup in ath10k_qmi_init) never resolves -
+		 * which is why there was no wiphy even with the modem running.
+		 * mbox/IRQ are the vendor's (apcs_glb 12 / GIC_SPI 449).
+		 */
+		glink-edge {
+			interrupts-extended = <&intc GIC_SPI 449 IRQ_TYPE_EDGE_RISING 0>;
+			mboxes = <&apss_shared 12>;
+			label = "mpss";
+			qcom,remote-pid = <1>;
+		};
+	};
+};
+
+/*
+ * Battery sense.  Upstream's pm6150.dtsi only declares the die_temp channel
+ * of the PMIC ADC, so VBAT_SNS is never exposed and userspace has no way to
+ * read pack voltage - which is why Phosh shows the battery as unknown/critical.
+ * The SPMI ADC5 driver has supported this channel all along (ADC5_VBAT_SNS =
+ * 0x84); it just needs to be described.
+ */
+/*
+ * talos declares a video carve-out at 0x93400000..0x93900000 that violet does
+ * not have: violet puts video at 0x92e00000 and its next carve-out after the
+ * WLAN MSA starts at 0x93500000.  Leaving talos' node in place covers the top
+ * half of violet's 2 MB MSA, so the kernel drops the MSA region and hands the
+ * WLAN firmware a truncated map.
+ */
+&{/reserved-memory} {
+	/delete-node/ pil-video@93400000;
+
+	/*
+	 * talos' pil_video_mem label is referenced by video-codec@aa00000,
+	 * so it has to keep existing - it just has to point at violet's own
+	 * video carve-out (0x92e00000) instead of talos' 0x93400000, which
+	 * sits on top of the WLAN MSA's upper half.
+	 */
+	pil_video_mem: video@92e00000 {
+		compatible = "removed-dma-pool";
+		no-map;
+		reg = <0x0 0x92e00000 0x0 0x500000>;
+	};
+};
+
+&pm6150_adc {
+	channel@84 {
+		reg = <ADC5_VBAT_SNS>;
+		label = "vbat_sns";
+	};
+};
+
+/* ADSP fastrpc remote heap (audiopd) must be hyp-assigned to the DSP: vendor qcom,adsp-remoteheap-vmid = <22 37> */
+&glink_edge {
+	fastrpc {
+		qcom,vmids = <QCOM_SCM_VMID_LPASS QCOM_SCM_VMID_ADSP_HEAP>;
+	};
+};
+
+/*
+ * Volume keys.  Volume down is the PMIC RESIN input; volume up is pm6150l GPIO2
+ * (active low, pulled up), exactly as the vendor DTBO wires them.
+ */
+&pm6150_resin {
+	linux,code = <KEY_VOLUMEDOWN>;
+	status = "okay";
+};
+
+&pm6150l_gpios {
+	key_vol_up_default: key-vol-up-default-state {
+		pins = "gpio2";
+		function = "normal";
+		input-enable;
+		bias-pull-up;
+		power-source = <0>;
+	};
+};
+
+&{/} {
+	gpio-keys {
+		compatible = "gpio-keys";
+		pinctrl-names = "default";
+		pinctrl-0 = <&key_vol_up_default>;
+
+		key-volume-up {
+			label = "Volume Up";
+			gpios = <&pm6150l_gpios 2 GPIO_ACTIVE_LOW>;
+			linux,code = <KEY_VOLUMEUP>;
+			debounce-interval = <15>;
+			wakeup-source;
+		};
+	};
+};
+
+/*
+ * Battery estimate: no QG/SMB5 driver upstream, so violet-vbat turns VBAT_SNS
+ * into a capacity with the vendor OCV table and reads the SMB5 charge state.
+ */
+&pm6150_lsid0 {
+	battery {
+		compatible = "xiaomi,violet-vbat";
+		io-channels = <&pm6150_adc ADC5_VBAT_SNS>;
+		io-channel-names = "vbat";
+	};
+};
+
+
+/*
+ * Memory hole the vendor kernel does not see as RAM: 0x93500000..0x93afffff (6 MiB), between
+ * wlan_msa_mem (ends 0x934fffff) and rproc-cdsp (0x93b00000).  r10's /proc/iomem has no
+ * System RAM there (compared 2026-10-27), but without a reservation mainline hands these
+ * pages to the allocator; the first program that touches one gets an instant, silent SoC
+ * reset (XPU/TZ protection).  This is the "hang under memory load" that took Firefox,
+ * video, apk installs and memcpy stress down.
+ */
+&{/reserved-memory} {
+	violet_hole_mem: violet-hole@93500000 {
+		reg = <0x0 0x93500000 0x0 0x600000>;
+		no-map;
+	};
+};
+
+/*
+ * Top of the high DRAM bank.  A page-by-page physical-address walk (2026-10-27) died right
+ * when the allocator reached 0x173000000 with the SoC resetting silently; everything below
+ * that (0x138000000..0x172ff8000) was fine.  Every "crash under memory load" (Firefox, video,
+ * apk, memcpy stress) was the allocator handing out these protected pages.  Reserve the whole
+ * 173 MiB tail until the real boundary of the protected area is known.
+ */
+&{/reserved-memory} {
+	violet_tail_mem: violet-tail@173000000 {
+		reg = <0x1 0x73000000 0x0 0x0ad00000>;
+		no-map;
+	};
+};
+
+/*
+ * PMIC real-time clock.  Disabled in pm6150.dtsi, so violet booted with the time at
+ * 1970-01-01 until chrony got an NTP reply (and had no clock at all when offline).
+ * The RTC counter itself is read-only for Linux here (writes are refused, tested), so
+ * the clock is kept as "counter + offset" and the offset lives in an SDAM cell, the same
+ * way sc8280xp-crd does it.  b600 is the battery-gauge SDAM: the vendor QG driver uses
+ * offsets 0x45..0xb3 (+0xbc), so 0xb4..0xb7 is free (the SDAM driver only exposes offsets up to 0xbf).
+ */
+&pm6150_lsid0 {
+	pm6150_sdam_6: nvram@b600 {
+		compatible = "qcom,spmi-sdam";
+		reg = <0xb600>;
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges = <0 0xb600 0x100>;
+
+		rtc_offset: rtc-offset@b4 {
+			reg = <0xb4 0x4>;
+		};
+	};
+};
+
+&pm6150_rtc {
+	nvmem-cells = <&rtc_offset>;
+	nvmem-cell-names = "offset";
+	status = "okay";
+};
