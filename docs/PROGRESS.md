@@ -1,3 +1,131 @@
+## 2026-10-29 21:20 — charging was never broken: `violet-vbat` had the current sign inverted
+
+After the battery died and the phone came back on cable, the gauge reported `status=Not charging`,
+`current_now=-1.27 A` and a capacity that *fell* 59 % → 52 % in twelve minutes — while `vbat` was rising
+(3.947 → 3.992 V). That combination is contradictory, so the hardware was read directly instead of trusting
+the derived values.
+
+**Charger registers (via a temporary debugfs hook in `violet-vbat`, addresses from downstream `smb5-reg.h`):**
+
+| Register | Value | Meaning |
+|---|---|---|
+| `0x1006` CHGR_STATUS1 | `0x03` | charger in an active charge state (not inhibit, not disabled) |
+| `0x1051` CHGR_CFG2 | `0x2c` | bit0 `CHARGER_INHIBIT` = **0** → charging permitted |
+| `0x1340` USBIN_CMD_IL | `0x00` | `USBIN_SUSPEND` = **0** → input not suspended |
+| `0x1370` USBIN_CURRENT_LIMIT_CFG | `0x1e` | input limit ~3 A (100 mA LSB) |
+| `0x1310` USBIN_RT_STS | `0x10` | bit4 set → VBUS present |
+
+So the SMB5 was charging the pack the whole time in its hardware-default configuration; **nothing needed to
+be enabled, and there is nothing to "fix" in the charger**. The bug was in the gauge's sign convention:
+`violet_batt_sample()` negates the QG burst-average current, which makes the value **positive while
+charging**, but every consumer then treated positive as *discharging* — so the coulomb counter subtracted
+charge as the pack filled, the status said `Not charging`, and `current_now` was exported negative.
+
+**Fix (7 places in `patches/violet-vbat.c`, positive = charging now):** coulomb counter `+=`, IR-compensated
+OCV `vbat - I·Rbat`, status `CHARGING` when `ibat > +30 mA`, `current_now` = `+ibat` (kernel ABI: positive =
+charging), the publish gate and the termination test follow the same convention. Built as a module against
+the running kernel (vermagic `7.2.10-sm6150 SMP preempt mod_unload aarch64` matches exactly), installed to
+`/lib/modules/7.2.10-sm6150/extra/violet-vbat.ko`, `depmod` + `modprobe` — **no flash needed**.
+
+After reload: `status=Charging`, `current_now=+849304` (≈0.85 A into the pack), and the OCV estimate agrees
+with the pack (73–80 % rather than the drifted 52 %).
+
+**Lesson:** the derived `status`/`current_now` were self-consistent and therefore convincingly wrong; the
+SMB5 registers were the only independent witness. Do not calibrate a gauge against its own integrator.
+
+**Still missing (unchanged):** mainline has **no SMB5 charger driver** (`drivers/power/supply/` has
+`qcom_smbb`, `qcom_smbx`, `qcom_battmgr` — nothing for PM6150's SMB5), so charging relies on the boot-time
+hardware defaults: no dynamic ICL/AICL, no PD/QC negotiation, no thermal throttling, no charge termination
+handling beyond reading the status bit. That is a driver-porting job (downstream `qpnp-smb5.c` + `smb5-lib.c`),
+not a block enabled/disabled — and it can be developed as a module, so it does **not** need a flash per
+iteration.
+
+## 2026-10-29 20:55 — battery died, and the reboot came up with a dead panel (boot-time DSI init race)
+
+The phone had been up since the previous morning with no cable, ran flat during use, and rebooted when it was
+plugged in. That boot came up with a **black screen while the system was fully alive**: SSH over WiFi worked,
+`phoc`/`phosh`/`gnome-session` were running, and a screenshot of the session (`org.gnome.Shell.Screenshot`)
+returned a perfectly normal **lock screen with the power menu open** — so composition was fine and the panel
+was the problem.
+
+Evidence, all within the first 11 s of uptime:
+
+```
+[    5.373476] WARNING: drivers/clk/qcom/clk-rcg2.c:136 at update_config+0xd4/0xe8, CPU#6: kworker/u32:0/12
+                update_config+0xd4/0xe8 → clk_rcg2_configure+0xec/0xf4 → clk_set_rate+0x98/0x138
+                → _opp_config_clk_single → dev_pm_opp_set_rate → dsi_link_clk_set_rate_6g
+                → msm_dsi_host_power_on+0xf0/0xaf8 → dsi_mgr_bridge_pre_enable
+[   10.399570] DSIDBG fifo_status=0xdddd1019        (repeats; `dsi_err_worker: status=4`)
+[   10.427568] DSIDBG sw reset after FIFO error
+```
+
+Counts: **8 × `update_config` warnings, 19 × `dsi_err_worker`, DSI power-on attempted twice**, and every one of
+those lines is inside 5.39–10.58 s. After that the link is clean (`dsi_err_worker` count frozen at 19 for the
+rest of the boot).
+
+So the first `msm_dsi_host_power_on` failed to take the 6 GHz link rate ("RCG did not update its
+configuration"), the DSI FIFO kept erroring, and the panel never started scanning — while DRM kept reporting
+`card0-DSI-1: connected` and the compositor kept rendering into a pipe nobody was reading. The second
+power-on (a later blank/unblank cycle — `org.gnome.ScreenSaver.SetActive(false)` on the session bus, coinciding
+with a power-button press) re-ran the DSI enable and **this time the clock took**; the panel came up and stayed
+up, backlight `2048/4095`.
+
+Why the power button "did nothing" at first: the compositor's own power menu was already open on screen
+(visible in the screenshot), so presses were being consumed by that menu, and the panel had no valid video
+timing to show the UI anyway. It is the re-modeset that fixes it, not the key press.
+
+**Why this matters beyond today:** this is the same failure class as the GPU hang — `clk-rcg2 update_config`
+failing to apply a rate at a power-on boundary. `docs/STATUS.md` already noted `gpu_cc_gx_gfx3d_clk_src`
+reporting dead on this SoC before patch 0007; a GPU that comes up with a wrong/absent gfx3d clock would stall
+its ringbuffer with exactly the `adreno_idle: timeout waiting to drain ringbuffer` signature we see in G1.
+Worth checking the RCG/`update_config` path (parent PLL not enabled, RCG reconfigured while running) as a
+*shared* root cause for both G1 (GPU lockups) and D1 (this dead panel at boot), rather than two separate bugs.
+
+**Workaround that needs no reboot** if it recurs: unblank the session so the bridge re-enables —
+
+```
+P=$(pgrep -x phoc); DB=$(tr '\0' '\n' < /proc/$P/environ | grep ^DBUS_SESSION_BUS_ADDRESS= | cut -d= -f2-)
+sudo -u user env XDG_RUNTIME_DIR=/run/user/10000 DBUS_SESSION_BUS_ADDRESS=$DB \
+  gdbus call --session --dest org.gnome.ScreenSaver --object-path /org/gnome/ScreenSaver \
+  --method org.gnome.ScreenSaver.SetActive false
+```
+
+Also observed: battery reports **"Not charging"** at 57 % while plugged into the build host's USB port on
+`androidboot.mode=charger` — the NCM gadget enumerates (serial `xiaomi,violet`) and `usb0` is up at
+`172.16.42.1/16`, but the phone is not taking charge current from this port.
+
+## 2026-10-29 08:15 — published as a public repository: github.com/VipinVIP/violet-sm6150-mainline
+
+The documentation + patch series went public so the port can be reproduced by others. Old private repo
+`violet-mainline` is superseded (user to delete it).
+
+**What was published (137 files, 9 commits, ordered so it reads as a narrative):** `README.md` (scope,
+status table, layout, quick start, credits) · `docs/` (STATUS, CHECKLIST, RULED-OUT, PROGRESS, PLAN and a
+new `REPRODUCE.md` build/flash guide) · `patches/` (17 patches; **0014 dropped**, it is superseded by 0015) ·
+`dt/violet-sm6150.dts` (byte-identical to the DTS that built the flashed image — authoritative over the
+early DTS inside patch 0001) · `configs/config-7.2.10-sm6150-2026-10-27` · `host/` (boot image, fastboot
+entry, ssh helpers; `host/legacy/` = the kexec-era workflow) · `phone/` (52 on-device scripts/configs) ·
+`tools/` (34 probes).
+
+**Deliberately NOT published:** `kernel/` (7.8 GB tree), `images/`, `device-backup/`, `debug-backup/`,
+`vendor-extract/`, `fw/`, `logs/`, `*.img`, `*.wav`, `pstore*.raw`, `*.ko/.o` build products. The firmware
+blobs are vendor-signed and not redistributable, and the partition dumps carry device-unique identifiers
+(IMEI, MACs, calibration data). `docs/REPRODUCE.md` explains how a reproducer pulls them from their **own**
+phone.
+
+**Scrubbing pass applied to every published file:** home AP SSID → `<home-ap-ssid>`, AP BSSID →
+`<ap-bssid>`, the phone's LAN address → `<phone-ip>`, fastboot serial → `<serial>`, the phone's WiFi MAC →
+`<device-wifi-mac>`, personal e-mail → GitHub noreply, `~…` → `~`/`$PROJECT`. Verified by scanning
+a **fresh clone** of the public repo (no e-mails, keys, tokens, private IPs, MACs, serials, SSID or local
+paths), and every link in the markdown resolves.
+
+**Two code changes made for reproducibility, not cosmetics:** `host/mk-bootimg-clean.sh` now requires
+`PMOS_BOOT_UUID`/`PMOS_ROOT_UUID` from the environment instead of carrying this phone's filesystem UUIDs,
+and `patches/README.md` no longer points at files that stayed behind.
+
+**Verified after publishing:** 137 files / 9 commits on `main`; all 17 patches still parse
+(`git apply --numstat`); markdown links resolve; fresh-clone secret scan clean.
+
 ## 2026-10-29 07:35 — the GPU lockup is systemic, not ATL/Vulkan-specific (and needs a kernel fix)
 
 Chasing the NewPipe video crash with GL disabled (user: "don't avoid the vulnerability, fix it") established that
@@ -386,7 +514,7 @@ Correction + third try: the vote that fails is DCODEC (block 4, "AFE failed to v
 **Newest first.** Add each new entry directly under this header block, as a `## YYYY-MM-DD HH:MM — title`
 heading (subsections `###`). Use the real wall-clock time (`date`), not a guess.
 
-Related: [PLAN.md](PLAN.md) (design) · [STATUS.md](STATUS.md) (what works / what doesn't, right now) ·
+Related: [PLAN.md](../PLAN.md) (design) · [STATUS.md](STATUS.md) (what works / what doesn't, right now) ·
 [RULED-OUT.md](RULED-OUT.md) (dead ends and lessons — check before re-testing anything).
 
 > **Reordered on 2026-10-25 ~11:10** when this log was split out of PLAN.md. Entries are verbatim

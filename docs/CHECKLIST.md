@@ -266,12 +266,14 @@ associate/DHCP/AP (`patches/0015`, W1–W6) · ATL installed and running real ap
 | # | Item | Where | Cable? |
 |---|---|---|---|
 | G1 | **GPU lockups** — 9 `hangcheck detected gpu lockup rb 0` in 35 min (2026-10-29) killing `phoc`, `gnome-control-center`, ATL; follows long GPU suspend (active 1.8 h vs suspended 7.5 h). Fix = a6xx power-up/resume path | kernel (`drivers/gpu/drm/msm/adreno`) | **yes** (flash per iteration) |
+| D1 | **Boot-time DSI init race** — first panel power-on can fail the 6 GHz link rate (`clk-rcg2.c:136 update_config` + DSI FIFO errors) → black panel with a live compositor. Same `clk-rcg2` failure class as G1; treat the RCG `update_config` path as one shared root cause until disproven | kernel | **yes** |
 | S6 | dmesg flooded by `qcom_q6v5_pas … Handover signaled` (~94% of the ring), which is why crash evidence keeps rotating away | kernel | **yes** |
 | M1 | Microphone — WCD937x/SoundWire parked on `MASTER_CLASH_DET`; codec reset is LPI gpio24, not TLMM 24 | DT | **yes** |
 | A0 | `ramoops` record-size — pstore is empty after crashes, so there is no cross-reboot evidence | DT | **yes** |
 | P1 | Suspend/resume — only `s2idle` exists and the phone does not come back; currently masked three ways | kernel/DT | **yes** |
 | X1 | Sensors — behind the Snapdragon Sensor Core; QRTR service 400 is alive but no registry; mainline has no SSC/CHRE driver (see §6) | kernel/DT (+ maybe userspace) | **yes** |
 | W7 | `bdwlan.*` packing + `qcom,calibration-variant` — sensitivity polish only, WiFi already works | DT | yes |
+| C1 | **No SMB5 charger driver** — charging works only on the boot-time hardware defaults (no AICL, no PD/QC, no thermal throttle, no termination control). Downstream `qpnp-smb5.c`/`smb5-lib.c` is the reference; can be developed as a module, so no flash per iteration | kernel | no (module) |
 | T1 | Two UI checks the user can do without me: tap a text field (keyboard on focus), lock the phone (lock screen shows glissando, password prompt) | — | no |
 
 **Cheap WiFi-only follow-ups:** finish the ATL app trial (only the GPU lockup blocks video), and try the GPU pin

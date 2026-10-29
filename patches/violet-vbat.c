@@ -16,7 +16,9 @@
  *    open-circuit voltage and the vendor battery profile's 25C OCV table;
  *  - while the pack rests (|I| small) the SoC is pulled towards the OCV value,
  *    and it is pinned to 100 % when the charger reports termination;
- *  - the SoC is written back to the SDAM so it survives a reboot.
+ *  - the SoC is written back to the SDAM so it survives a reboot;
+ *  - sign convention: ibat > 0 = charging (measured against the SMB5 registers,
+ *    see the note in violet_batt_sample()).
  */
 #include <linux/delay.h>
 #include <linux/module.h>
@@ -114,6 +116,12 @@ static int violet_batt_sample(struct violet_batt *b)
 	if (ret)
 		return ret;
 	raw = buf[0] | (buf[1] << 8);
+	/*
+	 * Sign, measured 2026-10-29 against the charger registers: with CHGR_STATUS1
+	 * in an active state, CHARGER_INHIBIT clear, CMD_IL not suspended and ICL ~3 A,
+	 * this negation yields a POSITIVE value while the pack charges. Hence
+	 * ibat_ua > 0 = charging, ibat_ua < 0 = discharging.
+	 */
 	b->ibat_ua = -(s16)raw * (b->five_amp ? 152588LL : 305176LL) / 1000;
 
 	regmap_read(b->map, SMB5_USBIN_RT_STS, &hi);
@@ -134,12 +142,12 @@ static void violet_batt_poll(struct work_struct *w)
 		goto out;
 	b->last = now;
 
-	/* coulomb counting, ibat > 0 = discharging */
+	/* coulomb counting, ibat > 0 = charging */
 	if (dt_ms > 0 && dt_ms < 60000)
-		b->charge_uah -= (s64)b->ibat_ua * dt_ms / 3600000;
+		b->charge_uah += (s64)b->ibat_ua * dt_ms / 3600000;
 
 	/* IR-compensated open circuit voltage */
-	ocv_uv = b->vbat_uv + (s64)b->ibat_ua * b->rbat_mohm / 1000;
+	ocv_uv = b->vbat_uv - (s64)b->ibat_ua * b->rbat_mohm / 1000;
 	soc_ocv_x100 = ocv_to_soc_x100(ocv_uv);
 
 	if (abs(b->ibat_ua) < REST_UA) {
@@ -158,7 +166,7 @@ static void violet_batt_poll(struct work_struct *w)
 	}
 
 	/* the charger says the pack is full */
-	if (b->plugged && b->term && b->vbat_uv > 4300000 && b->ibat_ua > -150000)
+	if (b->plugged && b->term && b->vbat_uv > 4300000 && b->ibat_ua < 150000)
 		b->charge_uah = FCC_UAH;
 
 	b->charge_uah = clamp_t(s64, b->charge_uah, 0, FCC_UAH);
@@ -166,8 +174,8 @@ static void violet_batt_poll(struct work_struct *w)
 
 	/* only publish moves that agree with the current's direction */
 	if (soc != b->soc) {
-		if ((soc < b->soc && b->ibat_ua > -20000) ||
-		    (soc > b->soc && b->ibat_ua < 20000))
+		if ((soc < b->soc && b->ibat_ua < 20000) ||
+		    (soc > b->soc && b->ibat_ua > -20000))
 			b->soc = soc;
 	}
 	if (b->soc != b->sdam_soc) {
@@ -213,7 +221,7 @@ static int violet_batt_get(struct power_supply *psy, enum power_supply_property 
 		val->intval = b->vbat_uv;
 		return 0;
 	case POWER_SUPPLY_PROP_CURRENT_NOW:
-		val->intval = -b->ibat_ua;	/* kernel ABI: negative = discharging? keep vendor sign flipped */
+		val->intval = b->ibat_ua;	/* kernel ABI: positive = charging */
 		return 0;
 	case POWER_SUPPLY_PROP_CAPACITY:
 		val->intval = b->soc;
@@ -230,7 +238,7 @@ static int violet_batt_get(struct power_supply *psy, enum power_supply_property 
 			val->intval = POWER_SUPPLY_STATUS_DISCHARGING;
 		else if (b->soc >= 100 || (b->term && b->vbat_uv > 4300000))
 			val->intval = POWER_SUPPLY_STATUS_FULL;
-		else if (b->ibat_ua < -30000)
+		else if (b->ibat_ua > 30000)
 			val->intval = POWER_SUPPLY_STATUS_CHARGING;
 		else
 			val->intval = POWER_SUPPLY_STATUS_NOT_CHARGING;
