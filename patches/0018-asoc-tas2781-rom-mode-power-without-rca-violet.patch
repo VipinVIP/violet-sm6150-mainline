@@ -1,0 +1,95 @@
+--- a/sound/soc/codecs/tas2781-i2c.c
++++ b/sound/soc/codecs/tas2781-i2c.c
+@@ -36,6 +36,16 @@
+ #include <sound/tas5825-tlv.h>
+ #include <linux/unaligned.h>
+ 
++/*
++ * violet diagnostic (audio A5): see tasdevice_fw_ready().  0 keeps upstream
++ * behaviour (RCA firmware mandatory); 1 lets the amp run on ROM defaults; 2 also
++ * loads the DSP coef blob (the vendor's tas2563_uCDSP.bin).
++ */
++static int no_rca_mode;
++module_param(no_rca_mode, int, 0644);
++MODULE_PARM_DESC(no_rca_mode,
++		 "allow playback without tas2563RCA1.bin: 0=off, 1=RCA-only, 2=try DSP coef");
++
+ #define X2563_CL_STT_VAL(xreg, xval) \
+ {	.reg = xreg, \
+ 	.val = { xval }, \
+@@ -1637,9 +1647,33 @@
+ 	ret = tasdevice_rca_parser(tas_priv, fmw);
+ 	if (ret) {
+ 		tasdevice_config_info_remove(tas_priv);
+-		goto out;
++		/*
++		 * violet diagnostic (audio A5): the RCA regbin (tas2563RCA1.bin)
++		 * is a TI PPC3/regbin artefact that no vendor image on this
++		 * phone ships, and without it fw_state stays PENDING, so
++		 * tasdevice_startup() refuses every stream with -EINVAL and the
++		 * amp is never powered.  Let the DSP coef blob alone (the
++		 * vendor's tas2563_uCDSP.bin, which the vendor driver uses by
++		 * itself) be enough when asked to, so we can tell whether the
++		 * I2S path and the amp work at all.
++		 *   no_rca_mode=0: upstream behaviour (RCA required)
++		 *   no_rca_mode=1: RCA-only equivalent, the amp runs on ROM
++		 *                  defaults (no boost/BOP tuning)
++		 *   no_rca_mode=2: also try the DSP coef blob, then continue
++		 *                  as if RCA had been parsed
++		 */
++		if (!no_rca_mode) {
++			goto out;
++		}
++		dev_warn(tas_priv->dev,
++			 "no RCA firmware, continuing with no_rca_mode=%d\n",
++			 no_rca_mode);
++		tas_priv->fw_state = TASDEVICE_RCA_FW_OK;
++		if (no_rca_mode == 1)
++			goto out;
++	} else {
++		tasdevice_create_control(tas_priv);
+ 	}
+-	tasdevice_create_control(tas_priv);
+ 
+ 	tasdevice_dsp_remove(tas_priv);
+ 	tasdevice_calbin_remove(tas_priv);
+@@ -1758,6 +1792,17 @@
+ 	release_firmware(fmw);
+ }
+ 
++static int tasdevice_dev_update_bits_one(struct tasdevice_priv *tas_priv, int chn, int shutdown)
++{
++	unsigned int v;
++	int ret = tasdevice_dev_read(tas_priv, chn, TASDEVICE_REG(0x0, 0x0, 0x02), &v);
++
++	if (ret)
++		return ret;
++	v = (v & ~3) | (shutdown ? 2 : 0);
++	return tasdevice_dev_write(tas_priv, chn, TASDEVICE_REG(0x0, 0x0, 0x02), v);
++}
++
+ static int tasdevice_dapm_event(struct snd_soc_dapm_widget *w,
+ 			struct snd_kcontrol *kcontrol, int event)
+ {
+@@ -1769,6 +1814,21 @@
+ 	mutex_lock(&tas_priv->codec_lock);
+ 	if (event == SND_SOC_DAPM_PRE_PMD)
+ 		state = 1;
++	if (no_rca_mode && !tas_priv->rcabin.ncfgs) {
++		/*
++		 * violet: no RCA configuration blocks, so tasdevice_tuning_switch() would never
++		 * power the amp.  Run it in ROM mode: PWR_CTL.MODE = active / shutdown.
++		 */
++		int i;
++
++		for (i = 0; i < tas_priv->ndev; i++) {
++			int rc = tasdevice_dev_update_bits_one(tas_priv, i, state);
++
++			dev_info(tas_priv->dev, "violet: amp %d %s: %d\n", i, state ? "shutdown" : "active", rc);
++		}
++		mutex_unlock(&tas_priv->codec_lock);
++		return 0;
++	}
+ 	tasdevice_tuning_switch(tas_priv, state);
+ 	/* Codec Lock Release*/
+ 	mutex_unlock(&tas_priv->codec_lock);

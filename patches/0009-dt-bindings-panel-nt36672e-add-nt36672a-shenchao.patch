@@ -1,0 +1,18 @@
+From: VipinVIP <VipinVIP@users.noreply.github.com>
+Subject: [PATCH] dt-bindings: display: panel: novatek,nt36672e: add nt36672a-shenchao
+
+Add the NT36672A 'shenchao' panel compatible used by the Redmi Note 7 Pro.
+---
+--- a/Documentation/devicetree/bindings/display/panel/novatek,nt36672e.yaml
++++ b/Documentation/devicetree/bindings/display/panel/novatek,nt36672e.yaml
+@@ -14,7 +14,9 @@
+ 
+ properties:
+   compatible:
+-    const: novatek,nt36672e
++    enum:
++      - novatek,nt36672a-shenchao
++      - novatek,nt36672e
+ 
+   reg:
+     maxItems: 1

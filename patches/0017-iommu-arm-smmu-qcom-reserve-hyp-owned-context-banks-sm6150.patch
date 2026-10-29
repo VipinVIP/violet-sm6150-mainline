@@ -1,0 +1,21 @@
+--- a/drivers/iommu/arm/arm-smmu/arm-smmu-qcom.c
++++ b/drivers/iommu/arm/arm-smmu/arm-smmu-qcom.c
+@@ -513,6 +513,18 @@
+ 		}
+ 	}
+ 
++	/*
++	 * violet (sm6150/talos): the hypervisor keeps context banks 10-12 for its own streams and
++	 * silently ignores S2CR writes that point a Linux stream at them (the stream stays FAULT),
++	 * which is what stopped the ADSP audio stream 0x1721 from ever translating.  Hide them.
++	 */
++	if (of_device_is_compatible(smmu->dev->of_node, "qcom,qcs615-smmu-500") &&
++	    smmu->num_context_banks > 12) {
++		set_bit(10, smmu->context_map);
++		set_bit(11, smmu->context_map);
++		set_bit(12, smmu->context_map);
++	}
++
+ 	for (i = 0; i < smmu->num_mapping_groups; i++) {
+ 		smr = arm_smmu_gr0_read(smmu, ARM_SMMU_GR0_SMR(i));
+ 

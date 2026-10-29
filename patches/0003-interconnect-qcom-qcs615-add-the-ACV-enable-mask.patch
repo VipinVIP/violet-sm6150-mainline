@@ -1,0 +1,16 @@
+From: VipinVIP <VipinVIP@users.noreply.github.com>
+Subject: [PATCH] interconnect: qcom: qcs615: add the missing ACV enable_mask
+
+The ACV BCM needs enable_mask = 0x8 (the vote downstream sends is 0x60000008); without it
+mainline sends the ACV vote as invalid.
+---
+--- a/drivers/interconnect/qcom/qcs615.c
++++ b/drivers/interconnect/qcom/qcs615.c
+@@ -1195,6 +1195,7 @@
+ 
+ static struct qcom_icc_bcm bcm_acv = {
+ 	.name = "ACV",
++	.enable_mask = 0x8,
+ 	.num_nodes = 1,
+ 	.nodes = { &ebi },
+ };

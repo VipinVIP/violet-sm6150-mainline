@@ -1,0 +1,39 @@
+From: VipinVIP <VipinVIP@users.noreply.github.com>
+Subject: [PATCH] clk: qcom: dispcc-qcs615: fix GDSC mode and keep XO clock on
+
+Wire up the DISP_CC GDSC (drop HW_CTRL, which makes the domain collapse when MDSS idles) and keep DISP_CC_XO_CLK always on, so the MDSS/DSI registers stay accessible during probe.
+---
+--- a/drivers/clk/qcom/dispcc-qcs615.c
++++ b/drivers/clk/qcom/dispcc-qcs615.c
+@@ -691,7 +691,12 @@
+ 		.name = "mdss_core_gdsc",
+ 	},
+ 	.pwrsts = PWRSTS_OFF_ON,
+-	.flags = HW_CTRL | POLL_CFG_GDSCR,
++	/*
++	 * No HW_CTRL: gdsc_enable() would put the domain in hardware trigger mode,
++	 * where it collapses as soon as the (idle) MDSS stops requesting power and
++	 * the MDSS register/clock accesses in probe fail.
++	 */
++	.flags = POLL_CFG_GDSCR,
+ };
+ 
+ static struct clk_regmap *disp_cc_qcs615_clocks[] = {
+@@ -774,7 +779,16 @@
+ 
+ static int disp_cc_qcs615_probe(struct platform_device *pdev)
+ {
+-	return qcom_cc_probe(pdev, &disp_cc_qcs615_desc);
++	struct regmap *regmap;
++
++	regmap = qcom_cc_map(pdev, &disp_cc_qcs615_desc);
++	if (IS_ERR(regmap))
++		return PTR_ERR(regmap);
++
++	/* Keep DISP_CC_XO_CLK always on, the branch status of the other clocks depends on it */
++	qcom_branch_set_clk_en(regmap, 0x6054);
++
++	return qcom_cc_really_probe(&pdev->dev, &disp_cc_qcs615_desc, regmap);
+ }
+ 
+ static struct platform_driver disp_cc_qcs615_driver = {

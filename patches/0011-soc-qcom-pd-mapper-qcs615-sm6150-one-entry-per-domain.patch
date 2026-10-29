@@ -1,0 +1,42 @@
+--- a/drivers/soc/qcom/qcom_pd_mapper.c
++++ b/drivers/soc/qcom/qcom_pd_mapper.c
+@@ -417,10 +417,28 @@
+ 
+ static const struct qcom_pdm_domain_data *qcs615_domains[] = {
+ 	&adsp_audio_pd,
+-	&adsp_root_pd,
++	/*
++	 * One entry per domain only: every entry adds "tms/servreg" for its
++	 * domain, so listing both the plain and the _pdr variant makes probe fail
++	 * with -EBUSY and pd-mapper registers nothing.
++	 * The root domains must also answer the "tms/pdr_enabled" service:
++	 * PDR clients (and q6afe/q6asm) ask for the root before a child
++	 * domain, and without this entry the lookup fails with -ENXIO.
++	 */
++	&adsp_root_pd_pdr,
+ 	&adsp_sensor_pd,
+ 	&cdsp_root_pd,
+-	&mpss_root_pd,
++	/*
++	 * sc7180_domains[] carries this for the same modem-hosted WLAN setup
++	 * and we did not: the modem's firmware queries the PD mapper for
++	 * "tms/pdr_enabled" on msm/modem/root_pd while it initialises, and with
++	 * no entry claiming that service pd-mapper answers "0 domains".  Per
++	 * the Qualcomm fix "remoteproc: qcom_common: load pd_mapper before
++	 * booting the DSP", firmware that cannot reach the PD mapper stalls
++	 * until its watchdog fires ~40 s later - which is exactly our
++	 * "fatal error without message" 40 s after the modem comes up.
++	 */
++	&mpss_root_pd_gps_pdr,
+ 	&mpss_wlan_pd,
+ 	NULL,
+ };
+@@ -602,6 +620,8 @@
+ 	{ .compatible = "qcom,qcm6490", .data = sc7280_domains, },
+ 	{ .compatible = "qcom,qcs404", .data = qcs404_domains, },
+ 	{ .compatible = "qcom,qcs615", .data = qcs615_domains, },
++	/* violet / Redmi Note 7 Pro: same PD layout as qcs615, different compatible */
++	{ .compatible = "qcom,sm6150", .data = qcs615_domains, },
+ 	{ .compatible = "qcom,sc7180", .data = sc7180_domains, },
+ 	{ .compatible = "qcom,sc7280", .data = sc7280_domains, },
+ 	{ .compatible = "qcom,sc8180x", .data = sc8180x_domains, },

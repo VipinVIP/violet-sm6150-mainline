@@ -1,0 +1,212 @@
+--- a/sound/soc/qcom/qdsp6/q6asm.c
++++ b/sound/soc/qcom/qdsp6/q6asm.c
+@@ -29,6 +29,11 @@
+ #define ASM_DATA_CMD_EOS			0x00010BDB
+ #define ASM_DATA_EVENT_RENDERED_EOS		0x00010C1C
+ #define ASM_NULL_POPP_TOPOLOGY			0x00010C68
++/* violet: vendor sm6150 AVS uses DEFAULT_POPP_TOPOLOGY (0x10BE4) for normal playback */
++static unsigned int violet_popp = 0x00010BE4;
++static unsigned int violet_wlen;
++module_param(violet_wlen, uint, 0644);
++module_param(violet_popp, uint, 0644);
+ #define ASM_STREAM_CMD_FLUSH_READBUFS		0x00010C09
+ #define ASM_STREAM_CMD_SET_ENCDEC_PARAM		0x00010C10
+ #define ASM_STREAM_POSTPROC_TOPO_ID_NONE	0x00010C68
+@@ -946,7 +951,7 @@
+ 	/* source endpoint : matrix */
+ 	open->sink_endpointype = ASM_END_POINT_DEVICE_MATRIX;
+ 	open->bits_per_sample = bits_per_sample;
+-	open->postprocopo_id = ASM_NULL_POPP_TOPOLOGY;
++	open->postprocopo_id = violet_popp;
+ 
+ 	switch (format) {
+ 	case SND_AUDIOCODEC_MP3:
+@@ -1536,7 +1541,7 @@
+ 	pkt->hdr.opcode = ASM_DATA_CMD_WRITE_V2;
+ 	write->buf_addr_lsw = lower_32_bits(ab->phys);
+ 	write->buf_addr_msw = upper_32_bits(ab->phys);
+-	write->buf_size = len;
++	write->buf_size = violet_wlen && violet_wlen < len ? violet_wlen : len;
+ 	write->seq_id = port->dsp_buf;
+ 	write->timestamp_lsw = lsw_ts;
+ 	write->timestamp_msw = msw_ts;
+--- a/sound/soc/qcom/qdsp6/q6adm.c
++++ b/sound/soc/qcom/qdsp6/q6adm.c
+@@ -349,6 +349,8 @@
+ 	open->flags = ADM_LEGACY_DEVICE_SESSION;
+ 	open->mode_of_operation = path;
+ 	open->endpoint_id_1 = afe_port;
++	/* vendor sm6150 AVS: 0xFFFF = no second endpoint (0 means AFE port 0 and corrupts the COPP) */
++	open->endpoint_id_2 = 0xFFFF;
+ 	open->topology_id = topology;
+ 	open->dev_num_channel = channel_mode & 0x00FF;
+ 	open->bit_width = bit_width;
+--- a/sound/soc/qcom/qdsp6/q6afe.c
++++ b/sound/soc/qcom/qdsp6/q6afe.c
+@@ -379,6 +379,7 @@
+ 	struct q6core_svc_api_info ainfo;
+ 	struct mutex lock;
+ 	struct aprv2_ibasic_rsp_result_t result;
++	uint32_t vote_result;
+ 	wait_queue_head_t wait;
+ 	struct list_head port_list;
+ 	spinlock_t port_list_lock;
+@@ -968,13 +969,14 @@
+ 	const struct aprv2_ibasic_rsp_result_t *res;
+ 	const struct apr_hdr *hdr = &data->hdr;
+ 	struct q6afe_port *port;
++	uint32_t *vote_res;
+ 
+ 	if (!data->payload_size)
+ 		return 0;
+ 
+-	res = data->payload;
+ 	switch (hdr->opcode) {
+ 	case APR_BASIC_RSP_RESULT: {
++		res = data->payload;
+ 		if (res->status) {
+ 			dev_err(afe->dev, "cmd = 0x%x returned error = 0x%x\n",
+ 				res->opcode, res->status);
+@@ -1001,8 +1003,10 @@
+ 	}
+ 		break;
+ 	case AFE_CMD_RSP_REMOTE_LPASS_CORE_HW_VOTE_REQUEST:
++		vote_res = data->payload;
+ 		afe->result.opcode = hdr->opcode;
+-		afe->result.status = res->status;
++		afe->result.status = 0;
++		afe->vote_result = *vote_res;
+ 		wake_up(&afe->wait);
+ 		break;
+ 	default:
+@@ -1664,6 +1668,9 @@
+  *
+  * Return: Will be an negative on packet size on success.
+  */
++static int violet_island = 1;
++module_param(violet_island, int, 0644);
++
+ int q6afe_port_start(struct q6afe_port *port)
+ {
+ 	struct afe_port_cmd_device_start *start;
+@@ -1673,6 +1680,16 @@
+ 	struct apr_pkt *pkt;
+ 	int pkt_size;
+ 
++	if (violet_island) {
++		/* vendor sends AFE_PARAM_ID_ISLAND_CONFIG {minor 1, enable 0} before every port start */
++		struct { u32 minor; u32 enable; } island = { 1, 0 };
++
++		ret = q6afe_port_set_param_v2(port, &island, 0x000102B4,
++					      AFE_MODULE_AUDIO_DEV_INTERFACE,
++					      sizeof(island));
++		pr_info("violet afe island cfg -> %d\n", ret);
++	}
++
+ 	ret  = q6afe_port_set_param_v2(port, &port->port_cfg, param_id,
+ 				       AFE_MODULE_AUDIO_DEV_INTERFACE,
+ 				       sizeof(port->port_cfg));
+@@ -1899,6 +1916,8 @@
+ 			       AFE_CMD_RSP_REMOTE_LPASS_CORE_HW_VOTE_REQUEST);
+ 	if (ret)
+ 		dev_err(afe->dev, "AFE failed to vote (%d)\n", hw_block_id);
++	else
++		*client_handle = afe->vote_result;
+ 
+ 	return ret;
+ }
+--- a/sound/soc/qcom/qdsp6/q6routing.c
++++ b/sound/soc/qcom/qdsp6/q6routing.c
+@@ -24,6 +24,10 @@
+ #include "q6adm.h"
+ #include "q6routing.h"
+ 
++/* violet: vendor sm6150 AVS uses DEFAULT_COPP_TOPOLOGY (0x10314) for legacy sessions */
++static unsigned int violet_copp_topo = 0x00010314;
++module_param(violet_copp_topo, uint, 0644);
++
+ #define DRV_NAME "q6routing-component"
+ 
+ #define Q6ROUTING_RX_MIXERS(id)						\
+@@ -390,7 +394,7 @@
+ 	session->bits_per_sample = pdata->bits_per_sample;
+ 
+ 	payload.num_copps = 0; /* only RX needs to use payload */
+-	topology = NULL_COPP_TOPOLOGY;
++	topology = violet_copp_topo;
+ 	copp = q6adm_open(routing_data->dev, session->port_id,
+ 			      session->path_type, session->sample_rate,
+ 			      session->channels, topology, perf_mode,
+--- a/sound/soc/qcom/sm8250.c
++++ b/sound/soc/qcom/sm8250.c
+@@ -18,6 +18,48 @@
+ 
+ #define MI2S_BCLK_RATE		1536000
+ 
++/*
++ * violet diagnostic (audio A6).  The AFE firmware on this device answers the
++ * legacy LPASS core/HW vote request with "Unknown cmd" and times out (-110) on
++ * AFE_PARAM_ID_CLOCK_SET, which is what sm8250_snd_startup sends via
++ * Q6AFE_LPASS_CLK_ID_PRI_MI2S_IBIT.  Try the newer port-scoped clock param
++ * (AFE_PARAM_ID_LPAIF_CLK_CONFIG, SET_PARAM_V2) instead, or send nothing at all
++ * to isolate the clock call from the port start.
++ *   0 = IBIT clock id  -> CLOCK_SET        (0x10290, SET_PARAM v1)  [upstream]
++ *   1 = LPAIF_BIT_CLK  -> LPAIF_CLK_CONFIG (0x10238, SET_PARAM_V2)
++ *   2 = send no clock at all
++ */
++static int violet_slave;
++module_param(violet_slave, int, 0644);
++MODULE_PARM_DESC(violet_slave, "1: AFE MI2S port is clock slave (no internal bit clock)");
++static int clk_mode;
++module_param(clk_mode, int, 0644);
++MODULE_PARM_DESC(clk_mode, "AFE MI2S clock param: 0=IBIT/CLOCK_SET, 1=LPAIF_BIT_CLK, 2=none");
++
++static int sm8250_mi2s_clk(struct snd_soc_dai *cpu_dai, int ibit_id)
++{
++	int ret;
++
++	switch (clk_mode) {
++	default:
++	case 0:
++		ret = snd_soc_dai_set_sysclk(cpu_dai, ibit_id, MI2S_BCLK_RATE,
++					     SNDRV_PCM_STREAM_PLAYBACK);
++		break;
++	case 1:
++		ret = snd_soc_dai_set_sysclk(cpu_dai, LPAIF_BIT_CLK, MI2S_BCLK_RATE,
++					     SNDRV_PCM_STREAM_PLAYBACK);
++		break;
++	case 2:
++		ret = 0;
++		break;
++	}
++
++	dev_info(cpu_dai->dev, "mi2s clk: mode=%d ibit_id=%d -> %d\n",
++		 clk_mode, ibit_id, ret);
++	return ret;
++}
++
+ struct sm8250_snd_data {
+ 	bool stream_prepared[AFE_PORT_MAX];
+ 	struct snd_soc_card *card;
+@@ -73,8 +115,8 @@
+ 
+ static int sm8250_snd_startup(struct snd_pcm_substream *substream)
+ {
+-	unsigned int fmt = SND_SOC_DAIFMT_BP_FP;
+-	unsigned int codec_dai_fmt = SND_SOC_DAIFMT_BC_FC;
++	unsigned int fmt = violet_slave ? SND_SOC_DAIFMT_BC_FC : SND_SOC_DAIFMT_BP_FP;
++	unsigned int codec_dai_fmt = violet_slave ? SND_SOC_DAIFMT_BP_FP : SND_SOC_DAIFMT_BC_FC;
+ 	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
+ 	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
+ 	struct snd_soc_dai *codec_dai = snd_soc_rtd_to_codec(rtd, 0);
+@@ -82,9 +124,7 @@
+ 	switch (cpu_dai->id) {
+ 	case PRIMARY_MI2S_RX:
+ 		codec_dai_fmt |= SND_SOC_DAIFMT_NB_NF | SND_SOC_DAIFMT_I2S;
+-		snd_soc_dai_set_sysclk(cpu_dai,
+-			Q6AFE_LPASS_CLK_ID_PRI_MI2S_IBIT,
+-			MI2S_BCLK_RATE, SNDRV_PCM_STREAM_PLAYBACK);
++		sm8250_mi2s_clk(cpu_dai, Q6AFE_LPASS_CLK_ID_PRI_MI2S_IBIT);
+ 		snd_soc_dai_set_fmt(cpu_dai, fmt);
+ 		snd_soc_dai_set_fmt(codec_dai, codec_dai_fmt);
+ 		break;

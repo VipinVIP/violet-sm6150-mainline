@@ -1,0 +1,17 @@
+--- a/drivers/pmdomain/qcom/rpmhpd.c
++++ b/drivers/pmdomain/qcom/rpmhpd.c
+@@ -877,6 +877,14 @@
+ static struct rpmhpd *qcs615_rpmhpds[] = {
+ 	[RPMHPD_CX] = &cx,
+ 	[RPMHPD_CX_AO] = &cx_ao,
++	/*
++	 * The modem (mpss) votes on the MSS rail: qcom_q6v5_pas's
++	 * mpss_resource_init attaches proxy power domains "cx" and "mss", and
++	 * without this entry qcom_pas_pds_attach() fails with -ENODATA, which
++	 * is what has kept mpss - and therefore the WLAN firmware bootstrap -
++	 * off on violet.
++	 */
++	[RPMHPD_MSS] = &mss,
+ };
+ 
+ static const struct rpmhpd_desc qcs615_desc = {

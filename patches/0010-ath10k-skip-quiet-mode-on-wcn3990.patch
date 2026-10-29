@@ -1,0 +1,18 @@
+--- a/drivers/net/wireless/ath/ath10k/thermal.c
++++ b/drivers/net/wireless/ath/ath10k/thermal.c
+@@ -136,6 +136,15 @@
+ 	if (!ar->wmi.ops->gen_pdev_set_quiet_mode)
+ 		return;
+ 
++	/*
++	 * violet: WCN3990 HL3.x firmware advertises WMI_SERVICE_THERM_THROT in
++	 * its service map but asserts (EX:wlan_process ... WLAN RT) on the
++	 * quiet-mode WMI command right after vdev create.  Same failure as the
++	 * March 2026 ath10k report for the OnePlus 7T.
++	 */
++	if (QCA_REV_WCN3990(ar))
++		return;
++
+ 	if (ar->state != ATH10K_STATE_ON)
+ 		return;
+ 

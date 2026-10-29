@@ -1,0 +1,31 @@
+From: VipinVIP <VipinVIP@users.noreply.github.com>
+Subject: [PATCH] spmi: pmic-arb: ack and disable stale interrupts outside the requested range
+
+When booted by kexec from a kernel that left peripheral interrupts enabled, the level
+interrupt of an unowned/unrequested APID would stay asserted forever and storm.  Ack it and
+mask it at the peripheral.
+---
+--- a/drivers/spmi/spmi-pmic-arb.c
++++ b/drivers/spmi/spmi-pmic-arb.c
+@@ -785,6 +785,21 @@
+ 			if (apid < first || apid > last) {
+ 				WARN_ONCE(true, "spurious spmi irq received for apid=%d\n",
+ 					apid);
++				/*
++				 * Interrupts left enabled by a previous kernel (e.g. when kexec'ed
++				 * from a downstream kernel) for peripherals nobody here listens to
++				 * would keep this level interrupt asserted forever: ack and
++				 * disable them.
++				 */
++				{
++					u16 ppid = bus->apid_data[apid].ppid;
++					u8 en = 0xff;
++
++					writel_relaxed(0xff, ver_ops->irq_clear(bus, apid));
++					pmic_arb_write_cmd(bus->spmic, SPMI_CMD_EXT_WRITEL, ppid >> 8,
++							   ((ppid & 0xff) << 8) + QPNPINT_REG_EN_CLR, &en, 1);
++					writel_relaxed(0, ver_ops->acc_enable(bus, apid));
++				}
+ 				continue;
+ 			}
+ 			enable = readl_relaxed(

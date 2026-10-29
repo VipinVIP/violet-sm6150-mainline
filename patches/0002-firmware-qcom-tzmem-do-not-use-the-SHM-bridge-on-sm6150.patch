@@ -1,0 +1,18 @@
+From: VipinVIP <VipinVIP@users.noreply.github.com>
+Subject: [PATCH] firmware: qcom: tzmem: do not enable the SHM bridge on sm6150
+
+Once Linux enables the TrustZone SHM bridge on SM6150 (Snapdragon 675), TZ rejects every
+PAS_INIT_IMAGE call (error 0xffcfffbb), so e.g. the Adreno zap shader can never be
+authenticated.  Downstream never enables it.  Add qcom,sm6150 to the blacklist next to
+sm7150/sm8150/sdm845.
+---
+--- a/drivers/firmware/qcom/qcom_tzmem.c
++++ b/drivers/firmware/qcom/qcom_tzmem.c
+@@ -83,6 +83,7 @@
+ 	"qcom,sdm670", /* failure in GPU firmware loading */
+ 	"qcom,sdm845", /* reset in rmtfs memory assignment */
+ 	"qcom,sm7150", /* reset in rmtfs memory assignment */
++	"qcom,sm6150", /* PAS_INIT_IMAGE is rejected once Linux enables the SHM bridge */
+ 	"qcom,sm8150", /* reset in rmtfs memory assignment */
+ 	NULL
+ };

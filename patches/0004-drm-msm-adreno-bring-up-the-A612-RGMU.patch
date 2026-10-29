@@ -1,0 +1,391 @@
+From: VipinVIP <VipinVIP@users.noreply.github.com>
+Subject: [PATCH] drm/msm/adreno: bring up the A612 RGMU
+
+The A612 has an RGMU which has to be started with its PCC table (a612_rgmu.bin) and a
+GPUSTART OOB before the GPU registers are accessible; the CPU must not take the GX power
+domain itself.  Follows the downstream kgsl sequence (wake and slumber).  The RGMU has no
+HFI/OOB firmware interface, so treat it like a GMU wrapper where those paths are used, but
+keep the AHB fence in fenced_write(): the RGMU uses it to wake GX when it was collapsed.
+
+The GPUSTART request is held for as long as the GPU is powered and only released on
+suspend: releasing it after hw_init() lets the RGMU power-collapse GX when the GPU idles,
+and the driver then keeps submitting to a GPU that has lost its state (the first job of
+each later power cycle faulted in the GPU SMMU).
+---
+--- a/drivers/gpu/drm/msm/adreno/a6xx_catalog.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_catalog.c
+@@ -687,7 +687,6 @@
+ 			[ADRENO_FW_SQE] = "a630_sqe.fw",
+ 		},
+ 		.gmem = (SZ_128K + SZ_4K),
+-		.quirks = ADRENO_QUIRK_4GB_VA,
+ 		.inactive_period = DRM_MSM_INACTIVE_PERIOD,
+ 		.funcs = &a6xx_gmuwrapper_funcs,
+ 		.zapfw = "a610_zap.mdt",
+@@ -720,6 +719,7 @@
+ 			[ADRENO_FW_GMU] = "a612_rgmu.bin",
+ 		},
+ 		.gmem = (SZ_128K + SZ_4K),
++		.quirks = ADRENO_QUIRK_4GB_VA,
+ 		.inactive_period = DRM_MSM_INACTIVE_PERIOD,
+ 		.funcs = &a6xx_gmuwrapper_funcs,
+ 		.a6xx = &(const struct a6xx_info) {
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
+@@ -10,6 +10,7 @@
+ #include "a6xx_gmu.xml.h"
+ 
+ #include <linux/bitfield.h>
++#include <linux/iopoll.h>
+ #include <linux/devfreq.h>
+ #include <linux/pm_domain.h>
+ #include <linux/soc/qcom/llcc-qcom.h>
+@@ -31,6 +32,17 @@
+ 	return (count_hi << 32) | count_lo;
+ }
+ 
++
++/*
++ * Targets with a GMU wrapper or an RGMU (A612) have no full GMU: there is no
++ * HFI/OOB firmware interface and none of the AHB fence registers exist.
++ */
++static inline bool a6xx_gmu_is_minimal(const struct adreno_gpu *adreno_gpu)
++{
++	return adreno_has_gmu_wrapper(adreno_gpu) || adreno_has_rgmu(adreno_gpu);
++}
++
++
+ static bool fence_status_check(struct msm_gpu *gpu, u32 offset, u32 value, u32 status, u32 mask)
+ {
+ 	/* Success if !writedropped0/1 */
+@@ -59,6 +71,7 @@
+ 	gpu_write(gpu, offset, value);
+ 
+ 	/* Nothing else to be done in the case of no-GMU */
++	/* The RGMU does have the AHB fence, it wakes GX for us when it was collapsed */
+ 	if (adreno_has_gmu_wrapper(adreno_gpu))
+ 		return 0;
+ 
+@@ -115,7 +128,7 @@
+ 	struct a6xx_gpu *a6xx_gpu = to_a6xx_gpu(adreno_gpu);
+ 
+ 	/* Check that the GMU is idle */
+-	if (!adreno_has_gmu_wrapper(adreno_gpu) && !a6xx_gmu_isidle(&a6xx_gpu->gmu))
++	if (!a6xx_gmu_is_minimal(adreno_gpu) && !a6xx_gmu_isidle(&a6xx_gpu->gmu))
+ 		return false;
+ 
+ 	/* Check tha the CX master is idle */
+@@ -1179,7 +1192,7 @@
+ 	unsigned int i;
+ 	int ret;
+ 
+-	if (!adreno_has_gmu_wrapper(adreno_gpu)) {
++	if (!a6xx_gmu_is_minimal(adreno_gpu)) {
+ 		/* Make sure the GMU keeps the GPU on while we set it up */
+ 		ret = a6xx_gmu_set_oob(&a6xx_gpu->gmu, GMU_OOB_GPU_SET);
+ 		if (ret)
+@@ -1512,7 +1525,7 @@
+ 	}
+ 
+ out:
+-	if (adreno_has_gmu_wrapper(adreno_gpu))
++	if (a6xx_gmu_is_minimal(adreno_gpu))
+ 		return ret;
+ 
+ 	/* Last step - yield the ringbuffer */
+@@ -1869,7 +1882,7 @@
+ 	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
+ 	struct a6xx_gpu *a6xx_gpu = to_a6xx_gpu(adreno_gpu);
+ 
+-	if (adreno_has_gmu_wrapper(adreno_gpu))
++	if (a6xx_gmu_is_minimal(adreno_gpu))
+ 		return;
+ 
+ 	gmu_write(&a6xx_gpu->gmu, REG_A6XX_GMU_GMU_PWR_COL_KEEPALIVE, on);
+@@ -1882,7 +1895,7 @@
+ 	struct a6xx_gmu *gmu = &a6xx_gpu->gmu;
+ 	u32 status;
+ 
+-	if (adreno_has_gmu_wrapper(adreno_gpu))
++	if (a6xx_gmu_is_minimal(adreno_gpu))
+ 		return 0;
+ 
+ 	if (gmu_poll_timeout_atomic(gmu, REG_A6XX_GMU_AO_AHB_FENCE_CTRL, status, !status, 1, 100)) {
+@@ -2155,6 +2168,200 @@
+ 	return ret;
+ }
+ 
++/*
++ * A612 RGMU.
++ *
++ * The RGMU is not a CPU running firmware we talk to over HFI: a612_rgmu.bin is a
++ * table for its power-collapse controller (PCC).  Once the table is loaded and
++ * the PCC is started, the RGMU owns the GX power domain and powers it up when the
++ * host raises the GPUSTART "OOB" request.  The sequences below follow what the
++ * downstream kgsl driver does (a6xx_rgmu_fw_start() & friends).
++ *
++ * The GPUSTART OOB is held for the whole time the GPU is powered (raised in
++ * a6xx_rgmu_start(), dropped in a6xx_rgmu_stop()): if it is released earlier the
++ * RGMU power-collapses GX as soon as the GPU idles and the driver, which does not
++ * know, keeps using a GPU that lost its state.
++ *
++ * All offsets are dword offsets from the GPU base, as for the other GMU
++ * registers (see gmu_read()/gmu_write()).
++ */
++#define RGMU_GENERAL_0			0x1F9C5
++#define RGMU_GENERAL_7			0x1F9CC
++#define RGMU_ITCM_START			0x1B400
++#define RGMU_PWR_COUNTER_ENABLE		0x1F840
++#define RGMU_PWR_COUNTER_1		0x1F841
++#define RGMU_PWR_COUNTER_2		0x1F842
++#define RGMU_PWR_COL_HYST_CTRL		0x1F8C0
++#define RGMU_PWR_COL_HYST		0x1F8C1
++#define RGMU_PWR_COL_MISC		0x1F8C3
++#define RGMU_SPTPRAC_PWR_CLK_STATUS	0x1F8D0
++#define RGMU_CX_INTR_GEN_EN		0x1F80F
++#define RGMU_PCC_CTRL			0x1F838
++#define RGMU_PCC_INIT_RESULT		0x1F839
++#define RGMU_PCC_DEBUG			0x1F83D
++#define RGMU_GMU2HOST_INTR_CLR		0x1F991
++#define RGMU_GMU2HOST_INTR_INFO		0x1F992
++#define RGMU_GMU2HOST_INTR_MASK		0x1F993
++#define RGMU_HOST2GMU_INTR_SET		0x1F994
++#define RGMU_HOST2GMU_INTR_EN_2		0x1F999
++#define RGMU_HOST2GMU_INTR_EN_3		0x1F99A
++#define RGMU_AO_INTERRUPT_EN		0x23B03
++#define RGMU_AO_HOST_INTR_CLR		0x23B04
++#define RGMU_AO_HOST_INTR_MASK		0x23B06
++#define RGMU_AO_PWR_SEQ_0		0x23B09
++#define RGMU_AO_PWR_SEQ_1		0x23B0A
++#define RGMU_AO_PWR_SEQ_2		0x23B0B
++#define RGMU_AO_PWR_SEQ_3		0x23B0E
++#define RGMU_AO_AHB_FENCE_CTRL		0x23B10
++#define RGMU_AO_AHB_FENCE_RANGE		0x23B11
++#define RGMU_GLM_SLEEP_CTRL		0x23B80
++#define RGMU_GLM_SLEEP_STATUS		0x23B81
++#define RGMU_GLM_HW_CRC_DISABLE		0x23B82
++/* GPU-side register the downstream driver pokes around slumber */
++#define RGMU_GPU_SLUMBER_CTRL		0x3C45
++
++#define RGMU_OOB_GPUSTART		0
++#define RGMU_GX_GDSC_POWER_OFF		BIT(6)
++
++static int a6xx_rgmu_oob_set(struct a6xx_gmu *gmu)
++{
++	u32 val;
++	int ret;
++
++	gmu_write(gmu, RGMU_HOST2GMU_INTR_SET, BIT(RGMU_OOB_GPUSTART + 16));
++
++	ret = readl_poll_timeout(gmu->mmio + GMU_BYTE_OFFSET(gmu, RGMU_GMU2HOST_INTR_INFO),
++				 val, val & BIT(RGMU_OOB_GPUSTART + 16), 100, 100000);
++	if (!ret)
++		gmu_write(gmu, RGMU_GMU2HOST_INTR_CLR, BIT(RGMU_OOB_GPUSTART + 16));
++
++	return ret;
++}
++
++static void a6xx_rgmu_oob_clear(struct a6xx_gmu *gmu)
++{
++	gmu_write(gmu, RGMU_HOST2GMU_INTR_SET, BIT(RGMU_OOB_GPUSTART + 24));
++}
++
++static int a6xx_rgmu_start(struct a6xx_gpu *a6xx_gpu)
++{
++	struct adreno_gpu *adreno_gpu = &a6xx_gpu->base;
++	struct msm_gpu *gpu = &adreno_gpu->base;
++	struct a6xx_gmu *gmu = &a6xx_gpu->gmu;
++	const struct firmware *fw = adreno_gpu->fw[ADRENO_FW_GMU];
++	const __le32 *data;
++	u32 val;
++	int i, ret;
++
++	if (!fw)
++		return -ENOENT;
++
++	data = (const __le32 *)fw->data;
++
++	/* Clear and mask all interrupts, we do not service the RGMU ones */
++	gmu_write(gmu, RGMU_GMU2HOST_INTR_CLR, 0xffffffff);
++	gmu_write(gmu, RGMU_AO_HOST_INTR_CLR, 0xffffffff);
++	gmu_write(gmu, RGMU_GMU2HOST_INTR_MASK, 0x00ffffff);
++	gmu_write(gmu, RGMU_AO_HOST_INTR_MASK, 0xfffffff7);
++
++	/* Keep the TCM contents, then load the PCC table through the AHB */
++	gmu_write(gmu, RGMU_GENERAL_7, 1);
++	for (i = 0; i < fw->size / 4; i++)
++		gmu_write(gmu, RGMU_ITCM_START + i, le32_to_cpu(data[i]));
++
++	gmu_write(gmu, RGMU_PWR_COUNTER_ENABLE, 1);
++	gmu_write(gmu, RGMU_PWR_COL_HYST, 0x000a1680);
++	gmu_write(gmu, RGMU_PWR_COL_HYST_CTRL, 1);
++	gmu_write(gmu, RGMU_CX_INTR_GEN_EN, 0x00020060);
++	gmu_write(gmu, RGMU_AO_INTERRUPT_EN, 0x8);
++	gmu_write(gmu, RGMU_HOST2GMU_INTR_EN_2, 0x00ff0000);
++	gmu_write(gmu, RGMU_HOST2GMU_INTR_EN_3, 0xff000000);
++
++	/* AHB fence range, and let writes through */
++	gmu_write(gmu, RGMU_AO_AHB_FENCE_RANGE, BIT(31) | ((0xa << 2) << 18) | 0x8a0);
++	gmu_write(gmu, RGMU_AO_AHB_FENCE_CTRL, 0);
++
++	/* BCL: enable the HW CRC interface */
++	gmu_write(gmu, RGMU_GLM_HW_CRC_DISABLE, 0);
++
++	/* Reset the PCC, then let it run */
++	gmu_write(gmu, RGMU_PCC_CTRL, 0);
++	wmb();
++	gmu_write(gmu, RGMU_PCC_CTRL, 1);
++
++	ret = readl_poll_timeout(gmu->mmio + GMU_BYTE_OFFSET(gmu, RGMU_PCC_INIT_RESULT),
++				 val, val & 1, 100, 100000);
++	if (ret) {
++		DRM_DEV_ERROR(gmu->dev, "RGMU boot failed, PCC debug %08x\n",
++			      gmu_read(gmu, RGMU_PCC_DEBUG));
++		return ret;
++	}
++
++	gpu_write(gpu, RGMU_GPU_SLUMBER_CTRL, 0);
++
++	/* Ask the RGMU to power up GX */
++	ret = a6xx_rgmu_oob_set(gmu);
++	if (ret) {
++		DRM_DEV_ERROR(gmu->dev, "RGMU GPUSTART request timed out, PCC debug %08x\n",
++			      gmu_read(gmu, RGMU_PCC_DEBUG));
++		return ret;
++	}
++
++	/* Remaining power-up programming done by downstream after GPUSTART */
++	gmu_write(gmu, RGMU_AO_PWR_SEQ_0, 0x22);
++	gmu_write(gmu, RGMU_AO_PWR_SEQ_1, 0x11);
++	gmu_write(gmu, RGMU_AO_PWR_SEQ_2, 0x55);
++	gmu_write(gmu, RGMU_PWR_COUNTER_2, 0xdeafbe04);
++	gmu_write(gmu, RGMU_AO_PWR_SEQ_3, 0xff000000);
++	gmu_write(gmu, RGMU_PWR_COUNTER_1, 0x20);
++	gmu_write(gmu, RGMU_PWR_COUNTER_ENABLE, 1);
++	for (i = 0; i < 3; i++) {
++		gmu_write(gmu, RGMU_PWR_COL_MISC, 1);
++		gmu_write(gmu, RGMU_PWR_COL_MISC, 0);
++	}
++
++	return 0;
++}
++
++/* Called after the buses are halted, before the clocks go away */
++static void a6xx_rgmu_stop(struct a6xx_gpu *a6xx_gpu)
++{
++	struct msm_gpu *gpu = &a6xx_gpu->base.base;
++	struct a6xx_gmu *gmu = &a6xx_gpu->gmu;
++	u32 val;
++
++	/* Release the GPUSTART request (held since resume) so the RGMU may collapse GX */
++	a6xx_rgmu_oob_clear(gmu);
++
++	gpu_write(gpu, RGMU_GPU_SLUMBER_CTRL, 1);
++	gpu_write(gpu, RGMU_GPU_SLUMBER_CTRL, 2);
++	gpu_write(gpu, RGMU_GPU_SLUMBER_CTRL, 0);
++
++	gmu_write(gmu, RGMU_PWR_COUNTER_ENABLE, 0);
++
++	/* BCL off: disable the HW CRC interface and wait for the ack */
++	gmu_write(gmu, RGMU_GLM_HW_CRC_DISABLE, 1);
++	if (readl_poll_timeout(gmu->mmio + GMU_BYTE_OFFSET(gmu, RGMU_GLM_SLEEP_STATUS),
++			       val, val & BIT(1), 100, 10000))
++		DRM_DEV_ERROR(gmu->dev, "timed out waiting for HW CRC disable ack\n");
++	gmu_rmw(gmu, RGMU_GLM_SLEEP_CTRL, BIT(7), 0);
++
++	gmu_write(gmu, RGMU_AO_HOST_INTR_MASK, 0xffffffff);
++	gmu_write(gmu, RGMU_GMU2HOST_INTR_MASK, 0xffffffff);
++	gmu_write(gmu, RGMU_AO_HOST_INTR_CLR, 0xffffffff);
++	gmu_write(gmu, RGMU_GMU2HOST_INTR_CLR, 0xffffffff);
++
++	/*
++	 * If the RGMU left GX on, take the power domain over and release it, like
++	 * the downstream driver does ("switch gx gdsc control from RGMU to CPU").
++	 */
++	if (!(gmu_read(gmu, RGMU_SPTPRAC_PWR_CLK_STATUS) & RGMU_GX_GDSC_POWER_OFF)) {
++		pm_runtime_resume_and_get(gmu->gxpd);
++		pm_runtime_put_sync(gmu->gxpd);
++	}
++}
++
++
+ static int a6xx_pm_resume(struct msm_gpu *gpu)
+ {
+ 	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
+@@ -2181,25 +2388,45 @@
+ 	dev_pm_opp_set_opp(&gpu->pdev->dev, opp);
+ 
+ 	pm_runtime_resume_and_get(gmu->dev);
+-	pm_runtime_resume_and_get(gmu->gxpd);
++	/* On RGMU targets the RGMU, not the CPU, controls the GX power domain */
++	if (!adreno_has_rgmu(adreno_gpu))
++		pm_runtime_resume_and_get(gmu->gxpd);
+ 
+ 	ret = clk_bulk_prepare_enable(gpu->nr_clocks, gpu->grp_clks);
+ 	if (ret)
+ 		goto err_bulk_clk;
+ 
++	if (adreno_has_rgmu(adreno_gpu)) {
++		int i;
++
++		/* The RGMU needs to run at 200 MHz */
++		for (i = 0; i < gmu->nr_clocks; i++)
++			if (!strcmp(gmu->clocks[i].id, "gmu"))
++				clk_set_rate(gmu->clocks[i].clk, 200000000);
++	}
++
+ 	ret = clk_bulk_prepare_enable(gmu->nr_clocks, gmu->clocks);
+ 	if (ret) {
+ 		clk_bulk_disable_unprepare(gpu->nr_clocks, gpu->grp_clks);
+ 		goto err_bulk_clk;
+ 	}
+ 
++	if (adreno_has_rgmu(adreno_gpu)) {
++		ret = a6xx_rgmu_start(a6xx_gpu);
++		if (ret) {
++			clk_bulk_disable_unprepare(gmu->nr_clocks, gmu->clocks);
++			clk_bulk_disable_unprepare(gpu->nr_clocks, gpu->grp_clks);
++		}
++	}
++
+ 	if (adreno_is_a619_holi(adreno_gpu))
+ 		a6xx_sptprac_enable(gmu);
+ 
+ 	/* If anything goes south, tear the GPU down piece by piece.. */
+ 	if (ret) {
+ err_bulk_clk:
+-		pm_runtime_put(gmu->gxpd);
++		if (!adreno_has_rgmu(adreno_gpu))
++			pm_runtime_put(gmu->gxpd);
+ 		pm_runtime_put(gmu->dev);
+ 		dev_pm_opp_set_opp(&gpu->pdev->dev, NULL);
+ 	}
+@@ -2259,13 +2486,17 @@
+ 	/* Drain the outstanding traffic on memory buses */
+ 	adreno_gpu->funcs->bus_halt(adreno_gpu, true);
+ 
++	if (adreno_has_rgmu(adreno_gpu))
++		a6xx_rgmu_stop(a6xx_gpu);
++
+ 	if (adreno_is_a619_holi(adreno_gpu))
+ 		a6xx_sptprac_disable(gmu);
+ 
+ 	clk_bulk_disable_unprepare(gpu->nr_clocks, gpu->grp_clks);
+ 	clk_bulk_disable_unprepare(gmu->nr_clocks, gmu->clocks);
+ 
+-	pm_runtime_put_sync(gmu->gxpd);
++	if (!adreno_has_rgmu(adreno_gpu))
++		pm_runtime_put_sync(gmu->gxpd);
+ 	dev_pm_opp_set_opp(&gpu->pdev->dev, NULL);
+ 	pm_runtime_put_sync(gmu->dev);
+ 
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gpu.h
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gpu.h
+@@ -117,6 +117,7 @@
+ 	void *htw_llc_slice;
+ 	bool have_mmu500;
+ 	bool hung;
++	bool rgmu_pm_held;
+ 
+ 	u32 cached_aperture;
+ 	spinlock_t aperture_lock;
