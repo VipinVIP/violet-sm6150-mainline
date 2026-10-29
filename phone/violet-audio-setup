@@ -1,0 +1,9 @@
+#!/bin/sh
+export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+# Session autostart: route MultiMedia3 -> PRI_MI2S_RX (speaker) and make it the default PulseAudio sink.
+A=$(amixer -c 0 controls | grep "PRI_MI2S_RX Audio Mixer MultiMedia3'" | sed "s/numid=\([0-9]*\).*/\1/")
+[ -n "$A" ] && amixer -c 0 cset numid=$A on >/dev/null
+for i in 1 2 3 4 5 6 7 8 9 10; do pactl info >/dev/null 2>&1 && break; sleep 1; done
+pactl list short sinks | grep -q violet_speaker || pactl load-module module-alsa-sink sink_name=violet_speaker device=hw:0,2 rate=48000 channels=2 format=s16le tsched=0 fragments=4 fragment_size=16384 >/dev/null
+pactl set-default-sink violet_speaker
+pactl set-sink-volume violet_speaker 50%

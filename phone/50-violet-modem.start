@@ -1,0 +1,6 @@
+#!/bin/sh
+# Mainline violet only: bring up the modem (and with it WiFi) at boot.
+# Started from local.d because OpenRC's stale deptree never starts services added after Oct 12.
+case "$(uname -r)" in *sm6150*) ;; *) exit 0 ;; esac
+rc-service violet-modem start >/dev/null 2>&1 &
+exit 0

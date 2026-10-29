@@ -1,0 +1,63 @@
+#!/sbin/openrc-run
+# violet-modem — boot the SM6150 modem (MPSS) so the WCN3990 WLAN firmware comes up.
+#
+# On this SoC the WLAN firmware is started by the modem, and the mainline PAS remoteproc
+# does not autostart it (mpss_resource_init has auto_boot = false).  rmtfs and tqftpserv
+# must already be running; pd-mapper, ipa and ath10k_snoc are kernel modules loaded by udev.
+# The first start after a boot sometimes never registers on QRTR and fatals after 40 s,
+# (the modem's own SSR recovery then brings it up within ~50 s), so wait long enough for that
+# cycle, and only stop/start again if wlan0 still has not shown up.
+#
+# Mainline only; harmless no-op on the downstream r10 kernel.
+
+description="Start the modem (MPSS) so WiFi can come up"
+LOG=/var/log/violet-modem.log
+
+depend() {
+	need localmount rmtfs tqftpserv
+	after udev-postmount modules
+}
+
+_rproc() {
+	for d in /sys/class/remoteproc/remoteproc*; do
+		[ "$(cat "$d/name" 2>/dev/null)" = "modem" ] && { echo "$d"; return 0; }
+	done
+	return 1
+}
+
+_run() {
+	rp=$(_rproc) || { echo "no modem remoteproc" >> "$LOG"; return 1; }
+	n=0
+	while [ $n -lt 4 ]; do
+		[ "$(cat "$rp/state")" = "running" ] || echo start > "$rp/state"
+		echo "$(date +%T) attempt $n: modem state $(cat "$rp/state")" >> "$LOG"
+		w=0
+		while [ $w -lt 120 ]; do
+			sleep 1; w=$((w + 1))
+			[ -d /sys/class/net/wlan0 ] && { echo "$(date +%T) wlan0 up after ${w}s (attempt $n)" >> "$LOG"; return 0; }
+		done
+		echo "$(date +%T) no wlan0 after 120s, restarting the modem" >> "$LOG"
+		echo stop > "$rp/state"; sleep 2
+		n=$((n + 1))
+	done
+	return 1
+}
+
+start() {
+	case "$(uname -r)" in *sm6150*) ;; *) return 0 ;; esac
+	: > "$LOG"
+	# OpenRC's deptree cache is dated Oct 12 and the phone's clock is near 1970 after boot,
+	# so services added later are never picked up by the runlevel: start the helpers ourselves.
+	for s in tqftpserv rmtfs; do
+		rc-service -q "$s" status >/dev/null 2>&1 || rc-service "$s" start >/dev/null 2>&1
+	done
+	ebegin "Starting modem in the background (see $LOG)"
+	( _run ) >/dev/null 2>&1 &
+	eend 0
+}
+
+stop() {
+	case "$(uname -r)" in *sm6150*) ;; *) return 0 ;; esac
+	rp=$(_rproc) && echo stop > "$rp/state"
+	return 0
+}

@@ -1,0 +1,4 @@
+#!/bin/sh
+# violet: the Adreno GPU path hangs the whole phone under Firefox; force software GL/WebRender-off.
+export LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe MOZ_WEBRENDER=0
+exec /usr/bin/firefox-esr "$@"

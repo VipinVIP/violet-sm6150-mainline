@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Violet speaker routing
+Exec=/usr/local/bin/violet-audio-setup
+NoDisplay=true
+X-GNOME-Autostart-Phase=Applications

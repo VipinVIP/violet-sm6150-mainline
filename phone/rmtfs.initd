@@ -1,0 +1,45 @@
+#!/sbin/openrc-run
+# rmtfs — provides the modem's EFS storage over QMI (service 14).
+#
+# The modem's `efs sync` fails and the firmware asserts within ~1 s if nobody
+# answers its open() requests, so this must be running *before* the modem is
+# started.
+#
+# NOTE: -o is the storage root.  -s only enables the mss rproc sync hook and
+# takes no argument; using -s <dir> silently leaves storage at /boot.
+
+name="rmtfs"
+description="Qualcomm remote filesystem service (modem EFS)"
+
+: ${RMTFS_STORAGE:=/var/lib/rmtfs}
+
+command="/usr/bin/rmtfs"
+command_args="-o ${RMTFS_STORAGE}"
+command_background="yes"
+pidfile="/run/rmtfs.pid"
+
+depend() {
+	need localmount
+	after dbus
+}
+
+start_pre() {
+	if [ ! -x /usr/bin/rmtfs ]; then
+		eerror "rmtfs is not installed (apk add rmtfs)"
+		return 1
+	fi
+	checkpath -d -m 0755 "${RMTFS_STORAGE}"
+	# The modem refuses to boot without these three files; seed them from the
+	# EFS partitions once so the firmware has something to read.
+	_seed() {
+		part=$1
+		file=$2
+		[ -f "${RMTFS_STORAGE}/${file}" ] && return 0
+		[ -e "/dev/disk/by-partlabel/${part}" ] || return 0
+		einfo "seeding ${file} from /dev/disk/by-partlabel/${part}"
+		dd if="/dev/disk/by-partlabel/${part}" of="${RMTFS_STORAGE}/${file}" 2>/dev/null
+	}
+	_seed modemst1 modem_fs1
+	_seed modemst2 modem_fs2
+	_seed fsg modem_fsg
+}
