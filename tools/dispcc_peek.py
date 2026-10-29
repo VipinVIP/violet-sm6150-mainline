@@ -1,0 +1,6 @@
+import mmap,os,struct,sys
+# reads a few DISP_CC registers (0xaf00000 + off)
+fd=os.open("/dev/mem",os.O_RDONLY|os.O_SYNC)
+m=mmap.mmap(fd,0x3000,mmap.MAP_SHARED,mmap.PROT_READ,offset=0xaf00000)
+for o in (0x20d8,0x2028,0x202c,0x2024,0x2008,0x2010,0x2014,0x2074,0x2078,0x207c,0x2080,0x2060,0x2064,0x2068,0x206c,0x2070):
+    print("%04x %08x"%(o,struct.unpack("<I",m[o:o+4])[0]))
