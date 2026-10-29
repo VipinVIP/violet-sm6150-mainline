@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# ssh to the phone over USB-NCM, re-resolving the link-local address every call.
+# The gadget re-enumerates with a new MAC/IPv6 on every boot, so a cached address
+# goes stale and ssh fails with "could not resolve %enp0s20f0u4" (empty IP).
+#
+# Usage: ./rssh '<remote command>'        ./rssh -t '<interactive cmd>'
+#        ./rscp <local> :/remote/path     (scp needs the brackets, ssh must not)
+set -uo pipefail
+IF=${IF:-enp0s20f0u4}
+resolve() {
+	ping -6 -c1 -W1 "ff02::1%$IF" >/dev/null 2>&1
+	ip -6 neigh show dev "$IF" 2>/dev/null | awk '/REACHABLE|STALE|DELAY/{print $1; exit}'
+}
+
+case $(basename "$0") in
+rscp)
+	src=$1; dst=$2
+	DNS=$(resolve); [ -n "$DNS" ] || { echo "rscp: no phone on $IF" >&2; exit 1; }
+	exec scp -6 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+		"$src" "user@[${DNS}%${IF}]:${dst#:}"
+	;;
+esac
+
+DNS=$(resolve)
+[ -n "$DNS" ] || { echo "rssh: no phone on $IF (plug it in / power it on)" >&2; exit 1; }
+exec ssh -T -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+	-o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 \
+	"user@${DNS}%${IF}" "$@"

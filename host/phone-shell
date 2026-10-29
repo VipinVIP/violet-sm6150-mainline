@@ -1,0 +1,7 @@
+#!/bin/bash
+# interactive shell on the phone (USB link-local, falls back to WiFi <phone-ip>)
+IF=${IF:-enp0s20f0u4}
+ping -6 -c1 -W1 ff02::1%$IF >/dev/null 2>&1
+A=$(ip -6 neigh show dev $IF 2>/dev/null | awk '/REACHABLE|STALE|DELAY/{print $1; exit}')
+if [ -n "$A" ]; then T="user@${A}%${IF}"; else T="user@<phone-ip>"; fi
+exec ssh -t -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR "$T"
