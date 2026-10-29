@@ -386,7 +386,7 @@ Correction + third try: the vote that fails is DCODEC (block 4, "AFE failed to v
 **Newest first.** Add each new entry directly under this header block, as a `## YYYY-MM-DD HH:MM — title`
 heading (subsections `###`). Use the real wall-clock time (`date`), not a guess.
 
-Related: [PLAN.md](../PLAN.md) (design) · [STATUS.md](STATUS.md) (what works / what doesn't, right now) ·
+Related: [PLAN.md](PLAN.md) (design) · [STATUS.md](STATUS.md) (what works / what doesn't, right now) ·
 [RULED-OUT.md](RULED-OUT.md) (dead ends and lessons — check before re-testing anything).
 
 > **Reordered on 2026-10-25 ~11:10** when this log was split out of PLAN.md. Entries are verbatim

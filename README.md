@@ -39,6 +39,7 @@ lists exactly what is left and whether each item needs physical USB access.
 | `docs/CHECKLIST.md` | What remains, with a "needs the USB cable?" column, plus historical measurement tables |
 | `docs/PROGRESS.md` | Dated engineering log, newest first — the actual evidence trail |
 | `docs/RULED-OUT.md` | Dead ends and the exact experiments that killed them — read before re-testing anything |
+| `docs/PLAN.md` | Why mainline is the only route to GPU acceleration here, and how the plan was sequenced |
 | `docs/REPRODUCE.md` | Build and flash walkthrough, firmware notes, expected output, failure modes |
 | `patches/` | 17 patches against vanilla 7.2.10, in series order (`patches/README.md` explains each) |
 | `dt/violet-sm6150.dts` | The board DTS exactly as flashed — authoritative over the DTS inside patch 0001 |
