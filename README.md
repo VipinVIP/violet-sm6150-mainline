@@ -44,7 +44,7 @@ lists exactly what is left and whether each item needs physical USB access.
 | `patches/` | 17 patches against vanilla 7.2.10, in series order (`patches/README.md` explains each) |
 | `dt/violet-sm6150.dts` | The board DTS exactly as flashed — authoritative over the DTS inside patch 0001 |
 | `configs/` | Kernel `.config` used to build the shipped image |
-| `host/` | Scripts that run on your build machine (boot image, fastboot, ssh helpers); `host/legacy/` = the earlier kexec workflow |
+| `host/` | Scripts that run on your build machine (boot image, fastboot, ssh helpers) |
 | `phone/` | Scripts and config files that run on the device (audio, modem, WiFi, session, ATL) |
 | `tools/` | Probe/debug utilities (registers, DRM, I2C, GPU, ACPI-adjacent pokes) |
 
@@ -59,11 +59,11 @@ curl -LO https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.2.10.tar.xz
 tar xf linux-7.2.10.tar.xz && cd linux-7.2.10
 
 # 2. patch series, then the authoritative DTS on top
-for p in ../patches/0*.patch; do git apply "$p" || echo "FAILED: $p"; done
+git apply ../patches/violet-7.2.10-all.patch   # consolidated; the numbered patches are per-feature history
 cp ../dt/violet-sm6150.dts arch/arm64/boot/dts/qcom/violet-sm6150.dts
 
 # 3. configure and build
-cp ../configs/config-7.2.10-sm6150-2026-10-27 .config
+cp ../configs/config-7.2.10-sm6150-2026-11-02 .config
 make ARCH=arm64 LLVM=1 olddefconfig
 make ARCH=arm64 LLVM=1 -j"$(nproc)" Image qcom/violet-sm6150.dtb
 

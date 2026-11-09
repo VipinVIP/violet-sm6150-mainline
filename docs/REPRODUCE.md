@@ -48,10 +48,10 @@ git apply ../patches/violet-7.2.10-all.patch
 `dw9800`, `qcom-lcdb-regulator`, `pinctrl-sm6150-lpass-lpi`, `violet-vbat`). It is the authoritative source.
 
 The numbered patches in `patches/` are the per-feature history, useful for reading and for upstreaming. **Do not
-apply them in sequence**: the series contains superseded and diagnostic patches (0014, 0019-0023, 0026, 0027, 0033
-touch code that later changed or was removed), measured on 2026-11-09 against pristine 7.2.10: 0015, 0021, 0023,
-0032 and 0033 fail to apply in order, and 0043/0044 are not in a format `git apply` accepts. `patches/README.md`
-lists what each one does and its status.
+apply them in sequence.** On 2026-11-09 the full old series failed against pristine 7.2.10 (0015, 0021, 0023, 0032 and
+0033 did not apply in order; 0043/0044 are not in a format `git apply` accepts). The superseded and diagnostic
+patches (0014, 0019-0023, 0026, 0027, 0033, plus 0005) were removed from the repo on 2026-11-09 (they remain in git
+history). `patches/README.md` lists what each remaining one does.
 
 The kernel config is `configs/config-7.2.10-sm6150-2026-11-02` (the same as the flashed tree's `.config` apart from
 the clang version strings). Earlier dated configs are kept for history.

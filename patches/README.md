@@ -1,3 +1,5 @@
+> **2026-11-09:** use `violet-7.2.10-all.patch` (one `git apply` on pristine 7.2.10, verified). The numbered patches below are per-feature history; do not apply them in sequence. Removed from the repo (still in git history): 0005, 0014, 0019-0023, 0026, 0027, 0033, `violet-udc-repair`, the camtest debug driver, and `host/legacy` (kexec workflow).
+
 # Patches against vanilla Linux 7.2.10
 
 No git tree: patches were saved by hand. `violet-vbat.c` is a new file, the others are diffs. Status as of 2026-10-27.
