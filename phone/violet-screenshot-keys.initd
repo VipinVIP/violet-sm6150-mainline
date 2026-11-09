@@ -1,0 +1,13 @@
+#!/sbin/openrc-run
+# Power + Volume Down => screenshot (see violet-screenshot-keys.py)
+description="Android-style screenshot button chord"
+command=/usr/local/bin/violet-screenshot-keys
+command_background=true
+pidfile=/run/violet-screenshot-keys.pid
+output_log=/var/log/violet-screenshot-keys.log
+error_log=/var/log/violet-screenshot-keys.log
+
+depend() {
+	need localmount
+	after elogind
+}

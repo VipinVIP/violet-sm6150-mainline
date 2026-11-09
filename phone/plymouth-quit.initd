@@ -1,0 +1,23 @@
+#!/sbin/openrc-run
+# Quit the Plymouth splash once the session manager is starting, so phoc can take
+# over the DRM device. Pair of phone/plymouth.initd - see the enable block there.
+#
+# Deliberately a separate service rather than a `stop` in greetd: greetd must not
+# depend on plymouth (a splash failure must never block the session), while the
+# quit has to happen before phoc opens the card - hence `before greetd`. (An
+# earlier draft had `after greetd`, which let phoc race plymouthd for DRM master.)
+# `after`, not `need`: if plymouth is absent or failed, this is a harmless no-op.
+
+description="Quit the Plymouth boot splash"
+depend() {
+	after plymouth
+	before greetd
+}
+
+start() {
+	ebegin "Quitting Plymouth splash"
+	# --retain-splash keeps the last splash frame on the panel until phoc's first
+	# modeset replaces it, so there is no black gap between splash and lockscreen.
+	plymouth quit --retain-splash --wait 2>/dev/null || plymouth --quit 2>/dev/null
+	eend 0
+}

@@ -35,8 +35,32 @@ fi
 
 export GLISSANDO_DATA_DIR="$PREFIX/share/glissando"
 start=$(date +%s)
-"$PREFIX/bin/glissando" --allow-replacement
-rc=$?
+# phosh 0.58 (Alpine edge) starts its own OSK — /usr/bin/phosh-osk-stevia — from the
+# shell. If it already owns the input seat when we come up, glissando refuses to start
+# ("another input method is already running on this seat") and the session ends up on
+# stevia. The retry loop below frees the seat before every attempt.
+# Try more than once: phosh may (re)start its own OSK at any point during session
+# bring-up, and glissando exits immediately if the seat is taken when it starts.
+# Three short attempts cover the orderings we have actually observed, and the
+# fallback below stays as the last resort so a keyboard always exists.
+attempt=0
+rc=1
+while [ "$attempt" -lt 3 ]; do
+	attempt=$((attempt + 1))
+	for rival in phosh-osk-stevia squeekboard; do
+		if pkill -f "$rival" 2>/dev/null; then
+			sleep 1
+		fi
+	done
+	"$PREFIX/bin/glissando" --allow-replacement
+	rc=$?
+	# 0 means it ran a whole session and exited normally: do not restart it
+	[ "$rc" -eq 0 ] && break
+	elapsed=$(( $(date +%s) - start ))
+	[ "$elapsed" -gt 10 ] && break		# it survived a while then died: real crash, not the race
+	echo "glissando-launch-system: attempt $attempt failed after ${elapsed}s (rc=$rc), retrying" >&2
+	sleep 2
+done
 
 {
 	[ -f "$STATE/crashes" ] && tail -n 5 "$STATE/crashes"

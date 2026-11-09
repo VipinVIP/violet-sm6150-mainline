@@ -9,7 +9,7 @@ IF=${IF:-enp0s20f0u4}
 [ -x "$ENV/bin/vncdo" ] || { python3 -m venv "$ENV" && "$ENV/bin/pip" install -q vncdotool; }
 ping -6 -c1 -W1 ff02::1%$IF >/dev/null 2>&1
 A=$(ip -6 neigh show dev $IF 2>/dev/null | awk '/REACHABLE|STALE|DELAY/{print $1; exit}')
-if [ -n "$A" ]; then T="user@${A}%${IF}"; else T="user@<phone-ip>"; fi
+if [ -n "$A" ]; then T="user@${A}%${IF}"; else T="user@<lan-ip>"; fi
 # restart the tunnel every time (wayvnc is restarted with the session)
 pkill -f "ssh -N -L 5901:127.0.0.1:5900" 2>/dev/null
 ssh -N -f -L 5901:127.0.0.1:5900 -o ExitOnForwardFailure=yes -o BatchMode=yes -o StrictHostKeyChecking=no \

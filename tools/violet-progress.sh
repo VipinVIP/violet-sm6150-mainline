@@ -71,7 +71,7 @@ while true; do
 	[ "$ONCE" = 1 ] || clear 2>/dev/null || printf '\033[H\033[2J'
 	printf ' violet / glissando keyboard build — %s   (refresh %ss, Ctrl-C to stop)\n' "$(date '+%H:%M:%S')" "$INTERVAL"
 	hr
-	printf ' PHONE (%s)\n' "<phone-ip> / USB-NCM"
+	printf ' PHONE (%s)\n' "<lan-ip> / USB-NCM"
 	phone_block
 	hr
 	printf ' LAPTOP\n'

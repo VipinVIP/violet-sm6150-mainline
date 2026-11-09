@@ -1,3 +1,1748 @@
+## 2026-11-07 14:47 - Vibrator ENABLED and flashed: pm6150_vib node turned on, driver binds, FF device present, feedbackd plays haptics
+
+Change: `&pm6150_vib { status = "okay"; };` added to `violet-sm6150.dts` (with a comment pointing at the pmi632 register-set match). DTB rebuilt (`make ARCH=arm64 LLVM=1 qcom/violet-sm6150.dtb`), verified in the compiled DTB (`fdtdump` -> `status = "okay"`), boot image rebuilt with `mk-bootimg.sh` (O=boot-mainline-vib.img, 46 MB, sha256 0a5fbb93...), and flashed `boot` only (45000 KB, OKAY) after dumping the old partition to `device-backup/boot-before-vib-20261107.img` (64 MB, sha256 65933539c6f93442405012c79a1b0bc20c1dd27b649d5b4f56059398c73cd4d0, also kept at /home/user/boot-before-vib.img).
+
+Verified after reboot:
+- `/proc/device-tree/.../pmic@1/vibrator@5300/status` = `okay`.
+- dmesg: `input: pm8xxx_vib_ffmemless as /devices/platform/soc@0/c440000.spmi/spmi-0/0-01/c440000.spmi:pmic@1:vibrator@5300/input/input4`.
+- `lsmod`: `pm8xxx_vibrator` loaded, `ff_memless` in use; new `/dev/input/event4` = `pm8xxx_vib_ffmemless`; FF caps `107030000`.
+- feedbackd 0.8.9 accepted `fbcli -E button-pressed` (3 quick + one 2 s). **User confirmed 2026-11-07 14:49: the long buzz was felt.** Replayed 3 short + 1 s + a double-tap rhythm afterwards as a final check.
+- **Perception threshold measured** (feedbackd `Haptic.Vibrate` sweep at 0.9 strength, 2026-11-07): 10 ms not felt, 20 ms felt but "too quick", 30 ms "very feelable", 60/120 ms clear. Set `~/.config/glissando/config.toml` to `haptics = true`, `haptic_strength = 0.9`, `haptic_ms = 30` (Glissando reloads it live).
+- **Why nothing buzzed before on any UI interaction:** feedbackd's default theme (`/usr/share/feedbackd/themes/default.json`) asks for `button-pressed`/`key-pressed` = 7 ms at **0.2** strength and `*-released` = 12 ms - far under this motor's ~20-30 ms spin-up. Glissando bypasses the theme with its own `Haptic.Vibrate` pattern, so only OSK keys benefit until the theme is overridden (user theme copy in `~/.local/share/feedbackd/themes/` with 0.9 / 30 ms would fix Phosh buttons and every app using TriggerFeedback). **Changed 2026-11-07 (user preferred the vendor-faithful feel, B/C of the sweep):**
+- Glissando: `~/.config/glissando/config.toml` -> `haptic_strength = 0.63`, `haptic_ms = 50` (0.63*160 -> ~2790 mV on the mainline FF scale = the vendor's 2.8 V; 50 ms = the vendor's `QPNP_VIB_MIN_PLAY_MS`).
+- feedbackd: `gsettings set org.sigxcpu.feedbackd max-haptic-strength 0.63` (caps every feedbackd client at the vendor voltage) and a user theme override at `/usr/local/share/feedbackd/themes/default.json` (found before /usr/share via XDG_DATA_DIRS) with `button-pressed`/`key-pressed` = 0.63 / 50 ms and `*-released` = 50 ms vibra-rumble, instead of the stock 0.2 / 7 ms.
+- feedbackd reloads the theme only at startup: `pkill -x feedbackd` then any trigger auto-starts it via `/usr/share/dbus-1/services/org.sigxcpu.Feedback.service` (verified: new pid, theme active).
+- Optional remaining hardening (not done): add `qcom,vib-ldo-volt-uv` to the vibrator node and clamp `vib->level` in pm8xxx-vibrator, so even a client writing FF directly to /dev/input/event4 cannot exceed 2.8 V. Needs a DTB change (boot flash), so deferred. Glissando's haptics defaults are on (strength 0.5, 12 ms per key; `~/.config/glissando/config.toml` `haptics`/`haptic_strength`/`haptic_ms` to tune), so OSK key presses should now buzz.
+- Also installed the missing `/usr/local/bin/reboot-bootloader` from `phone-reboot-bootloader.sh` (it was lost in the userdata wipe), so `./enter-fastboot.sh` works again.
+
+Rollback: `fastboot flash boot device-backup/boot-before-vib-20261107.img` (or `boot-mainline.img` of the same date), then reboot.
+## 2026-11-07 14:35 - Vibration (haptic motor): works in hardware, DISABLED in mainline DT - one-line fix identified
+
+- Hardware: violet's vibrator is the PM6150 "vibrator LDO" (`qcom,qpnp-vibrator-ldo`, SPMI 0x5300, LDO 2.8 V, vendor driver `drivers/leds/leds-qpnp-vibrator-ldo.c`). Vendor registers: STATUS1 0x08 (VREG_READY BIT7), VSET_LB 0x40/0x41, EN_CTL 0x46 (BIT7), 1504-3544 mV in 8 mV steps.
+- Mainline already has the node: `pm6150.dtsi: pm6150_vib: vibrator@5300 { compatible = "qcom,pm6150-vib", "qcom,pmi632-vib"; status = "disabled"; }`. The `pm8xxx-vibrator` driver's `pmi632_regs` (enable 0x46 BIT7, drv 0x40, drv2 0x41 bits 0-3, 1504-3544 mV / 8 mV steps) matches the vendor register map exactly. Module `pm8xxx-vibrator.ko.zst` is installed.
+- On the device the node is present but `status = "disabled"` (`/proc/device-tree/soc@0/spmi@c440000/pmic@1/vibrator@5300/status`), so nothing binds: no FF input device, no LED, `lsmod` has no pm8xxx-vibrator. feedbackd 0.8.9 is installed/running, and Glissando/Phosh ask it for haptics - they get nothing, so there is no vibration anywhere in the UI.
+- Fix: `&pm6150_vib { status = "okay"; };` in `violet-sm6150.dts`, rebuild the boot image (DTB), flash `boot` only, reboot. Then the header's pmi632 register set drives the motor; the driver exposes an evdev FF (rumble) device that feedbackd's FF backend can use, so OSK/Phosh haptics work.
+- Not done yet: needs a boot-image flash and a human to feel the motor; the phone is currently reachable only over WiFi (no USB cable for recovery), so this waits for the user.
+## 2026-11-07 14:30 - Nautilus multi-select on touch; UI smoothness profiled (60 fps, no systemic bottleneck)
+
+**Nautilus 51.0.1 multi-select on the phone (measured with real touch, `touch.py`)**
+- Long-press on an item selects it and opens the item menu (Open/Cut/Copy/Move to/Copy to/Rename/Compress/Trash/Properties) - **no "Select" entry, no checkbox selection mode**.
+- Dragging on empty space **scrolls** (touch pan); the rubber-band box only works with a pointer (mouse/VNC), not with a finger.
+- Header menu (three dots) has **Select All**; Ctrl+A also works (16 folders selected in the test).
+- So on touch: Select All (menu or Ctrl+A via the OSK); for an arbitrary subset there is no touch gesture - workaround is search-then-select-all, or a mouse/keyboard. Selection actions (Copy/Trash) then live in the header/menu.
+
+**Smoothness profile (all measured on the device, nothing changed yet)**
+- Hardware state: 8 cores, `schedutil`, little 300M-1.59G, big 300M-1.90G; GPU A612 `simple_ondemand` 435-845 MHz; thermal zones ~39 C (no throttling); load ~1.0 with the session idle; 3.4 GB RAM, 5 GB swap unused.
+- GL is in use: Nautilus has the DRM render fds open, `GSK_RENDERER` unset (auto -> ngl/GL). Compositor uses freedreno (dmesg loads a612_rgmu/a630_sqe).
+- Continuous icon-view scrolling for 7 s: **Nautilus 216 ticks = ~31% of one core, phoc 43 ticks = ~6%**. Overview swipes for 6 s: phoc ~7%, phosh ~12%.
+- Frame pacing, GTK4 client with a 300-row scrolled list, scrolling by touch for 12 s: **758 frames, 59.5 fps, p50/p90/p99 = 16.7 ms, one 150 ms hitch; 1 frame >20 ms**. So the compositor+GTK path delivers a locked 60 fps; there is no systemic jank to fix in phoc/GTK/the SoC.
+- Caveat: a first probe measured 13 fps, but its window was fully occluded behind Nautilus - GTK throttles frame clocks for obscured windows, so that number is meaningless (recorded here so nobody repeats it).
+- Remaining candidates for perceived jank are app/UX-level: Nautilus icon view is the heaviest (thumbnails, ~1/3 core while scrolling), Phosh animation durations, and app startup. `org.gnome.desktop.interface enable-animations` is currently `true`; turning it off makes transitions instant but is a UX choice (not changed).
+## 2026-11-07 14:00 - Clipboard/selection investigation: Firefox copy works, Bazaar selects all its description (app bug), Ghostty paste keybinds; touch injection tool for UI tests
+
+Context: user reported "text not copyable in Firefox", "a single touch on Bazaar's app description selects the whole text", and asked how to paste a selection in Ghostty. Checked on the device (touch.py below), not by reading docs.
+
+**Firefox (firefox-esr 140, Wayland) copy - works, measured.**
+- Keyboard: Ctrl+A then Ctrl+C in the page put the text on the clipboard (`wl-paste` returned it) and it survived an app switch (still there after Ghostty took focus).
+- Touch: a long-press on the page shows the selection handles and a context menu with **Copy / Select All / Print Selection / Translate Selection**; tapping Copy put the page text on the clipboard (verified with wl-paste before/after).
+- So the "cannot copy" report is not a broken clipboard here. The likely cause is expectation: on Linux/Wayland, selecting text does **not** copy it (selection is the PRIMARY selection, a separate buffer), and Phosh has no GNOME-Shell-style selection toolbar. Copy must be an explicit action (long-press menu, or Ctrl+C). There is a known upstream Firefox async-clipboard bug (bugzilla 1722118/1831755: wl-paste can read an empty string while the types list is full), but it did not reproduce in this test.
+
+**Bazaar (bazaar 0.9.10) selects its whole description on focus - app bug, root cause found.**
+- `src/bz-appstream-description-render.c: text_focus_cb` is connected to `notify::has-focus` and, when the `GtkTextView` has focus, sets the accessible label and then calls `gtk_text_buffer_select_range (buffer, &start, &end)` - i.e. **select all**. That is an accessibility feature (screen readers read the focused text); on a touchscreen any tap on the description focuses it and selects everything.
+- Reproduced with an injected touch tap: opening the app page leaves the whole description selected (screenshot 14:00).
+- Not a GTK/phoc bug and nothing the OSK or the compositor can fix. Upstream fix would be to drop the `select_range` call (or only do it for non-pointer focus). Also present in bazaar master at 2026-11-07.
+
+**Ghostty 1.3.2-dev paste - works, keybinds confirmed.**
+- `ctrl+shift+c` copy (mixed), `ctrl+shift+v` paste from clipboard, `ctrl+insert` copy, `shift+insert` paste from the PRIMARY selection (i.e. the text you just selected in another app, no Copy needed).
+- Verified: with text in the clipboard, ctrl+shift+v into `ghostty -e sh -c 'read x; ...'` pasted the whole block.
+- Phone-friendly route: tap the clipboard icon in the Glissando toolbar and tap an entry; `PanelHit::Paste` -> `Op::Commit` -> `im.commit_string` inserts it into the focused app without any shortcut.
+
+**New tool: touch injection (VNC cannot do touch).** `~/violet-ios/work/touch.py` (on the phone: `/home/user/touch.py`, run with `sudo python3 touch.py tap|long|drag x y ...`) creates a uinput touchscreen (`INPUT_PROP_DIRECT`, MT slots, BTN_TOUCH) and injects taps/long-presses/drags. Required for anything that GTK only does on touch (`gtk_event_treat_as_touch`), e.g. the OSK show path and text selection handles. Note the EV_SYN capability must not be set (uinput rejects it).
+## 2026-11-07 12:35 - OSK phantom keyboard ROOT CAUSE and FIX: phoc 0.57 predates the "text-input-v3 v2" GTK 4.24 workaround; upgraded to phoc 0.58
+
+**Symptom**: the OSK opened on screens with no text field, in several GTK4 apps - Settings (tap anything), Nocturne (swiping the album carousel), g4music (before it was removed). Not app-specific, not Glissando's fault.
+
+**Measured**: with `WAYLAND_DEBUG=client`, GTK 4.24 enables text input on window focus, with no editable widget focused: `zwp_text_input_v3.enable()`, `set_surrounding_text("",0,0)`, `set_content_type(0,0)`, `set_cursor_rectangle(0,0,0,0)`, `commit()` (captured for Settings 12:07). phoc 0.57's relay turned `enable` into `wlr_input_method_v2_send_activate()` unconditionally (`src/input-method-relay.c: handle_text_input_enable`), so the OSK opened. zwp_input_method_v2 carries no caret rectangle, so no input method (Glissando or stevia) can filter this on its own.
+
+**Upstream fix (prior art)**: phoc 0.58.0 NEWS: *"text-input-v3: Add basic support for version 2 to work around an issue in GTK 4.24"*. phoc 0.58 embeds wlroots 0.20.x with `subprojects/packagefiles/wlroots/text-input-v2/000{1,2,3,4}-*.patch`, advertises `zwp_text_input_manager_v3` version 2, and adds `show_input_panel`/`hide_input_panel` handling: for v2 clients `handle_text_input_enable` returns early and the IM is activated only from `show_input_panel`. GTK 4.24 has the matching side: `gtk/gtkimcontextwayland.c` sends `zwp_text_input_v3_show_input_panel()` when the compositor offers v2 - and only from a touch click on a text widget (`gtk/gtktext.c: gtk_text_click_gesture_released`) - otherwise it falls back to `enable()`.
+
+**Change**: `apk add phoc=0.58.0-r0 phoc-schemas=0.58.0-r0 phoc-lang=0.58.0-r0` (was 0.57.0-r1), then reboot. phosh stays 0.57.0 (phosh_private went to v8, only additive: `add_thumbnail_view` + `phosh_private_thumbnail`). Backup of the 0.57 files: `/home/user/phoc-0.57.0-backup.tar.gz` on the phone. Do NOT use `apk add -u phoc`: it drags in llvm23-libs/glycin/mesa updates (~100 MB); pin the version.
+
+**Verified after reboot**: `wayland-info` shows `zwp_text_input_manager_v3 version: 2`; the phosh session and glissando came up unchanged. Settings open on a page with no text field: `sm.puri.OSK0 Visible = false` and the client sends no `enable()`. The GTK key-capture test window (the g4music pattern) now sends **zero** `enable()` requests and the OSK stays hidden (was 1 request + keyboard). **Confirmed by the user 2026-11-07 13:40: the fix works.** A real text field opens the keyboard on touch and it hides again when tapping away. (GTK only requests the panel from an actual **touch** click, which VNC pointer events cannot simulate, so this last step had to be checked on the device.)
+
+**Side note**: glissando upstream (1.0.0-rc.1, 00b650a = what is installed) has no caret handling at all; the "don't show without a caret" heuristic I was about to add to Glissando is unnecessary now.
+## 2026-11-07 10:15 - OSK phantom keyboard is GTK key-capture (app-side), not Glissando; per-app block removed; the 31 s app-open splash was g4music-only
+
+Follow-up to the 09:10/09:20 entries after the user rejected the `no_auto_show` block as a hack. **No phone-side workaround remains**: `~/.config/glissando/config.toml` deleted (Glissando defaults, Calculator only), g4music and amberol uninstalled.
+
+**Symptom 1 (keyboard with no text field) - root cause is GTK's key-capture, triggered by g4music. Measured.**
+- Instrumented GTK4 test windows on the phone (`~/violet-ios/work/osk2.py`, run with `WAYLAND_DEBUG=client`): a window with `Gtk.SearchBar` + `set_key_capture_widget(content)` sends `zwp_text_input_v3.enable()` at window focus **while the focused widget is a Button** (`REPORT focus=Button ... visible=True mapped=True`); the same window without key capture sends nothing; a hidden `Gtk.Entry` sends nothing. So the app asks for the keyboard with no editable on screen.
+- Code path in GTK 4.24.1: `gtk_text_set_input_interceptor()` (`gtk/gtktext.c`) puts a `GtkEventControllerKey` carrying the search entry's IM context on the **capture widget**; `gtk_event_controller_key_handle_crossing()` (`gtk/gtkeventcontrollerkey.c`) then calls `gtk_im_context_focus_in()` for any focus inside that widget - i.e. GTK tells the compositor "text input is active". GTK main (4.25/4.26, file fetched 2026-11-07) still has the same code, so it is a live upstream quirk. Glissando and phoc do exactly what text-input-v3 says.
+- g4music 4.6 does this from `src/ui/store-panel.vala:77` (`search_bar.key_capture_widget = win.content`) at window construction, so every focus change in the window (player page included) re-enables text input and it never sends `disable` while focused.
+- Fix shape verified, then dropped with the app: arming the capture only while the search bar is open gives `enable=0` with the bar closed and `enable=1` when it opens (`gated` variant). User decision: do not patch g4music; the player will be replaced, so g4music/amberol were uninstalled (10:05) and the config block removed.
+
+**Symptom 2 (keyboard does not go away after Enter)** is the same app-side cause: Enter leaves focus in the search entry, the app sends no `disable()`. Nothing to fix in the keyboard.
+
+**App-open time: the 31 s Phosh splash was g4music-only. Measured from the app grid (screen frames over VNC).**
+- Files (Nautilus): real UI at **~2.7 s** after the icon tap, splash gone.
+- Web (Firefox): real UI at **~2.2 s** (its address-bar OSK opens - correct, it is a text field).
+- g4music: splash stayed **~31 s** (measurements in the 09:10 entry).
+- Why 31 s: Phosh removes a splash only on `PhoshAppTracker::app-ready`, which fires when phoc relays the startup id the app activates with (`src/splash-manager.c`, `src/app-tracker.c:315`; phoc `src/xdg-activation-v1.c` -> `src/seat.c:1354` -> `phosh-private.c`). If an app never completes that round trip, the tracker keeps extending the timeout for a live PID up to `0.9 * APP_TRACKER_MAX_INITIAL_TOPLEVEL_TIMEOUT` (~31.5 s) and then removes the splash anyway (`on_startup_timeout`). That is exactly the observed 31 s: g4music was the only app failing the handshake, Files and Firefox complete it. No systemic fix needed.
+
+**Housekeeping**: Amberol was installed and removed (it needs "Open folder"; the user wants automatic scanning, and will install a player by hand later). gnome-music was considered and dropped (user decision). `tinysparql`/`localsearch` are dependencies of nautilus and stay. Laptop-side: `/etc/ssh/ssh_config.d/20-systemd-ssh-proxy.conf` is a symlink owned by `nobody:nobody`, so plain `ssh` fails with "Bad owner or permissions"; `ssh -F /dev/null` is the workaround (wrappers `~/violet-ios/work/prssh`, `~/violet-ios/work/vncshot.sh`, repro tool `~/violet-ios/work/osk2.py`).
+
+Repro for the GTK behaviour if it comes back: put `~/violet-ios/work/osk2.py` on the phone and run `WAYLAND_DEBUG=client python3 osk2.py plain|searchbar|nocap|gated|hiddenentry`, then grep `text_input_v3#.*\.enable`.
+
+## 2026-11-07 09:10 - OSK shows with no text field / stays up: not a Glissando or phoc bug; trigger measured (GtkSearchBar key capture)
+
+Task: why does the keyboard appear on screens with no text field and sometimes not go away. **Nothing was changed on the phone** (no config, no restart, no flash); test processes were stopped.
+
+**Prior art (web search, 2026-11-07)**
+- Glissando upstream (x-vlad-x/glissando): README says the keyboard is driven by input-method-v2 + `sm.puri.OSK0`, per-app "do not auto-open" list exists (default only `org.gnome.Calculator`); 11 open issues, none about show/hide; closest is #7 "Check text input against newer GTK and phoc". Nothing found about the symptoms.
+- Phosh/squeekboard trackers: squeekboard#298 (GTK4 apps fail to show keyboard until minimized - the opposite symptom), phosh#706 (keyboard re-opens on volume keys, app-specific), phosh#560 (keyboard stuck on lock screen with focused search field). GTK MR 4397 / commit "Save context even when text_input isn't around yet" (Guido Guenther, 2022): GTK's Wayland IM context sends `enable` from `focus_in`, i.e. the OSK is purely app-driven.
+- "Nothing found" for an issue that names GtkSearchBar key capture + OSK; I did not find a GTK bug for it.
+
+**How Glissando decides (source `crates/glissando/src/wl.rs`, read on the phone at `~/glissando`, upstream `00b650a`)**: `want_visible = forced_visible || (im_active && auto_show && !user_hidden && !app_blocked)`. `im_active` is set only by the compositor's `activate`/`deactivate` (phoc relays the app's `zwp_text_input_v3.enable/disable`). `forced_visible` only by a D-Bus `SetVisible(true)` (home-bar long press) and is cleared on deactivate/Hide. Glissando therefore never shows by itself.
+
+**Measured (WAYLAND_DEBUG=client on apps started by me on the phone; D-Bus monitor on `sm.puri.OSK0` showed no `SetVisible` call at any time)**
+| App / test | text-input requests | keyboard |
+|---|---|---|
+| Loupe, Snapshot, Papers, Settings, Nautilus | `enter` only, no `enable` | none (correct) |
+| Calculator | `enable` | shown (it has an entry; it is on glissando's default block list) |
+| **g4music 4.6** (player page, song list - what the user hit) | `enable()` the moment the window gets keyboard focus (`set_content_type(0,0)`, empty surrounding text, cursor rect 0,0,0,0), `disable()+enable()` again 2 s later, never a `disable` while the window keeps focus | **shown on the player page and on the plain list; stays** (screenshots) |
+| g4music search: tap search, type, Enter | normal field traffic (`preedit`/`commit_string`, cursor rects); Enter produces nothing, focus stays in the live search entry | stays - correct for the protocol |
+| minimal GTK4 window (`tools/osk-imtest.py plain`) | none | none |
+| same + hidden `Gtk.Entry` (`hiddenentry`) | none | none |
+| same + `Gtk.SearchBar` with `set_key_capture_widget(window content)` (`searchbar`) | **`enable()` at window focus, never disabled** | would show |
+| same SearchBar without key capture (`nocap`) | none | none |
+
+**Root cause of symptom 1 (measured):** an app that sets a `GtkSearchBar`/`GtkSearchEntry` key-capture widget (g4music does: `search_bar.key_capture_widget = win.content`) makes GTK 4.24.1 enable text-input for the whole window as soon as it has focus, with no field on screen. Glissando and phoc do exactly what the protocol says. (Hypothesis, not verified in GTK source: this is the `gtk_editable_set_input_interceptor` path that GtkSearchEntry uses for key capture in GTK main; I could only read part of `gtktext.c`.) Other apps with a search-as-you-type bar (Software, Contacts, Settings search...) may do the same; the sweep above only covered the apps installed that I could start (Clocks, Decibels, Showtime, Software are not installed).
+
+**Symptom 2 (does not go away after Enter):** two measured causes, both app-side. (a) Enter in a search entry only `activate`s it; the entry keeps focus, so there is no `disable` and the OSK must stay. (b) Any window of case 1 never sends `disable` while focused, so the keyboard cannot go away until the user hides it by hand (chevron / home bar) or the app loses focus (then `leave` + `disable`, seen at app switch). `user_hidden` is cleared on the next `activate`, so touching the window again after an `disable+enable` re-opens it.
+
+**Side effect found in Glissando:** GTK sends `disable()+enable()` back to back on every focus move between widgets (e.g. every tap in g4music). Glissando handles `deactivate` by destroying the layer surface and `activate` by creating it again, so `Visible` on `sm.puri.OSK0` flaps `false,true` within <1 ms (D-Bus monitor) - a flicker/relayout risk. Upstream-able fix idea (not written): in `wl.rs::im_done`, delay `destroy_surface` by a short timer (~100-200 ms) and cancel it on the next `activate`.
+
+**Fix / workaround proposals - NOT applied, need the user's decision**
+1. *Workaround* (config only, live, no OSK swap): add `com.github.neithern.g4music` to `no_auto_show` in `~/.config/glissando/config.toml` (file is watched live; needs `wlr-foreign-toplevel`, which phoc advertises - verified in the registry). Cost: the keyboard no longer opens automatically in g4music's search; the home-bar long press still shows it. Must be repeated per affected app.
+2. *Root-cause fix*: g4music (drop the key-capture widget or only set it while the search bar is revealed) and/or GTK (do not enable the IM when the interceptor widget, not the entry, has focus). Report upstream; not filed.
+3. *Glissando improvement*: the hide debounce above.
+Repro/tools for later: `tools/osk-imtest.py <plain|searchbar|nocap|hiddenentry>` (run on the phone with `WAYLAND_DEBUG=client`), `tools/wl-debug-run.sh`.
+
+**UPDATE 2026-11-07 09:20 - workaround 1 APPLIED with the user's OK ("Apply block")**: `~/.config/glissando/config.toml` on the phone now contains only `no_auto_show = ["org.gnome.Calculator", "com.github.neithern.g4music"]` (Calculator kept because setting the key replaces the default list; every other key falls back to defaults via `#[serde(default)]`). Glissando watches the file: no restart, no OSK swap. Measured effect: g4music's search entry was focused with text-input enabled and the keyboard stayed hidden (screenshot 09:13). Cost as stated above: no automatic keyboard in g4music search; home-bar long press still opens it. Revert: delete that file. This is a workaround, not a root-cause fix (proposals 2 and 3 remain open).
+
+**g4music slow start via the Phosh icon (user report: 10+ s) - REPRODUCED 2026-11-07; the delay is NOT in the app.** Tapping Gapless (Media folder) in the Phosh grid: Phosh's splash (app icon + spinner) stayed for **~31 s** (press at +1.0 s, real UI first seen at +32.5 s; earlier runs still on the splash at +12 s and +18 s). The same app launched without Phosh's splash shows its UI in **~3.4-3.7 s**: direct `/usr/bin/g4music` over ssh, `gtk-launch`, and the exact D-Bus call (`org.freedesktop.Application.Activate`) all measured ~3.4-3.7 s (screen polling; the VNC capture can return a stale frame when nothing redraws, so only runs whose pre-check was dark are strictly valid: the D-Bus run at +3.7 s; the others agree within 0.4 s). D-Bus monitor of an icon launch: Phosh calls `Activate` after 0.84 s with `desktop-startup-id` = `activation-token`; the service starts at +1.1 s, replies at +1.9 s, window actions appear at +2.1 s, then g4music is quiet on the bus. Process threads were idle during the splash (not CPU- or IO-bound). `GST_PLUGIN_FEATURE_RANK` (set in the session, not in ssh) was tested and is NOT the cause (UI ~3.4 s with it set). Reading: the app is ready in ~3.5 s but Phosh keeps its splash until ~30 s, i.e. it does not get/accept the "app ready" signal for this startup-id (phosh issue #811 describes slow splashes covering the app until they time out; Phosh's `splash-manager.c` removes a splash on `app-ready`/`app-failed`/closed, source of the signal not read). Not verified: what exactly Phosh waits for, and whether the splash is cut by a timeout (the ~31 s hints at one). Next, if wanted: Phosh logs with `G_MESSAGES_DEBUG=phosh-startup-tracker` need a Phosh restart (not done); compare with another DBusActivatable GTK4 app's splash time (Loupe/Papers) to see if it is g4music-specific (`DBusActivatable=true`, `StartupNotify=true`).
+(old note kept below for the measurements: strace breakdown etc.)
+**g4music slow start (user report: 10+ s) - NOT reproduced, cause not established.** Library is 3 files (11 MB), caches present, so scanning is not it. Measured: isolated D-Bus session (theme differs: white window, not representative) window at +2.0 s; real session via `gtk-launch com.github.neithern.g4music` content on screen by +3.3 s; under `strace -f` ~7 s, spread over libgstreamer/GStreamer init (~1.9 s before the Wayland connect), GTK init (fonts, vulkan pipeline cache), GStreamer plugin loads (typefind, isomp4, libav, ...) while opening the current track, then cover decode through glycin/bwrap; after load it renders at a constant ~60 fps (rotating cover). Phone load average was 1.7-3.3 (WebKit/epiphany/sound-recorder running, plus my own debug loggers). A tap on the Gapless icon in the Phosh app grid shows Phosh's splash (app icon + spinner) while the app starts; I did not get a clean timed run of that path. To do: time the first launch after a reboot (cold page cache) by tapping the icon, with nothing else running. Note for drivers of the UI over VNC: a plain `click 1` on a Phosh grid icon did nothing; `mousedown`/`mouseup` with a short pause works.
+## 2026-11-04 (morning) - front camera fixed (driver) + libcamera soft-ISP tuning started
+
+Full details, state and next steps: **`docs/HANDOFF-2026-11-04-camera.md`**. Summary:
+
+- **Front camera darkness FIXED in the driver.** `ov13855_init_controls()` defaulted `V4L2_CID_VBLANK` to 82 and `ov13855_start()` rewrites `0x380e` from it after the mode table, so the frame length became 1650 lines (~49 fps) instead of the vendor's `0x0c8e` = 3214 (30 fps). Max exposure is `VTS-8`, so the sensor got exactly half the light. Now `OV13855_VBLANK_DEFAULT = 0x0c8e - 1568` = 1646: max exposure 3206, 28 fps, 2.05x more light at the ceiling (raw signal 16 % -> 33 %). Module installed and verified across a reboot.
+- **Gain ceiling measured**: `0x3508/0x3509` at `0x0f80` (15.5x) changes nothing; the real OV13855 maximum is `0x07c0` (7.75x), so the control range stays 128..1984.
+- **Build trap**: `make M=drivers/media/i2c ov13855.ko` compiles without `-DMODULE` (no `CONFIG_VIDEO_OV13855` in .config) -> `U init_module` -> "Unknown symbol init_module" on load. Use `CONFIG_VIDEO_OV13855=m` on the make line and check `nm`.
+- **libcamera 0.7.2 built natively on the phone into `/usr/local`** (system libcamera untouched, desktop unaffected) and patched: adaptive AWB smoothing (kills the startup green flash, G/R 4.00 -> 1.30), highlight-weighted AGC (inert until >2 % of pixels are in the top histogram bins), and a tone shoulder at knee 0.85 in both the packed/unpacked shaders and the CPU debayer LUT. Patch + tooling in `patches/proposed/libcamera-*`. A/B over 8 frames: no flash, settled cast 1.09 vs 1.03, mean 160 vs 165, 0 % clipped.
+- **Still open**: the shoulder is unproven against a genuinely clipped object; the residual grey-world cast needs CCM/tuning work; nothing decides yet whether the desktop should use the patched libcamera; autofocus still has no VCM driver (i2c 0x0c undriven).
+- **Backups**: `device-backup/phone-userspace/quick-20261104-0803.tar.gz` (678 MB) and `device-backup/camera-fix-20261104-0803.tar.gz` (driver/docs/cap.sh).
+
+## 2026-11-04 07:30 - front camera too dark: frame length overrode the vendor 30 fps timing (driver FIXED)
+
+- **Symptom**: the front OV13855 preview was unusably dark, while libcamera's AGC sat pinned at *both* limits (`exposure 1642/1642`, `analogue_gain 1984/1984`) - starved of light, not mis-tuned. Raw frames confirmed it: at max exposure+gain the scene only reached 16 % of full scale above black level (64).
+- **Root cause**: `ov13855_init_controls()` created `V4L2_CID_VBLANK` with default **82**, and `ov13855_start()` calls `__v4l2_ctrl_handler_setup()` after the mode table, so `0x380e` was rewritten to 82+1568 = **1650 lines** at every stream start. The vendor mode table's own frame length is `0x0c8e` = **3214 lines** (30 fps). Max exposure is `VTS-8`, so the sensor integrated 1642 lines at ~49 fps instead of 3206 at ~28 fps - **exactly half the light (1 stop)**.
+- **Proof** (same scene, minutes apart): vblank 82 -> mean 221 (signal 157); vblank 1646 -> mean 371.5 (signal 307) = **1.96x**; 60 frames in 1.22 s vs 2.18 s. Registers read back from the chip: `0x380e = 0x0672` before, `0x0c8e` after.
+- **Fix** (`kernel/linux-7.2.10/drivers/media/i2c/ov13855.c`): new `OV13855_VBLANK_DEFAULT (0x0c8e - OV13855_HEIGHT)` = 1646, used as the VBLANK control default, for `s->vblank` in probe, and for the exposure range (max is now 3206). Module rebuilt and installed in `/lib/modules/7.2.10-sm6150/extra/ov13855.ko`.
+- **Gain ceiling measured**: writing `0x0f80` (15.5x) produces *no* change in the captured signal - `0x07c0` (7.75x, `analogue_gain` 1984) is the real OV13855 maximum, so the range stays 128..1984 (a wider range would only let the AGC push a gain that does nothing).
+- **Verified after a reboot** (module autoloaded from disk): `0x380e = 0x0c8e` at stream start, exposure max 3206, 60 frames in 2.18 s (~28 fps), signal at max exposure+gain **321/959 = 33 %** of full scale (was 16 %).
+- **Build gotcha**: `make M=drivers/media/i2c ov13855.ko` alone compiles the object WITHOUT `-DMODULE` (there is no `CONFIG_VIDEO_OV13855` in .config), giving a .ko with `U init_module` that fails to load with "Unknown symbol init_module (err -2)". Use `make ARCH=arm64 LLVM=1 M=drivers/media/i2c CONFIG_VIDEO_OV13855=m ov13855.ko` and check `nm ov13855.ko | grep " T init_module"`.
+- **Reload gotcha**: the module refcount is held by v4l2-async, so `rmmod ov13855` fails with "in use" even with no open fds. `echo 3-0036 > /sys/bus/i2c/drivers/ov13855/unbind`, then rmmod/modprobe (or just reboot - the .ko is on disk). Killing `wireplumber` first is still required (`fuser /dev/media0`).
+- **Rear harness bug found**: rear captures fail with `Failed to start media pipeline: -32` (link validation) when the pads are set to `SBGGR10` - the imx586 subdev's mbus code is **`SRGGB10`** (video pixelformat `pRAA`). `/var/tmp/cap.sh` was fixed and a copy is now in `phone/cap.sh`.
+
+## 2026-11-03 19:35 - backup profile for fast restore + scripted restore
+
+- `host/phone-backup.sh quick` now keeps the compiled things as they are (Glissando install + dictionaries, ATL build tree, NewPipe APK, launchers, kernel module tree 7.2.10-sm6150) and drops personal folders, recordings and caches: `quick-20261103-1932.tar.gz`, 298 MB, 7628 entries. `full` is unchanged (whole rootfs, ~1 GB).
+- `host/phone-restore.sh check|flash|files|finish` (flash base rootfs, give the phone USB internet, extract the backup, reinstall the saved apk list); `check` was run against the real backup, `flash`/`files` have not been run end to end (that needs a wipe). Procedure and the verification list: `docs/RESTORE.md`.
+
+## 2026-11-03 19:10 - Glissando OSK, ATL master (+ our fixes) and NewPipe rebuilt after the userdata wipe
+
+- **Glissando** (upstream master `00b650a`, no local patches): built on the phone (`tools/phone-build-glissando.sh`: `cargo build --release -p glissando`, `tools/build-dicts.py` for en/de/ru from the pinned-checksum word lists), installed under `~/.local/opt/glissando`, `~/.local/share/applications/sm.puri.OSK0.desktop` overridden. Our hardened launcher (`phone/glissando-launch-hardened.sh`) replaces upstream's `glissando-launch`: `sm.puri.OSK0` is a required session component, so every exit path must end in a keyboard. After a reboot (never swap the OSK live): `glissando` is the running OSK, stevia is not, the session is intact.
+- **ATL master + fixes**: `tools/phone-build-atl.sh`. Base `37b8ed08` (2026-11-02), `patches-atl/atl-phone-fixes.diff` applies cleanly, three-step JDK dance (JDK 8 ninja fails at the upcall generator -> `ninja upcalls.h` under JDK 17 -> ninja under JDK 8), binary in `~/atl-master/builddir/`. The phone cannot reach gitlab.com (connect timeout), so the source was cloned on the laptop and copied over.
+- **NewPipe 0.29.1** from the official GitHub release (signing cert SHA-256 `CB:84:06:9B:...:5C:AB`, same as the one published in NewPipe's README) -> `~/atl/NewPipe.apk`; launcher `phone/newpipe-atl.desktop`, `atl-run`/`atl-run-master`, `libatl-swipe-back.so` (built from `phone/atl-swipe-back.c`).
+- **Test**: `atl-run-master` NewPipe for 100 s: window focused, network sockets opened, no crash, no GPU fault/hangcheck. Confirmed by the user: NewPipe works (2026-11-03 19:15).
+- **Pitfall found**: `KillUserProcesses=yes` (logind.conf.d, restored with the other settings) kills every process started from an ssh session when that session ends, including detached `nohup`/`setsid` jobs; keep the ssh session open for long jobs (`~/violet-ios/tools/phlong`).
+- **Slip**: my source swap ran `rm -rf atl` and deleted `~/atl` (the NewPipe APK); re-pushed.
+
+## 2026-11-03 18:10 - after the restore: orientation rule, notch overlay, GPU compositing back on
+
+Three leftovers of the userdata wipe, found by the user:
+- **UI upside down.** Measured with the phone held upright by the user: raw accelerometer Y = +8.8 m/s2 and `AccelerometerOrientation` = `bottom-up` (libssc 0.4.4 / iio-sensor-proxy 3.9-r2 on the rebuilt rootfs). On 2026-10-30 the raw frame was already correct (upright Y = -9.92) and the mount-matrix rule was the bug (retraction 21:55); on this install the frame is rotated 180 degrees about Z, so the rule is needed: `phone/90-violet-accel-mount-matrix.rules` (`ACCEL_MOUNT_MATRIX="-1,0,0;0,-1,0;0,0,1"` on `fastrpc-adsp-secure`) -> `/etc/udev/rules.d/`, `udevadm trigger`, restart iio-sensor-proxy. Confirmed by the user: UI upright. Rule of thumb stays: re-measure upright before touching it.
+- **Notch.** libgmobile has no cutout data for xiaomi,violet: `phone/gmobile/xiaomi,violet.json` -> `/usr/local/share/violet-gmobile/`, selected by `export G_RESOURCE_OVERLAYS=/mobi/phosh/gmobile/devices/display-panels=/usr/local/share/violet-gmobile` in `/home/user/.phoshdebug` (sourced by phosh-session). Env confirmed in phoc's environment; confirmed by the user: the status bar clears the notch.
+- **Software rendering.** The base rootfs carries `/etc/profile.d/90-violet-pixman.sh` (`WLR_RENDERER=pixman`, an Oct-25 bring-up workaround from before the memory fix). It was active after the restore, so phoc composited in software. Renamed to `.disabled` (as before); after a reboot phoc logs `Using OpenGL ES 3.2 Mesa 26.2.4, GL vendor: freedreno, GL renderer: FD612`; `devfreq 5000000.gpu` ramps to 845 MHz; 0 hangcheck/fault/iommu/dpu-timeout lines.
+- Also: `host/phone-backup.sh full` over a USB link stalls when the cable is pulled; it now falls back to WiFi and was restarted over WiFi.
+
+## 2026-11-03 18:00 - userdata wiped by an Android flash; phone rebuilt from the repo (restore + verification)
+
+**What happened.** Another session flashed an Android image and wiped `userdata` (the pmOS rootfs lives there; our own flashes only ever wrote the `boot` partition). The `modem`, `dsp`, `persist` and `vendor` partitions were intact (still mounted by msm-firmware-loader with adsp/modem/bdwlan firmware). The kernel work (patches, DTS, boot images, docs, `phone/` scripts) lives on the laptop and was not affected. `userdata` was reflashed with the base `rootfs-r9.img`, the 7.2.10 module tree installed; the boot image is the shared-tree build #188 (camera work on top of 0038-0040).
+
+**Rebuilt from the repo (all verified on the phone, 2026-11-03, build #188):**
+| Item | How restored | Evidence |
+|---|---|---|
+| Packages | `apk add rmtfs hexagonrpcd(+openrc,udev) qrtr iw alsa-utils gnome-sound-recorder gnome-console py3-evdev` (phone got internet over USB-NAT through the laptop) | `apk info -e` |
+| GPU firmware | `a612_zap.*`, `a612_rgmu.bin`, `a630_sqe.fw` from the Oct-18 extras tarball into `/lib/firmware/qcom` | dmesg: SQE + RGMU loaded at 19 s, no zap error, `devfreq 5000000.gpu` 435 MHz |
+| Modem + WiFi | `phone/rmtfs.initd`, `violet-modem.initd`, `/var/lib/rmtfs`, `ath10k/WCN3990/hw1.0/{firmware-5.bin,board-2.bin}` (violet board data) | modem up in 1 s, `queued 52 B received before probe` (patch 0038 path), `wlan0` UP <lan-ip>, internet OK, associated to <home-ssid> |
+| Sensors | `phone/install-sensors.sh` + `fw/sensors/violet-sensors.tar.gz`, `hexagonrpcd-adsp-sensorspd.initd` | `ssccli`: accelerometer live (8.5, -0.18, 5.06 m/s2), light live (105 lux), proximity FAR |
+| Audio | `violet-audio-setup` + autostart, `modprobe.d` `no_rca_mode=2` | `violet_speaker` + `violet_mic` created at session start; speaker->mic loopback of a 440 Hz tone: 440 Hz peak found in 3 of 13 half-second windows |
+| Touch | kernel 0040 (panel follower) | `Detected 1080x2340 touchscreen` at 6.0 s |
+| Autologin | `/etc/phrog/greetd-config.toml` `[initial_session]` -> `phosh-session-logged` | phosh session starts at boot |
+| Suspend/resume | `/etc/elogind/system-sleep/no-hexagonrpcd-on-suspend.sh` (patches/0036), `sleep-inhibitor.conf` `is-alsa-playing`, `logind.conf.d` (HandlePowerKey=ignore, KillUserProcesses=yes) | `loginctl suspend` + RTC wake: hook ran, USB `configured` (0039), hexagonrpcd restarted, ADSP `running`, WiFi reassociated, no `ep0out`/sensor_process errors |
+| Charging | `violet-vbat` module in the restored module tree | battery 100 %, Full |
+| Misc | NM `wifi.cloned-mac-address=stable`, IPv6 off on wlan0 sysctl, `tap.py`/`taps.py`/`key.py` in `/usr/local/bin` | files present |
+
+**NOT restored (lost with userdata or not re-done):**
+- `tas2563_coef.bin` (vendor `tas2563_uCDSP.bin` came from the Android ROM's vendor image; it is not on any partition of the phone). The amp runs in ROM mode (`no_rca_mode=2`); the tone loopback shows the speaker plays.
+- (ATL master build, NewPipe and the Glissando keyboard were rebuilt later the same day, see the 19:10 entry above.)
+- The `violet-screenshot-keys` service, `displayboot`, the `modem-trace` diagnostic.
+- gsettings that were customised: Phosh lock screen `require-unlock` is back to `true` (the earlier setting was `false`; left for the user to decide), caffeine, idle timers.
+- Personal data in `/home/user` and the Sound Recorder recordings.
+
+**Lesson / fix:** no routine backup of the rootfs existed. Added `host/phone-backup.sh` (`quick`: configs + scripts + firmware + home + apk list, 7 MB; `full`: whole root filesystem) writing to `device-backup/phone-userspace/`. The archives contain secrets (the WiFi profile with its key): keep them out of any public export. First snapshots taken 2026-11-03 17:50 (quick) and 17:51 (full, running).
+
+## 2026-11-03 17:55 - camera: three cameras noted; vendor init table not in the module data
+
+- Hardware note: violet has **two rear cameras and one front camera** (CAMX lists 5 camera devices; the IMX586 is
+  the rear main, cameraId 1). The vendor ships per-module data for ofilm / semco / sunny IMX586 variants.
+- Checked all three `com.qti.sensormodule.*_imx586.bin`: every one has an **empty `sensorDriverData`** (24 zero
+  bytes), so the init sequence is not in the module data - it is code in `camera.qcom.so` (or built at runtime).
+- The vendor kernel (Elixir's) has no per-sensor driver symbols; only the generic `cam_sensor_*` stack, so the
+  kernel cannot supply the table either.
+- kprobes on `cam_cci_i2c_write_continuous_table` did not fire during a camera start in this test.
+
+State: Android remains the working oracle; mainline still cannot capture. The immediate question remains
+whether the IMX586 uses the 0x3000 register block (our current table) or the SMIA block (0x0100/0x0114/0x0340),
+which the vendor's own writes would settle.
+
+## 2026-11-03 17:40 - camera: direction check (external review) + a likely register-map error
+
+External review of the mainline symptoms flagged a real possibility: **the IMX586 may not use the 0x3000-block
+register map** that the public Raspberry-Pi table writes. Evidence in our own data supports this:
+
+- The chip ID reads correctly at **0x0016** (`0x0586`) - that is the SMIA-style ID register, and our driver's
+  own exposure code already uses SMIA (`0x0202`).
+- The kprobe captures of the *vendor* CCI writes showed small register addresses (values like 0x0112, 0x000a),
+  i.e. SMIA-space addresses - not 0x30xx.
+- So `0x3014`/`0x3040` reading back 0x00/0x01 on mainline is probably *not* a lane strap; those addresses may
+  simply not be the registers we think they are, and the "2-lane module" conclusion is now doubtful.
+- The vendor's DT (read from `/proc/device-tree` on Android) gives `cci-master = 1`, `csiphy-sd-index = 0`,
+  `cell-index = 1` for `qcom,cam-sensor@1`, and no lane property - so lane count must come from the sensor's own
+  settings, not the DT.
+
+Recommended order (cheap first):
+1. On mainline, read the SMIA frame counter (`0x0005`) before/after the stream-on write. If it does not start
+   incrementing, the sensor never streamed and the init table/map is the problem, not the CSI link.
+2. Get a real init sequence from the vendor side (sensor library / XML / CAMX), not by guessing 0x3000 values.
+3. Only then revisit CSI PHY/settle/lane configuration.
+
+State: Android 15 (Elixir) is installed and its camera works (the oracle). Root adb, kernel CAM debug, CAMX
+verbose logs, kprobes and a 103 MB dump of the camera provider's anonymous memory are all in place
+(`~/violet-ios/cam/memdump`). Scans of that dump for an SMIA table did not find a clean one yet.
+
+## 2026-11-03 17:20 - Android: CAMX verbose logs on, sensor module identity, register-table access still partial
+
+Progress on the oracle:
+- `setprop persist.vendor.camera.logInfoMask/logVerboseMask/logWarningMask 0xFFFFFFFF` turns on full CAMX
+  userspace logging (VERB level). Logcat then shows the sensor module data and EEPROM parsing.
+- Camera modules for cameraId 1: **ofilm_imx586 / semco_imx586 / sunny_imx586**; at one point the HAL logged
+  `ProbeImageSensorModules() lxl Sensor not detected for sensor_name = imx586` (after repeated provider kills -
+  needs a clean reboot to be trustworthy).
+- CAMX looks for `/vendor/etc/camera/camxoverridesettings.txt` (absent); that file is the lever for deeper
+  overrides if we need them.
+- Kernel side: `debug_mdl=0xFFFFFFFF` logs CAM-CCI / CAM-SENSOR / CAM-EEPROM (reads and EEPROM bursts are
+  visible, writes are not).
+- kprobe nested fetchargs work but only one level deep (`+0(+0(%x1))`), which is enough at
+  `cam_cci_i2c_write_table_cmd` but the values there look like CCI queue words, not sensor registers; at
+  `cam_cci_i2c_write` the reg-setting is two indirections away.
+
+Next: reboot Android for a clean camera state, then attack the capture from the CAMX side (it is the component
+that owns the register table) - either via an overridesettings file with a settings/dump key, or by capturing
+the ioctl payload the HAL hands to /dev/v4l-subdev.
+
+## 2026-11-03 17:00 - Android captured: Elixir installed, camera works, CCI tracing live
+
+After the failed in-place attempts, the ROM was installed properly and this is now a working oracle:
+
+- Elixir 5.7 (Android 15) installed via TWRP (**recovery partition**, not boot - that was the bootloop cause;
+  `fastboot flash recovery`, then the PON `recovery` magic from pmOS: syscall 142 with "recovery").
+  Data formatted, ROM sideloaded (`adb sideload`), booted.
+- Camera works: `dumpsys media.camera` shows 5 devices, CamX logs ZSLPreviewRaw frames, and it needs
+  `input keyevent 224` + `wm dismiss-keyguard` + camera permission before it will open (otherwise
+  "disabled by policy" = app not foreground).
+- **Kernel camera debug**: `echo 0xFFFFFFFF > /sys/module/cam_debug_util/parameters/debug_mdl` makes the vendor
+  camera stack log CAM-CCI / CAM-SENSOR / CAM-EEPROM lines to dmesg (thousands of them).
+- **kprobes work** on the vendor kernel (arm64 4.14): `kprobe_events` accepts register fetchargs (`%x0..`), and
+  memory fetchargs (`+8(%x1):u32`). Absolute/symbol fetches (`@sym`) return 0 on this kernel.
+- Captured `cam_cci_i2c_write` / `cam_cci_i2c_write_table` traffic and decoded the reg-setting struct from the
+  driver's own code (disassembly of `cam_cci_i2c_write_table_cmd`):
+  `+0x00` = pointer to the u16 register-address array, `+0x08` = u16 size, `+0x0c` = data_type,
+  `+0x10` = addr_type, `+0x14` = delay. Call sizes seen: 1, 8, 11, 51 entries.
+- Open item: reading the register array itself. The pointer is runtime-mapped (vmalloc/KASLR-affected), and
+  `/proc/kcore`, `/dev/mem` and kallsyms addresses are unavailable/obfuscated, so the contents need a helper
+  module built against the vendor kernel (or KASLR resolution).
+
+Artifacts: `~/violet-ios/cam/{camera.qcom.so, stockboot/, romkernel/, ctab.txt}`, `~/violet-ios/camregs/`
+(register dumper, built for the mainline kernel - not usable on Android).
+
+## 2026-11-03 16:20 - camera: CSIPHY/CSID/VFE register dump while streaming
+
+Built a small out-of-tree module (`~/violet-ios/camregs`, `camregs.ko`) that ioremaps and prints the camera
+register blocks during an active stream (`/dev/mem` is blocked, so this is the only read path).
+
+Observed with the sensor streaming (2-lane, SBGGR10 3856x2180):
+
+- CSIPHY1: lane blocks at 0x0000/0x0200/0x0900 are programmed (0xd7, 0x08, 0x11, 0x50, 0xb8...), and a
+  PLL-ish block at 0x08b0-0x08fc is live (`0x08b8=0x80`, `0x08dc=0x85`). The 0x0A00 block that the driver's
+  table mentions is **all zero** - either it belongs to another PHY variant or the PLL enable lives elsewhere.
+- CSID0: `0x0100=0x00100101`, `0x0114=0x10081188`, `0x0118=0x124813c8`, `0x021c=0xffff0000`,
+  `0x0220=0x3fff0000` (RDI frame config written).
+- VFE0: `0x0000=0x10010000`, `0x0004=0x15800000`, `0x0008=0x000035fe`, `0x000c=0x1ff`, `0x0014=0x0000fdb1`
+  (modules configured).
+
+So every block believes it is configured, yet no frame ever completes and the VFE interrupt fires only once at
+stream start. Either the sensor is not emitting (its own PLL/stream state cannot be read back - the timing
+registers are write-only), or the PHY never locks on the transmitted rate.
+
+Tooling kept for later: `camregs.ko` + source (only prints non-zero registers; add blocks/offsets as needed).
+
+## 2026-11-03 16:00 - camera: writes land, module is strapped to 2 lanes, still no frames
+
+Direct register experiments on the running sensor (driver probes, then streams):
+
+```
+CAMTEST 3000 w0 r0=01 | 3028 w0 r0=0000 | 3014 w0 r0=00 | id=0586
+```
+
+- **Writes do reach the sensor**: writing `0x3000 = 0x01` reads back `0x01`.
+- **`0x3014` and `0x3040` are read-only straps** on this part: they read 0x00 and **0x01** regardless of what we
+  write. `0x3040 = 0x01` means the module is **2-lane**, not 4 - so all previous 4-lane attempts were wrong.
+- Timing registers (`0x3028` VMAX, `0x302C` HMAX, `0x3050` SHR) read back 0 even after byte-wise writes; they are
+  probably write-only on this sensor, so that readback is not evidence either way.
+- The DT and driver now both use **2 lanes** (`data-lanes = <1 2>` / csiphy `<0 1>`, `IMX586_NUM_DATA_LANES 2`);
+  the driver probes and `STREAMON` is accepted, but still **no frames** and no CSI interrupts.
+
+Also done: an Android capture detour was attempted (TWRP flash) but the device boot-looped; pmOS boot was
+restored from `boot-mainline-cam.img` and `userdata` was never touched. The Android partitions turned out to be
+**empty** (`vendor` mounts empty, `system` is zeroed), so there was nothing to boot - the whole ROM would have to
+be installed to capture CCI traffic that way.
+
+Next: dump the CSIPHY registers from a small kernel module while streaming (PLL lock?), then sweep lane order;
+the module being 2-lane narrows the permutations a lot.
+
+## 2026-11-03 15:45 - camera: deeper RE on the vendor blobs (kernel symbols, HAL, sensor libs)
+
+Tooling built this round (kept):
+- `vmlinux-to-elf` in `~/violet-ios/reenv` recovers kallsyms from a raw ARM64 Image: produced
+  `vmlinux-vendor.elf` (the pmOS r10 downstream kernel) and `vmlinux-stock.elf` (the **stock Xiaomi** kernel from
+  `~/violet-backup/boot.img`; that kernel is gzip-compressed - decompressed to `stockboot/kernel.raw`).
+- Ghidra 12.1.4 headless project for `camera.qcom.so`, scripts in `tools/ghidra-scripts/`.
+
+What that established:
+- The **stock Xiaomi kernel** uses the generic `cam_sensor_*` stack (`cam_sensor_core_power_up`,
+  `cam_sensor_power_up`); there are **no per-sensor symbols or tables** in it - the only IMX586 string is a log
+  message. Per-sensor register programming is userspace (CAMX).
+- The vendor blobs we have are from **LineageOS 22** (`ro.vendor.build.fingerprint = Xiaomi/lineage_violet/...`),
+  where the camera works, so the init sequence *is* in `camera.qcom.so`.
+- `com.qti.sensor.imx586.so` is a 1.2 KB shim (exports only `GetSensorLibraryAPIs`); the module bin's
+  `sensorDriverData` is empty; no flat register table exists in the HAL under any layout tested
+  (LE/BE, 3/4/8-byte records, masked, packed, every alignment).
+- CSI routing matrix (csiphy0/1/2 x csid0/1/2 -> vfe0_rdi0) tried live: VFE0 IRQ increments by exactly 1 per
+  attempt (stream setup), never per frame. The sensor is not emitting.
+- `/dev/mem` is blocked (`Bad address`, STRICT_DEVMEM), so the CSIPHY PLL cannot be read directly.
+
+Conclusion: the init sequence is produced by CAMX code (likely computed per mode) and is not extractable as
+data in a reasonable time. The decisive route is now **capture the real I2C traffic from a working Android
+install** (LineageOS 22 userdebug is on disk; it allows `adb root`), logging CCI transfers to a file during a
+camera start, then replay that sequence in our driver.
+
+## 2026-11-03 15:40 - camera: Ghidra pass over camera.qcom.so (ROM route continued)
+
+Ghidra 12.1.4 (`/opt/ghidra_12.1.4_PUBLIC`) headless, ARM64 ELF auto-analysis of `camera.qcom.so` (5.9 MB,
+project at `~/violet-ios/ghidra/camproj`). Helper scripts saved in `tools/ghidra-scripts/`:
+`ImxHunter.java` (string -> xref -> function), `ImxRegs.java` / `ImxRegs2.java` (instructions referencing
+sensor register constants), `DecompFunc.java` (decompile any function by address).
+
+Findings (observations):
+- IMX586 code paths in the HAL: `EEPROMData@0x5b5210`, `get_otp_info_from_imx586@0x5c1c60`,
+  `FillExposureArray@0x5af3d0`, `CamX::SensorNode::CreateSensorSubmodules@0x5099c0`. All of these are
+  EEPROM/OTP, exposure or node plumbing - none is the init-register writer.
+- The only function referencing several distinctive IMX registers at once (`Initialize@0x4b7008`) decompiles to
+  `CamX::CAECStatsProcessor::Initialize` - a false positive (the constants are sizes/resolutions).
+- The 15 KB `com.qti.sensor.imx586.so` is only a `GetSensorLibraryAPIs` shim; it contains no table.
+- `com.qti.sensormodule.ofilm_imx586.bin` is a "QTI Chromatix Header" container (properties: sensorDriverData,
+  PDConfigData, cameraModuleData, actuatorDriver, EEPROMDriverData...) and its **sensorDriverData is empty**
+  (24 zero bytes).
+- Table scans over the HAL (LE/BE, 3/4/8-byte records, masked addresses, packed reg<<16|val) found only
+  coefficient tables - **no flat register array exists**.
+
+Inference: the init sequence is produced by code at runtime (sensor lib API / `ImageSensorData`), not shipped
+as a flat array, which is why byte scanning failed. Extracting it needs decompilation of the sensor settings
+path, not a data scan.
+
+## 2026-11-03 15:30 - camera bring-up: final state of this effort
+
+Summary of what stands after the session, all verified on the phone:
+
+| Milestone | State |
+|---|---|
+| M0 CAMSS + CCI | **Done** - `/dev/media0`, `msm_vfe{0,1}_video*`, camcc feeding them, no boot hang |
+| M0.5 sensor responds | **Done** - IMX586 answers at 0x1a on **CCI master 1** (bus 0 is electrically silent), ID `0x0586`; needs reset-assert -> rails -> MCLK -> release -> 20 ms, plus vendor TLMM 94 |
+| M1 driver | **Done** - `drivers/media/i2c/imx586.c` probes, detects the ID, registers a V4L2 subdev |
+| M2 capture | **Not achieved** - graph links end to end and `STREAMON` is accepted, but csiphy/csid/vfe IRQ counts stay flat: no CSI data. Tried 4-lane/2-lane, csiphy0/csiphy1. The public init table does not suit this **Ofilm IMX586** module |
+| M3 userspace | Not reached |
+
+Hardware facts that were hard-won and are worth keeping (all from measurement or the vendor binary):
+- The sensor is on **CCI master 1** and CSIPHY is still unconfirmed (vendor indices are off by one for CCI).
+- Camera rails: PM6150L gpio 3 (1.2 V), gpio 9 (2.8 V), gpio 4 (2.8 V), plus PM6150L L3 for CSI 1.2 V and L13A for 1.8 V.
+- TLMM 94 (`CAM_DVDD1_2V`) must be driven high; TLMM 98 is already high (owned elsewhere).
+- Reset TLMM 47 is active-low; MCLK0 (TLMM 28) at 24 MHz.
+- The ROM gives wiring and module identity only: the init table lives in `camera.qcom.so` (CAMX), not in a flat
+  array, so recovering it needs disassembly or Xiaomi's tree.
+
+To continue: `docs/CAMERA-PLAN-2026-11-03.md`, `patches/proposed/imx586.c`, and the vendor init-sequence
+question above. The phone is left running `boot-mainline-cam.img` (4-lane baseline, sensor node on csiphy1) and
+is otherwise healthy: WiFi, audio, modem all normal.
+
+## 2026-11-03 15:20 - camera M2: 2-lane test negative; ROM/HAL mining started
+
+**2-lane test**: sensor table switched to `0x3040 = 0x01` and DT `data-lanes = <1 2>` / csiphy `<0 1>`, flashed.
+`STREAMON` returns EPIPE (link/format rejected) and no CSI interrupts; not a path forward as-is.
+
+**Where the camera data actually lives (ROM anatomy, measured)**: `~/violet-rom-extract/vendor.img` is an ext4
+image and `debugfs` reads it without mounting:
+- `/lib64/camera/com.qti.sensor.imx586.so` is a **15 KB stub** - it does not contain the init table.
+- `/lib64/camera/` has no large sensor libraries; the real implementation is `/lib64/hw/camera.qcom.so`
+  (**5.9 MB**), which does contain the IMX586 code: strings `lxl eeprom lijun++ imx586 vendor_id`,
+  `FormatWBData_Ofilm_IMX586`, `get_otp_info_from_imx586` - so the rear module is an **Ofilm IMX586**.
+- `/etc/camera/*` is ISP tuning (face models, `.cng`), not sensor init.
+- The vendor kernel in `boot-r10.img` has **no** sensor tables (they are userspace HAL data); a scan found only
+  the DSI panel init sequence (147 records starting `0x3002`, which is the panel, not the sensor).
+- Pattern scans over `camera.qcom.so` for a dense 0x3000-0x5FFF register table did not find a clean cluster:
+  CAMX keeps these in compiled structures reached through functions, so recovering them needs disassembly
+  (Ghidra) around the imx586 init path, not a byte scan.
+
+So yes - the ROM is a real source, but for *hardware wiring* (already used: CSI PHY, CCI master, rails, GPIOs)
+and for *identifying the module* (Ofilm IMX586). The init sequence itself needs either CAMX disassembly or
+another IMX586 port's table.
+
+## 2026-11-03 15:15 - camera M2: CSIPHY1 tried, no CSI activity at all; stale-DTB trap found
+
+Two concrete results this round.
+
+**1. A stale-DTB trap that cost a cycle.** Editing `violet-sm6150-camera.dtsi` and running
+`make ARCH=arm64 LLVM=1 qcom/violet-sm6150.dtb` did **not** rebuild the DTB: the dependency on the included
+`.dtsi` is not tracked, so the flashed image still carried the previous graph and the media topology looked
+unchanged. `touch arch/arm64/boot/dts/qcom/violet-sm6150.dts` before the make forces it (verified by checking
+the DTB timestamp and decompiling it). Always confirm the DTB mtime changed before flashing.
+
+**2. The vendor index is off by one for CSI too - but CSIPHY1 gives the same silence.** Since the vendor's
+`cci-master = <0>` actually meant hardware CCI master 1, the sensor endpoint was moved from `&camss port@0`
+(csiphy0) to `port@1` (csiphy1) and the image rebuilt properly. The graph now shows `imx586 -> msm_csiphy1 ->
+msm_csid0 -> msm_vfe0_rdi0 -> msm_vfe0_video0`, formats aligned, `STREAMON` accepted - and the capture still
+times out with zero bytes.
+
+Interrupt sampling during a stream attempt settles it:
+
+```
+t0: csiphy1=0  csid0=2  vfe0=3
+t1: csiphy1=0  csid0=2  vfe0=3
+```
+
+Nothing increments on either side, so **the sensor is not transmitting** (or the PHY is not receiving at all) -
+this is upstream of the VFE. The sensor itself is configured and reports streaming (`0x3000` = 0x00).
+
+Remaining suspects, in order:
+- The public Raspberry Pi init table may not suit a Xiaomi IMX586 module (different PLL/datarate/lane mapping).
+  A vendor-derived init sequence (Xiaomi's published kernel source) would be the reference.
+- The sensor may need its MIPI lane order rearranged (module-specific), or 2 lanes instead of 4.
+- CSIPHY programming (its `HW Version` reads 0) - a register dump while streaming is still to be done.
+
+## 2026-11-03 15:10 - camera M2: sensor streams and is configured, no CSI data reaches the VFE
+
+State after this round (all measured on the phone):
+
+- Driver loads (default mode) and the graph is fully linked; `v4l2-ctl --stream-mmap` no longer EPIPEs.
+- Sensor side is proven configured: 242 common + 18 mode registers written, `0x3000` reads back 0x00
+  (streaming). Register readbacks during streaming are now logged by the driver.
+- Phone-side enables all check out: PM6150L rail pads high while probing, TLMM 94 driven high by the driver,
+  **TLMM 98 is already high** (owned by another consumer, so not the blocker), MCLK0 muxed as `cam_mclk`.
+- **No frames**: `msm_vfe0` IRQ count stays at 8 (init), so nothing arrives from CSID/CSI PHY.
+- `CSIPHY 3PH HW Version = 0x00000000` is still odd; the CSIPHY register block may not be programmed the way
+  we assume.
+- A 2x2-binned (1928x1090) alternative mode table was added for a lower-datarate test, but switching modes at
+  probe makes control init fail with -ERANGE (hblank/vblank ranges are derived from the mode), so the test was
+  not completed. The code path is behind the `use_binned` module parameter and defaults off.
+
+Working hypothesis, in order: (a) CSI PHY PLL/lane programming vs the sensor's actual datarate/lane map,
+(b) lane order (Xiaomi modules frequently reorder pairs), (c) the sensor table's PLL values not matching this
+module's clocking.
+
+Next experiments for M2:
+1. Dump CSIPHY/CSID registers during streaming (no debugfs for camss - needs a temporary print in
+   `camss-csiphy-3ph-1-0.c` or `camss-csid.c`) to see whether the PHY PLL locks.
+2. Try lane permutations on the csiphy endpoint (`data-lanes`) - cheap DT change, 2-3 candidates first.
+3. If the PHY is fine, try CSIPHY1 (`msm_csiphy1:1 -> msm_csid0:0`) in case the vendor's sd-index is not the
+   physical one.
+
+## 2026-11-03 15:00 - camera M2 in progress: full pipeline linked, sensor streams, no frames yet
+
+The media graph is now wired end to end and every entity agrees on the format:
+
+```
+imx586 3-001a -> msm_csiphy0 -> msm_csid0 -> msm_vfe0_rdi0 -> msm_vfe0_video0
+all pads: SBGGR10_1X10 3856x2180;  video node: pBAA 3856x2180
+```
+
+Links enabled with media-ctl; `v4l2-ctl --stream-mmap --stream-count=1` no longer returns EPIPE, but no buffer
+ever completes (the command times out). `VFE0` interrupt count stays at 8 (init only), so no CSI data arrives.
+
+Four real bugs were found and fixed in the driver on the way (each measured, not guessed):
+
+1. **Inverted power mode**: imx412's `MODE_STANDBY`/`MODE_STREAMING` are 0x00/0x01, IMX586 is the opposite
+   (0x01 standby, 0x00 streaming). The sensor was being put into standby at "stream on".
+2. **Wrong mode-select register**: inherited 0x0100 (IFP) instead of IMX586's 0x3000.
+3. **Missing common init**: only the 18-register 4K mode table was written; the 242-register common set (PLL,
+   lanes, datarate, timing) was never applied. Now written first, and `0x3000` reads back 0x00 afterwards.
+4. **Bayer order vs CAMSS formats**: the sensor reported `SRGGB10` while CAMSS's only 10-bit RDI format is
+   `pBAA` (BGGR); the mode code is now `MEDIA_BUS_FMT_SBGGR10_1X10` and EPIPE disappeared.
+
+Also changed: link frequency 600 MHz -> 891 MHz (the init table sets DATARATE_SEL for 1782 Mbps/lane, 4 lanes),
+in both the DT and the driver constant.
+
+Open questions for the next attempt (all cheap to test, one boot each):
+- Is the sensor really producing? Read its status/PLL registers while streaming, or try the 1080p 2x2-binned
+  table (much lower datarate) as a sanity check.
+- `CSIPHY 3PH HW Version = 0x00000000` is suspicious (other platforms print a non-zero version) - check whether
+  the CSIPHY registers are being programmed at all.
+- Lane count: vendor DTS does not state it; the table assumes 4 lanes. Try 2 lanes (`data-lanes = <1 2>`) if the
+  sensor is wired for two.
+
+## 2026-11-03 14:45 - camera M1 DONE: imx586 driver probes and detects the sensor
+
+New `drivers/media/i2c/imx586.c` (copy in `patches/proposed/imx586.c`), derived from the in-tree imx412 driver
+(mainline V4L2 shape: one mode, controls, async registration) rather than from the Raspberry Pi driver found
+upstream, so it matches this tree's APIs. DT node now says `compatible = "sony,imx586"`.
+
+Result on the phone:
+
+```
+imx586 3-001a: IMX586 detected (id 0586)
+```
+
+and the subdev appears as `/dev/v4l-subdev10` alongside the CAMSS subdevs (16 subdev nodes total).
+
+What the driver had to get right, each found by measurement and now encoded:
+
+1. **Power order**: XCLR asserted -> 20 ms -> AVDD -> 1 ms -> DOVDD -> 1 ms -> DVDD -> 1 ms -> MCLK 24 MHz ->
+   1 ms -> XCLR released -> 20 ms. imx412's order (rails, release, clock) never ACKs on this board.
+2. **A second enable line**: the vendor's `CAM_DVDD1_2V` TLMM line (gpio 94, exposed in the DT as
+   `camtest-gpios`) must be driven high. Without it the ID read returns -EIO every time. TLMM 98
+   (`CAM_AVDD1_8V`) is claimed by another driver (-EBUSY), so it is not requested.
+3. **Register tables**: IMX586 common + 4K-linear init sets extracted from the public
+   `youjunl/imx586-v4l2-driver` tables (242 + 18 registers), with the ID read at 0x0016 == 0x0586.
+
+Temporary DT scaffolding that must be cleaned before this is upstreamable: `camtest-gpios`,
+`camera_vana1_2_ldo` marked `regulator-always-on`, and the rail/supply split (the gpio4 rail is really the
+sensor's third supply).
+
+Next (M2): wire the graph - `camss` port -> `csiphy` -> `imx586` endpoint - then bring up an RDI capture and
+grab a frame with `v4l2-ctl`/`libcamera`.
+
+## 2026-11-03 14:35 - camera M0.5 DONE: IMX586 answers on CCI bus 1 (ID 0x0586)
+
+The rear sensor is alive and identifiable. Evidence from the phone, driver at `3-001a`
+(i2c bus 1 = `cci_i2c1`), with `violet-sm6150-camera.dtsi` carrying the sensor node:
+
+```
+CAMTEST ordered power: avdd=1 dovdd=1 dvdd=1 clk_en=1
+CAMTEST 0x1a ACK id=0586 at logical reset 0
+CAMTEST 0x1a no-ack at logical reset 1
+CAMTEST 0x1a ACK id=0586 at logical reset 0
+CAMTEST 0x1a no-ack at logical reset 1
+```
+
+`0x0586` is the IMX586 chip ID, read from register 0x0016 with 16-bit register addressing.
+
+What had to be true, each established by measurement:
+
+1. **Wrong bus**: the sensor is on **CCI master 1** (`cci_i2c1` -> i2c-3), not master 0. A full 0x08..0x77
+   scan shows master 1 alive (VCM at 0x0c, EEPROM at 0x50/0x51) and master 0 completely silent. The node was
+   moved from `&cci_i2c0` to `&cci_i2c1`; both buses are correctly muxed (TLMM 32/33 and 34/35, `cci_i2c`,
+   matching the vendor DTB), so this is not a pinmux bug.
+2. **A third rail is required**: with only avdd/dovdd/dvdd (vana0 gpio9, l13a, camera_ldo gpio3) the sensor
+   stayed silent; it answered once `camera_vana1_2_ldo` (PM6150L gpio 4) was also on. It is temporarily
+   marked `regulator-always-on` in the DT - the proper home for it is a supply the driver controls.
+3. **Power sequence matters**: the working recipe is reset **asserted** -> rails up (avdd, dovdd, dvdd, with
+   ~1 ms spacing) -> MCLK 24 MHz on -> **reset released** -> 20 ms -> read. imx412's own order
+   (rails -> reset released -> clk) is not enough: the sensor does not ACK.
+4. **Reset polarity is as declared** (`GPIO_ACTIVE_LOW`, TLMM 47): logical 0 = released = ACK,
+   logical 1 = asserted = no ACK.
+
+Also measured on the way: the PM6150L rail pads DO switch (`pinconf-groups` shows `pin output (1 level)`
+for gpio3/gpio9 while the driver is probing); earlier "out low" readings were just the post-probe teardown.
+A vendor TLMM line (94, labelled `CAM_DVDD1_2V` in the stock dtbo) is driven high in the harness; TLMM 98
+returned -EBUSY, so whether either is actually required is still open.
+
+Next: M1 - write the IMX586 driver (this power recipe + ID check + one 4-lane mode) instead of bending imx412.
+
+## 2026-11-03 14:20 - camera M0.5: CCI buses characterised, IMX586 still silent
+
+Measured on the phone (build with `violet-sm6150-camera.dtsi`, sensor node at `cci_i2c0` 0x1a,
+rails on PM6150L gpio 3/9, MCLK0 24 MHz, reset TLMM 47):
+
+- **CCI master 1 (i2c-3) is alive**: a 0x08..0x77 scan of 16-bit register reads ACKs at **0x0c**
+  (id 0xf207 - a VCM/actuator-style device), **0x50** and **0x51** (id 0x0105 / 0x516f - the camera EEPROM).
+- **CCI master 0 (i2c-2) is completely silent**: no ACK at any address. The rear-main sensor node sits on it.
+- **The IMX586 never ACKs**: 0x1a on both masters, and the scan found nothing else on either bus.
+  Tried with the reset line at both logical levels (physical high and low), 15-20 ms settle each: no ACK.
+- Regulators report enabled (`camera_ldo` 1.2 V, `camera_vana0_ldo` 2.8 V, `vreg_l13a_1p8`), MCLK0 is at 24 MHz,
+  and the driver runs a full power-on before the read - but `/sys/kernel/debug/gpio` shows PM6150L
+  **gpio3/gpio9 still "out low"** while the regulators say enabled. So the *rail GPIOs may not actually be
+  switching*, which would explain a silent rear module while the EEPROM (VIO-powered) still answers.
+- Vendor DT detail that matters: in the stock dtbo the rear **eeprom** node uses `cci-master = <1>`
+  while `qcom,cam-sensor@0` uses `<0>` - i.e. the vendor puts the rear module's EEPROM on CCI master 1
+  and the sensor on master 0, which is exactly the pattern measured above.
+- Debug harness: a patched `imx412.c` (kept at `patches/proposed/imx412-camtest-debug.c`) is used as the
+  probe vehicle - it powers the rails, enables MCLK, then reads IDs at several addresses and dumps GPIO state.
+  It must not be shipped; the real driver is M1.
+
+Next: (a) prove whether PM6150L gpio3/9 switch (request them from the driver via a DT `*-gpios` property and
+read the line back, or measure the pads), (b) settle which CCI master the rear sensor really sits on, and
+(c) only then write the imx586 driver.
+
+## 2026-11-03 14:05 - camera M0.5 in progress: sensor node, rails, driver probe; reboot freeze hit again
+
+- Sensor node added to `violet-sm6150-camera.dtsi`: IMX586 on `cci_i2c0` addr 0x1a, reset TLMM 47, MCLK0 24 MHz,
+  rails `avdd` = camera_vana0_ldo (PM6150L gpio 9, 2.8 V), `dvdd` = camera_ldo (PM6150L gpio 3, 1.2 V),
+  `dovdd` = vreg_l13a_1p8. Initially bound with `compatible = "sony,imx577"` so the in-tree imx412 driver does
+  the power-up and ID read without new driver code.
+- Built `imx412.ko` standalone (`make M=drivers/media/i2c CONFIG_VIDEO_IMX412=m modules`) because
+  `CONFIG_VIDEO_IMX412` is not set in this kernel; loaded with insmod.
+- Probe result: rails + MCLK + reset sequence runs (`cam_cc_mclk0_clk` at 24 MHz; no regulator/enable errors),
+  then `imx412_read_reg(IMX412_REG_ID)` returns -EIO, so **the sensor does not ACK at 0x1a on CCI bus 0**.
+  First attempt with link-frequency 720 MHz was rejected by the driver's hw-config check (it only accepts the
+  EVK's 600 MHz); with 600 MHz the probe reaches the ID read.
+- Two things to try next: the IMX586 may answer at a different 7-bit address (0x10 is the usual alternative),
+  and/or the CCI bus at the dtsi's 1 MHz may be too fast for this part.
+- A kernel-side bus scan (arbitrary addresses through `i2c_transfer`) oopsed in the CCI driver (NULL deref at
+  0x18), so address probing was moved into the driver via `client->addr` overrides instead; that load then
+  faulted in `__arm64_sys_finit_module`, most likely fallout from the first oops (same boot). Rebooted to retry.
+- **The reboot froze**: the phone never came back on USB or WiFi (the known intermittent shutdown/reboot freeze,
+  STATUS.md "Open (no fix at all)"). Recovery needed a 15 s power-button hold. `need-hands.sh power` used.
+
+## 2026-11-03 13:43 - CAMERA M0: CAMSS + CCI probe on violet (no sensor yet)
+
+- Prior art: SM6150 CAMSS is already merged upstream (series "media: qcom: camss: add sm6150 camss support", Wenmeng Liu, v4 2026-01-12, tested on the Talos EVK; lwn.net/Articles/1053829). `talos.dtsi` already carries `cci@ac4a000`, `isp@acb3000` and `camcc@ad00000` (`qcom,qcs615-camcc`) - they were simply `status = "disabled"` in violet, which is why no camera device existed.
+- New `arch/arm64/boot/dts/qcom/violet-sm6150-camera.dtsi` (copy in `dt/`): `&camss { vdd-csiphy-1p2-supply = <&vreg_l3e_1p2>; vdd-csiphy-1p8-supply = <&vreg_l13a_1p8>; status = "okay"; }; &cci { status = "okay"; };` - no sensor nodes yet.
+- Rails taken from the vendor DTB (unpacked from `~violet-pmos/images-r9/boot-r10.img` with `unpack_bootimg`): `cam_csiphy0..2` have `csi-vdd-voltage = <0x124f80>` and `mipi-csi-vdd-supply` = `pm6150l_l3` -> `vreg_l3e_1p2` (the same PM6150L L3 the DSI analog block uses). The vendor described no 1.8 V CSI rail; mainline's sm6150 resources also ask for one, so the camera IO rail (vendor `pm6150_l13`) is used for 1.8 V.
+- Camera power switches are **PM6150L GPIOs, not TLMM**: `camera_ldo` = pm6150l gpio 3, `camera_vana0_ldo` = gpio 9, `camera_vana1_2_ldo` = gpio 4 (vendor dtbo `gpio-regulator@0..2`; phandle 0x280 resolves to `pm6150l_gpios`). So TLMM's `gpio-reserved-ranges = <0 4>` does not block them.
+- Flashed `boot-mainline-cam.img` (existing Image + new DTB, built by `mk-bootimg.sh`). Boot clean, no hang, no new dmesg errors.
+- Verified on the phone: `/dev/media0` exists; `video0..4` = `msm_vfe0_video0/1/2`, `msm_vfe1_video0/1`; `camcc-qcs615 ad00000.clock-controller: sync_state() pending due to acb3000.isp` and `ac4a000.cci` (camcc registered, and CAMSS/CCI are its consumers); two new i2c adapters (i2c-2/3) = the CCI buses. No sensor bound (no IMX586 driver exists in 7.2.10 - `imx412.c` only claims `sony,imx577`).
+- Next (M0.5): IMX586 on `cci_i2c0`, addr 0x1a; rails dovdd = `vreg_l13a_1p8`, avdd = camera_vana0, dvdd = camera_ldo; reset TLMM 47; MCLK0 24 MHz; then read chip ID at 0x0016 and expect 0x0586 before writing the driver. Plan: `docs/CAMERA-PLAN-2026-11-03.md`.
+
+## 2026-11-02 19:45 - touch panel-follower (0040), audio knobs removed (0016), 0005 dropped (#186/#187)
+
+- **Touch** (hack: 30 s polling): replaced by the DRM panel-follower mechanism (same as i2c-hid/goodix): touchscreen node gets `panel = <&panel0>`, init runs from `panel_prepared()`. #187: `Detected 1080x2340 touchscreen with 10 max touches` at 5.96 s, input device registered. Confirmed with a real finger by the user (2026-11-02).
+- **Audio knobs** (`violet_popp`, `violet_wlen`, `violet_copp_topo`, `violet_island`, `violet_slave`, `clk_mode`, `violet_hw_vote`): removed, defaults kept as constants; q6afe-dai.c and sm8250.c pristine. #186 clean boot: card + capture present, `paplay` and mic `parecord` run, no AFE errors. (A 0-byte `snd-soc-sm8250.ko` I copied by mistake briefly made the card disappear; the kernel change was not the cause.)
+- **0005** spmi stale-IRQ patch dropped: kexec-only, 0 'spurious spmi irq' lines on normal boots, #186/#187 boot fine without it.
+- **aggre1_noc**: searched; upstream QCS615 QoS series (v3, 2026-03) proposes clocks UFS PHY AXI, USB2 SEC AXI, USB3 PRIM AXI, RPMH IPA for aggre1_noc; the sc7280 series makes the clocks optional because some firmware blocks QoS. Not tested here: needs a boot attempt that can hang.
+- Rollback image of #186 kept as `boot-mainline-186-rollback.img`.
+
+## 2026-11-02 19:30 - dwc3 post-resume USB death: ROOT CAUSE + fix (patch 0039); udc-repair removed (#185)
+
+- Searched first: no report of this exact failure; only generic 'failed to enable ep0out' causes (PHY SUSPHY bit, EP command timeouts), which did not apply (GUSB2PHYCFG SUSPHY clear).
+- Reproduced with the cable attached (repair service stopped, no hexagonrpcd): dwc3 trace events showed, on resume, ep0out `Start New Configuration` Successful, then `Set Endpoint Configuration` **Timed Out** 3.4 ms later. Register dump before/after: all dwc3 core registers sane, GUSB2PHYCFG SUSPHY clear.
+- Qualcomm glue QSCRATCH (phys 0x0a6f8800) read via /dev/mem: `GENERAL_CFG` 0x0d before suspend, **0x04 after resume** (PIPE_UTMI_CLK_SEL bit0 and PIPE3_PHYSTATUS_SW bit3 lost). `dwc3_qcom_select_utmi_clk()` only runs at probe; the resume path never restores it, so without the UTMI clock the controller answers one command and times out on the next.
+- Fix: `dwc3_qcom_pm_resume()` calls `dwc3_qcom_select_utmi_clk()` before `dwc3_pm_resume()` when `qcom,select-utmi-as-pipe-clk` is set (patch 0039). #185: with `violet-udc-repair` stopped and no rebind: `GENERAL_CFG` 0x0d after resume, UDC `configured`, no `ep0out`, `usb0` UP. End to end through elogind (`loginctl suspend`, real hook): hook pre ran, PM suspend/exit, UDC configured, hexagonrpcd restarted, card present, ADSP running, 0 sensor_process/sns_sig crashes. One sample each (no statistics loop, as asked).
+- Removed: `violet-udc-repair` service + script (kept in `patches/proposed/`, files moved off the phone to /root/old), and the dwc3-qcom rebind loop in the sleep hook.
+- #185 also showed the qrtr-smd early-packet path (patch 0038) firing on two consecutive boots (`queued 52 B received before probe`) with the modem registering and WiFi up both times: the race is frequent, not 1 in 3.
+- Not fixed: the no-cable case (`dwc3_gadget_suspend` -EAGAIN; the hook still unbinds the UDC there) - needs the cable unplugged to reproduce.
+
+## 2026-11-02 19:00 - modem first-start fatal: ROOT CAUSE + fix (patch 0038); 0012/0015 cleanups (#184)
+
+- Prior art searched first: no report matched; related only: glink version-ACK race (interrupt enabled after probe), fastrpc drvdata-before-init NULL deref.
+- Instrumented boot (`phone/modem-trace.start`, cmdline already had `trace_event=qcom_glink,qrtr_ns_*`). Bad boot: modem edge handshake fine (VERSION, IPCRTR open/ack/intents), modem TX_DATA 52 B (the QRTR HELLO) at 28.2840, RX_DONE by us, but NO `qrtr_ns_message: hello from 0` and no reply; QRTR shows 11 services (AP only) until the fatal at 40.03 s. Good boot: 53 services 5 s after 'up'.
+- Mechanism (read in source): the rpmsg core installs the callback before ->probe(); `qcom_smd_qrtr_callback()` returns -EAGAIN while drvdata is unset; `qcom_glink_rx_data()` RX_DONEs regardless. The modem sends the HELLO once and waits. Fix: `net/qrtr/smd.c` queues early packets and replays them in order under the callback's lock (patch 0038, module only).
+- Verified on #184 + new qrtr-smd.ko: on that boot the early path fired (`queued 52 B received before probe` at 27.94 s), the modem registered 55 services by 40 s, wlan0 up 5 s later, 0 fatals. One boot where the race actually occurred; the race is ~1 in 3, so keep an eye on the next boots.
+- `0012` cleanup: removed `tx_with_rcid` (0 'no open_ack' on #183), the `violet_intent_req_reuse` knob (now unconditional) and a debug print. `0015` cleanup: removed all `violet_*` module params, the vdev-start retry, the placeholder SSID, vdev-min, skip knobs and the WMI hexdump/channel-power/TLV knobs (wmi.c, wmi-tlv.c now pristine). #184 boots, audio card up, WiFi associates. Old versions kept in `patches/proposed/`.
+- Housekeeping: removed a stale second elogind hook (`variant-A.bak`, executable, ran on every sleep) from `/etc/elogind/system-sleep`; deleted my superseded `0035` file (0036 is the live hook).
+- Still open: dwc3 resume (`violet-udc-repair`, hack), hexagonrpcd stop around suspend (pmaports does the same), reboot freeze (CPU stall), aggre1_noc clock removal, touch/panel/DSI-PHY magic values, 0005 spmi (kexec-only), 0016 knobs, NewPipe live 403.
+
+## 2026-11-02 11:20 - suspend/resume: hexagonrpcd stop hook + UDC unbind (patch 0035, userspace)
+
+Research first: postmarketOS hit the same bug on the Pixel 3a - a hexagonrpcd sitting in a FastRPC call while the SoC sleeps crashes the ADSP on resume; their fix is an elogind system-sleep hook that stops hexagonrpcd before sleep (pmaports MR 5400; Debian hexagonrpc README). No upstream kernel fix found.
+
+- Hook `/etc/elogind/system-sleep/no-hexagonrpcd-on-suspend.sh` (copy: `patches/0035-userspace-elogind-sleep-hook-hexagonrpcd-udc.sh`, `phone/`): pre = bounded `rc-service stop` + SIGKILL, post = start again.
+- Second blocker found: with no USB cable `dwc3_gadget_suspend()` cannot soft-disconnect and returns -EAGAIN (`dwc3_qcom_pm_suspend returns -11`, `failed to enable ep0out`), aborting suspend (2/2 attempts). The hook unbinds the configfs UDC around sleep. This is a workaround for dwc3, not a dwc3 fix; root cause in dwc3 is not investigated.
+- Manual s2idle 16 s + RTC wake with the hook: no ADSP crash, no oops, no D-state tasks, WiFi reassociated.
+- Suspend unmasked: removed `/etc/elogind/sleep.conf.d/10-violet-no-suspend.conf`; dconf `sleep-inactive-{ac,battery}-type=suspend`, timeout 30 s (set with the phoc session bus; a plain ssh `gsettings set` goes to a different bus and does not persist).
+- UI idle test: power key (uinput) blanks the screen (Phosh only blanks); after 30 s idle the phone suspended by itself (`PM: suspend entry`), exit 5.5 s later with success=1, hexagonrpcd running again, sound card present, no D tasks. The wake was NOT a power-button press by the user (cause of that early wake not established), so a real power-button wake is still untested.
+- Modem fatal (item 1): one reboot sample without the fatal; the earlier boot showed it exactly 40.03 s after 'modem is now up'. No prior art found online. Not fixed.
+- NewPipe: 0.29.1 is the latest release; its notes have no YouTube live/403 fix.
+
+## 2026-11-02 11:00 — session summary: audio boot race fixed (0030 v2), suspend NULL-deref fixed (0034), launcher + IPv6 fixes, test-tooling lessons
+
+**Fixed and verified**
+- **Audio boot race** (no sound card on ~1 in 2 boots; silent recording, flat waveform): `q6afe-clocks` now waits until the AFE answers a harmless clock-off request (patch 0030 v2). #182/#183: card + both WCD937x slaves + 0 AFE errors on every boot checked; Sound Recorder record -> live waveform -> save -> play verified through the UI (Recording 4).
+- **Suspend/resume oops** (the 10-31 "never comes back"): `q6dsp_clock_dev_probe()` called `dev_set_drvdata()` after registering the clocks; after an ADSP restart the re-parenting prepared the new clock first -> NULL deref (cc->desc @0x348). Patch 0034. Re-test on #183: s2idle 15 s + RTC wake -> DSP crash/restart but **0 oops, card + mic back, no D-state tasks** (before: wedged root fs). Remaining: the ADSP sensor service crashes on resume (`sensor_process ... frpc_dsp`, `sns_sig_remote_`); stopping hexagonrpcd around sleep was tried but `rc-service stop` hangs (needs SIGKILL) - not solved.
+- **GPU**: from #181 the phone uses mainline's own A612 power path; the local RGMU port (and patches 0026/0027) is obsolete. NewPipe VOD plays with 0 GPU errors.
+- **NewPipe launcher** missing from the Phosh grid: needed `X-Purism-FormFactor=Workstation;Mobile;` in `~/.local/share/applications/newpipe-atl.desktop` (copy in `phone/`). Search "newpipe" now finds it; it starts in 2-5 s.
+- **IPv6 off on wlan0** (router advertises a v6 default route with no uplink; YouTube answers AAAA first): `nmcli connection modify <home-ssid> ipv6.method disabled` + `/etc/sysctl.d/60-violet-no-ipv6-wlan.conf`. Did not by itself cure NewPipe "Network error" on one video page (cause not found; WiFi signal was -89 dBm).
+- Mic gain persisted (ADC1 20, TX_DEC0 88), measured with a laptop-played sweep (in-band SNR ~20 dB).
+
+**Open**
+- Modem: first start after boot fatals once at ~67 s in roughly 1 of 3 boots (documented in `/etc/init.d/violet-modem`); WiFi recovers ~70 s. Root cause unknown (QRTR_SMD/Q6V5_PAS/GLINK_SMEM are modules; making them built-in is an untested idea).
+- NewPipe live streams: HTTP 403 after ~1 min (needs WebView/PoToken). NewPipe + audible audio not acoustically verified (a sink-input existed while muted).
+- The "recording restarted the phone" report was never reproduced; the likely cause was the boot race (no card).
+- Suspend remains masked in the UI.
+
+**Process lessons (cost ~1 h of the user's time today)**
+1. Every ssh command over WiFi costs ~2.6 s -> chains looked "hung". Use `ControlMaster` and size waits to the expected duration.
+2. The Phosh screenshot D-Bus call stalls intermittently (first call after a touch); retry once (`see.sh`). `grim`/`wtype` on the phone are 0-byte files. wayvnc capture fails ("No supported buffer formats").
+3. Do not wait >30 s on anything without checking why; verify through the UI, not by proxy; never `pkill -f` a pattern that matches your own shell.
+4. Blind tap sequences land on the wrong screen; look at the screen before each step.
+
+## 2026-11-02 09:20 — #181 (upstream A612 power path) user-flow tests: recorder OK, NewPipe no longer crashes; audio boot race found
+
+Tests driven through the real UI over uinput taps (`phone/tap.py`, `phone/taps.py`, `phone/key.py`; the phone has autologin + caffeine now):
+- **Boot animation** back on #181 (user-confirmed). Cause of its absence on #180 unknown.
+- **Sound Recorder:** boot 1 of #181 had **no sound card at all** (`--- no soundcards ---`): at 19.95 s the ADSP answered the first AFE
+  commands (clock set 0x100f3, core vote 0x100f4) with error 0x16 / no response (`AFE failed to vote (3)`), 10-30 ms after APR added
+  the service - the DSP's AFE is not ready when APR/PDR announces it. That is why the user saw a flat waveform and a silent recording
+  (file 1107 B, -91 dB). Boot 2: card present, mic + speaker fine: Record -> live waveform -> Stop -> Save -> Play all OK;
+  recording is the played sweep (matched-filter 812x, in-band SNR 14.8 dB, corr 0.59). Boot race ~1 in 2 boots: **needs a real fix**
+  (wait/retry for AFE readiness, not just q6core ready).
+- **The restart during recording:** not reproduced (record 12 s, playback, app launch, full UI flow: no reset). pstore was empty
+  on that boot, i.e. a cold PMIC-level reset, not a kernel crash.
+- **NewPipe on #181:** video decoded and rendered (live stream), 0 GPU errors (hangcheck/fault/RGMU), app alive >1 min. It then stopped
+  with **HTTP 403 from YouTube** ("IP ban or URL deobfuscation") - NewPipe 0.29.1 vs YouTube, not a phone fault. Not yet tested: a
+  normal (non-live) video, longer runs. (#180 = my RGMU port + fixes: GPU hangs under NewPipe; so mainline's path is better.)
+- **Modem** crashed 3x in the first 3 min after boot (72/113/196 s, "fatal error without message") on both #181 boots; was 0 on #176-#180.
+- Phosh does not list "NewPipe (ATL)" although `~/.local/share/applications/newpipe-atl.desktop` exists; `wtype`/`grim` on the phone are
+  0-byte files (type via the OSK instead).
+- Mic gain persisted: ADC1 20, TX_DEC0 88 (`phone/violet-audio-setup`).
+
+## 2026-10-31 04:10 — P1 suspend: s2idle sleeps and RTC-wakes; resume crashes the ADSP -> APR oops -> I/O wedge
+
+- `CONFIG_PM_DEBUG` on (#179+). `pm_test` freezer/devices/platform all pass (every driver OK; ath10k key removal
+  -110 adds 3 s).
+- **Real s2idle works** with CPU idle limited to WFI: manual `echo +15 > /sys/class/rtc/rtc0/wakealarm; echo freeze
+  > /sys/power/state` slept 17 s and woke on the PMIC RTC (suspend_stats success=1). `rtcwake` itself is unusable
+  from ssh (killed with the session before it writes the state) - use the manual sequence.
+- **The real failure is on resume, not wake:** right after "PM: suspend exit" the ADSP reports a fatal error
+  (`sensor_process ... frpc_dsp`, then `EX:kernel:sns_sig_remote_`) -> remoteproc recovers the ADSP -> PDR reports the
+  audio PD up -> `of_register_apr_devices` -> **NULL deref oops (addr 0x348) in an APR service probe** in the
+  pdr_notifier kworker. Afterwards root-fs I/O wedges (jbd2/loop0p2 and many tasks in D; the next suspend hangs in
+  `pm_sleep_fs_sync`). That matches the 10-26 "never comes back".
+- **Next:** (1) find the NULL deref in the APR re-probe after ADSP restart (q6afe/q6asm/q6adm or the macros/q6afecc
+  re-registration; sm7150-mainline has "survive ADSP restart" patches for wcd937x/macros/soundwire); (2) why the
+  sensor PD (hexagonrpcd sensors) crashes the ADSP on resume - try stopping `hexagonrpcd-adsp-sensorspd` before
+  suspend; (3) then re-enable deep idle states one by one. Phone force-rebooted (SysRq-b) after the wedge.
+- Suspend stays masked (gsd-power, autosleep off, HandlePowerKey=ignore).
+
+## 2026-10-31 03:35 — MICROPHONE WORKS (M1 closed): AMIC1 -> WCD937x -> TX macro -> MultiMedia2, PulseAudio `violet_mic`
+
+**Last blocker found:** the WCD937x slaves enumerated at boot and dropped off the bus the instant the sound card
+finished registering. Isolated by A/B (no capture link: stays attached; MBHC disabled: still drops; regmap trace: no
+codec writes at the detach) to `soc-core.c` "deactivate pins to sleep state": ASoC selects every idle component's
+*sleep* pinctrl state, and the codec's sleep state drove the LPI reset line low -> codec held in reset. Fixed by
+giving the codec node a default-only pinctrl state (reset stays with the driver's reset-gpios), as sm7150-mainline.
+
+**Verified on #178:** both slaves `Attached` after boot and after capture; `phone/mic-test.sh 1 3` (hw:0,1):
+AC RMS ~778, DC -219, ~168 zero crossings/s (room ambience) - real signal; ADC2 (headset/AMIC2) mostly silent with
+nothing plugged in. PulseAudio: `violet_mic` source (module-alsa-source hw:0,1) loaded + default by
+`/usr/local/bin/violet-audio-setup` (`phone/violet-audio-setup`), `parecord` AC RMS 2534. Recordings in
+`logs/mic-2026-10-31/recordings/`. Patches 0029-0032; config saved as `configs/config-7.2.10-sm6150-2026-10-31`.
+
+Not done: by-ear check of the recordings; secondary mic (AMIC3) / headset mic routing presets; UCM profile.
+Note: the PulseAudio speaker sink is left **muted** (it was muted for the overnight NewPipe test) - unmute with
+`pactl set-sink-mute violet_speaker 0`.
+
+## 2026-10-31 03:30 — overnight: G1 fixed (ordering), mic path unblocked to SoundWire attach, modem/PDR race fixed
+
+### G1 (GPU "RGMU GX failed to power up" -> SoC reset under NewPipe video) — FIXED
+- Captured live (dmesg stream + console ramoops at loglevel 8): NewPipe video -> GPU runtime-PM cycling several
+  times/s -> `RGMU GX failed to power up: status=000000c0 ... pwr_counter=deafbead` -> ~7 s later silent watchdog reset.
+- **Root cause (downstream comparison, Xiaomi violet kgsl_rgmu.c / adreno.c):** downstream stop order is GX retention
+  off -> release GPUSTART -> `wait_for_lowest_idle` (RGMU collapses GX; needs the GBIF running) -> only then halt CX GBIF.
+  We halted the GBIF first (incl. GX-side RBBM_GBIF_HALT), so the RGMU could never collapse GX and the CPU forced the
+  GX GDSC off on *every* suspend - downstream's GMU_SUSPEND error path. `patches/0026`.
+- **Death after the failure:** `msm_gpu_submit()` ignored `pm_runtime_get_sync()` and ran hw_init with clocks off
+  -> bus stall -> watchdog. `patches/0028` fails the job with -EIO instead (no upstream fix exists). `patches/0027`
+  adds downstream's RGMU fault recovery (halt PCC, force GX off, CX power cycle, cold boot) and returns -EAGAIN so
+  runtime PM does not latch `runtime_error`.
+- **Verified:** #171 946 swipe-driven resumes + #172 927 resumes: 0 GX failures, 0 hangs (old rate ~1/90).
+  `host/g1-swipe-stress.sh` drives phosh lock-screen animations (no unlock). NewPipe video itself not re-tested
+  (needs the user to unlock).
+
+### Microphone (M1) — LPI + SoundWire attach unblocked; capture not yet working
+- **LPI hang root cause:** LPI TLMM pads 0-17 (0x62b40000 + 0x12000) belong to the SSC; an AP access stalls the CPU
+  (that was the 10-26 wedge and a fresh one tonight: modprobe -> CPU2 stuck -> soft-lockup panic). The AP owns pads
+  18-31: node now `pinctrl@62b52000` (14 pins, gpio0..13 = vendor gpio18..31), as sm7150-mainline does.
+  New `pinctrl-sm6150-lpass-lpi.c` (table from sm7150-mainline, same LPASS) + `LPI_FLAG_CHECKED_CLOCKS` in the common
+  driver: vote clock via clk_bulk, a refused vote fails runtime resume (-EAGAIN) instead of a hanging access
+  (pm_clk_resume() ignores clk enable errors). Verified: logged "LPASS vote failed, not touching LPI registers" when
+  the DSP refused early, no hang.
+- WCD937x reset = vendor LPI gpio24 = gpio6 here (was TLMM 24, a different pad). `gpiod_set_value_cansleep()` fix
+  in wcd937x_reset() (LPI gpiochip can sleep).
+- With LPI right, **both WCD937x slaves attached** (first time ever; #173 manual load).
+- Boot race: va_macro's first AFE clock set / the LPI core vote hit the AFE before the audio PD was up (DSP error
+  0x16). Fixed properly with PDR (`qcom,protection-domain` on q6afe/q6asm/q6adm) **plus CONFIG_QCOM_PD_MAPPER=y**:
+  with pd-mapper as a module, PDR made the modem crash-loop ("fatal error without message" every 40 s, no WiFi) -
+  upstream "remoteproc: qcom_common: load pd_mapper before booting the DSP" (Loic Poulain, 2026-09). Built in: 0
+  modem crashes, WiFi up, va_macro probes first try. q6afe-clocks also defers until q6core reports the ADSP ready.
+- Controller is SWRM **v1.5.0** (reg 0x0 = 0x01050000) -> compatible `qcom,soundwire-v1.5.1`.
+- **Open:** with the capture link in the card the slaves attach at boot (card instantiates), then drop off
+  (`MCP_SLV_STATUS` 0x1090 = 0, no pending IRQ); capture fails `-5` "trf on Slave 1 failed". Next: dyndbg on
+  soundwire_bus/soundwire_qcom to see the detach, compare wcd937x DAPM/bias power-down with downstream.
+
+### Other
+- BOB: vendor init-mode is pass-through; ours forced HPM. Mainline has no PASS for BOB -> AUTO.
+- Modem crash-loop under PDR was NOT BOB (A/B'd: crashed with BOB unused).
+
+## 2026-10-31 00:47 — boot splash working (plymouth `pmos-spin`), user-confirmed
+
+- Installed `phone/plymouth.initd` (boot runlevel, `after udev-settle localmount`, `before greetd`) and
+  `phone/plymouth-quit.initd` (default runlevel, `before greetd`, `plymouth quit --retain-splash`). The staged draft
+  had the quit `after greetd`, which would let phoc race plymouthd for DRM master.
+- First attempt drew nothing: plymouth's debug log said `renderers are being explicitly skipped` - plymouthd only
+  creates graphical renderers when `splash` is on the kernel cmdline, and `mk-bootimg.sh` had dropped it together
+  with `quiet`. `splash` re-added (kernel unaffected; `quiet` stays off). Same kernel `#169`.
+- Result: short console lines -> pmOS spinner -> lockscreen, no black gap. Boot 7 on `#169`: dsi_err=0, rcg=0.
+- Rollback: `rc-update del plymouth boot; rc-update del plymouth-quit default`.
+
+## 2026-10-31 00:25 — D1 FIXED for real: MDSS core reset + pclk0 parent-enable (patches 0024/0025); retry removed
+
+**Root cause.** Two upstream-known gaps in the QCS615 display clock support, both already fixed on sister SoCs:
+1. **No MDSS core reset.** Since v6.17 the MDSS GDSC stays on through boot until `sync_state()`, so ABL's splash
+   configuration survives into drm/msm. msm8916/8939, sdm630/660, sm6115/6125 and sm7150 all added
+   `resets = <&dispcc …MDSS_CORE_BCR>` for exactly this ("video mode panel initialization appears to be broken"
+   without it). `qcom,qcs615-dispcc.h` defines `DISP_CC_MDSS_CORE_BCR` but `dispcc-qcs615.c` had no reset map and
+   talos.dtsi no `resets`.
+2. **`disp_cc_mdss_pclk0_clk_src` lacked `CLK_OPS_PARENT_ENABLE`** (upstream sm7150 fix, Jens Reidel, applied
+   2025-10-27; same on sdm845). Every failing boot logged `disp_cc_mdss_pclk0_clk_src: rcg didn't update its
+   configuration` at 5.370 s — the swallowed `-EBUSY` the probe comment predicted — then FIFO error (status=4) and
+   `wait for video done timed out`.
+
+**Fix.** `patches/0024` (reset map at 0x2000, same layout as sm6115/6125/7150; parent-enable flag) and `patches/0025`
+(DT reset). The stall-retry/reprogramming block in `msm_dsi_host_power_on()` is **deleted** (logs only now) — the
+fix is verified without the crutch.
+
+**Verified, build `#169`:** 4/4 boots clean (flash boot + 3 `host/d1-boot-cycle.sh` reboots): `rcg didn't update`=0,
+`dsi_err`=0, `video done timed out`=0, stalled=0; lockscreen visible on first power-on (user-confirmed). Before: every
+boot failed.
+
+**Leftovers:** the `dsi_link_clk_set_rate_6g` probe print fires on every DCS transfer (~20 lines at boot) — remove it
+with the other DSIDBG diagnostics. pclk1 does not exist on qcs615 dispcc, so no second flag is needed.
+
+## 2026-10-31 00:01 — D1 ordering probe: PLL was locked (`pll_unlocked=0`); the ordering hypothesis is not supported
+
+Build `#168` (probe in `msm_dsi_link_clk_set_rate_6g`) flashed via `host/d1-flash-when-ready.sh` once the cable
+was moved; full log `logs/displayboot-2026-10-30/d1-flash.log`. **This boot failed with the usual D1 signature**
+(`dsi_err_worker: status=4` at 5.57 s and 5.95 s, `wait for video done timed out` at 5.72 s), so the data covers the
+failing case.
+
+- Both rate programmings (5.37 s and the 5.64 s retry): `req pclk=183257000 byte=137442750 | ccf_pclk=183257000 |
+  clk_status=00000000 pll_unlocked=0`.
+- Second, independent check: `dsi_err_worker` status is **4 = `DSI_ERR_STATE_FIFO`**, never `0x20 =
+  `DSI_ERR_STATE_PLL_UNLOCKED`. The upstream `dsi_clk_status()` reads the xml `REG_DSI_CLK_STATUS` (0x11c) on that
+  same error IRQ and did not see bit 16. Both register views agree: no PLL unlock.
+- Caveat: our 0x120 view reads **all zero** this boot, including `after video enable` (classed `unreadable`),
+  whereas the earlier stalled link read 0x343 there. At set-rate time the link clocks are off, so zero is plausible;
+  after video enable it is not. Trust the 0x120 decode less than the upstream FIFO-only verdict.
+- `ccf_pclk` simply echoes the request (expected; CCF ignores the RCG `update_config()` -EBUSY) — no proof either way.
+
+**Conclusion (per the handoff rule):** not an enable-order bug → do not reorder. The next suspect is the dispcc
+pixel/byte RCG not taking the new config (the swallowed `-EBUSY`); a FIFO error at video enable fits a link
+clock running at the wrong rate. Next probe: read the RCG's own `CMD_RCGR`/`CFG_RCGR` (UPDATE/ROOT_OFF bits, M/N/D)
+right after `clk_set_rate`, rather than CCF's view.
+
+**Not captured:** the after-DPMS comparison. `wlopm --off/--on "*"` returned
+`Setting power mode for output 'DSI-1' failed` twice, so the "after power cycle" section only repeats the boot lines.
+The capture script needs another way to cycle the output (e.g. the power key via `evemu`/`wtype`, or phoc's own
+output-power protocol under the right user).
+
+## 2026-10-30 22:17 — D1 fix staged but deliberately not flashed (no USB recovery path)
+
+Built and verified, not flashed:
+
+- `patches/0021-dsi-drop-swreset-on-fifo.patch` — reverse-applies cleanly against the tree (`PATCH_MATCHES_TREE`).
+- `Image` rebuilt `BUILD_RC=0`; `strings Image | grep -c "sw reset after FIFO error"` = **0** (the hack is gone) and
+  `grep -c "RGMU GX failed to power up"` = **1** (the G1 fix is still in). `boot-mainline.img` rebuilt, md5 differs
+  from the currently-flashed image, which is kept as `boot-mainline-flashed-0804.img`.
+
+**Why not flashed tonight:** the USB port on the laptop fails enumeration (`Device not responding to setup address`,
+`error -71`), so `fastboot` has no device to talk to. With no fastboot there is **no recovery path** if a new
+`boot` image does not boot — the documented fallback `fastboot flash boot ~/violet-pmos/images-r9/boot-r10.img`
+(verified present, 66,621,440 B) needs that same USB link. Flashing is therefore blocked until the cable/port
+enumerates and someone can reseat it.
+
+Two incidental findings from the same window, both recorded so they are not re-derived:
+
+- **`wlopm` lies about failure.** `wlopm --on DSI-1` prints `ERROR: Setting power mode for output 'DSI-1' failed`
+  while `phoc`'s own log (`/tmp/user-session.log`) shows `connector DSI-1: Turning off` followed by
+  `connector DSI-1: Modesetting with 1080x2340 @ 60.000 Hz` — i.e. the output *did* come back. Judge display state
+  from phoc's connector lines, not from `wlopm`'s exit status, and not from `ScreenSaver.SetActive` (which is a
+  no-op when phosh already thinks the screen is awake).
+- **The boot probe's screenshots were all failing on permissions** (`phosh` runs as `user`,
+  `/var/log/displayboot/shots` was `root:root 0755`): `Failed to create screenshot … Permission denied`, which is
+  why `shots/` was empty. The script now does `chmod 1777` on that directory. Screenshot capture for the next boot
+  should work for real.
+
+## 2026-10-30 23:50 — D1: what is a fix and what is a mitigation (no retry-loop "fix" will be shipped)
+
+The user asked the right question — **"is this a hack or a proper fix"** — about the idea of replaying the panel power
+cycle inside the driver when the first power-on stalls. Recording the answer so the tree does not drift into
+workarounds:
+
+**Genuine, keep:**
+- Removing the DSIDBG `dsi_sw_reset()` on every FIFO error (`patches/0021`). Our own debug code turned a transient
+  overflow into a wrecked video-mode FIFO. That is a defect being deleted, not a behaviour being tuned.
+- Detecting the stalled link (`CLK_STATUS` AON-up/DYN-missing, the measured `0x343`) and **failing the power-on
+  instead of handing the DPU a dead link**. Fail-clean is correct regardless of where the rate bug lives.
+
+**Mitigation, explicitly not the fix:**
+- The disable/reprogram/re-enable retry in `msm_dsi_host_power_on()`, and any "automatically replay the two power
+  presses" logic. Both hide the unknown from every future log. The user's two presses are themselves the hardware
+  workaround; automating it would make the bug invisible while leaving it in place.
+
+**Root-cause hypothesis, and the single measurement that decides it.** `update_config()` (`clk-rcg2.c:130`) returns
+`-EBUSY` when the RCG will not take its config; CCF's `clk_change_rate()` discards it, so `dsi_link_clk_set_rate_6g()`
+returns 0 with the rate never applied. The 10-29 note already suspected the reason: the pixel/byte rate is programmed
+**before the DSI PHY PLL is locked**. If so the fix is ORDERING (program the RCG only once its parent PLL is locked),
+which also explains why the second power-on always works.
+
+`CLK_STATUS` bit 16 is `PLL_UNLOCKED` (latched, `0x00010000`, already defined in the generated header). The probe
+added to `dsi_link_clk_set_rate_6g()` logs, at the exact moment of the rate set:
+
+```
+msm_dsi_link_clk_set_rate_6g: req pclk=<req> byte=<req> | ccf_pclk=<ccf view> | clk_status=<reg> pll_unlocked=<0|1>
+```
+
+- `pll_unlocked=1` → ordering is the root cause → implement ordering, delete the retry.
+- `pll_unlocked=0` → the PLL was locked and the RCG still refused → the problem is in the clock controller and needs
+  a different investigation entirely (at which point the retry goes too).
+
+Also fixed tonight, both found by the instrumented boots rather than assumed:
+- The one-time "link clocks active" log proved its worth immediately by exposing that the check **itself** was wrong:
+  `CLK_STATUS` reads `0x00000000` for tens of ms after `link_clk_enable()` (still 0 after a 20 ms poll), so a
+  single-shot or short-poll check reports a false stall and fails an otherwise fine boot. It now distinguishes
+  UNREADABLE from STALLED and only acts on STALLED — the value the failing boot actually showed (`0x343`).
+- `log_buf_len=4M` added to the boot cmdline. The default ring here is ~133 KB and had rotated past the t=5 s DSI
+  lines within a minute, which cost this investigation two windows.
+
+**Blocker:** the phone is sitting in **fastboot** and the laptop cannot enumerate it (`usb 3-4: USB disconnect` with
+nothing re-enumerating; the same cable has failed enumeration three times tonight with `error -71`). Flashing needs
+a physical reseat, so the staged image and `host/d1-flash-when-ready.sh` watchdog are waiting for that.
+
+## 2026-10-30 22:45 — D1 second fix: verify the link clocks actually run (the sw-reset removal alone was NOT enough)
+
+User confirmed the state directly — "u can see screen in last analyzed screenshot, but i can see black screen with
+backlight" — on the boot that had **only** the sw-reset removal (`patches/0021`). So that change reduced the error
+burst (8 → 2) but did not fix the panel. It was a necessary cleanup, not the fix.
+
+The `DSIREG` dump that `dsidbg_dump()` writes on the first error was captured in the probe's dmesg snapshot
+(`logs/displayboot-2026-10-30/dmesg-2219-t30.txt`, 257 DSI + 24 INTF registers) and gives the broken state:
+
+| register | address | stalled value | healthy reference |
+|---|---|---|---|
+| CLK_STATUS | `0x120` | `0x00000343` | `0x009047c3` |
+| LANE_STATUS | `0x0a8` | `0x00001f0f` | `0x1f00` |
+| LANE_CTRL | `0x0ac` | `0x11000000` | — |
+| CLK_CTRL | `0x11c` | `0x0000023f` | — |
+| FIFO_STATUS | `0x0c` | `0x11111010` | `0x1010` |
+
+Decoded with the field table in `postmarketos-device-bringup → references/mainline-dsi-video-mode.md`:
+`0x343` has the AON byte/pixel clocks up but **DYN_BYTECLK (0x80) and DYN_PCLK (0x400) missing**, and LANE_STATUS
+`0x1f0f` means all four data lanes are parked in STOPSTATE and never leaving — the documented "DPU feeding a link
+that is not draining" state. `LANE_CTRL 0x11000000` shows the clock lane forced continuous HS, so the controller is
+asking for a clock that is not toggling.
+
+**Register-offset trap, worth recording:** the tree's generated `dsi.xml.h` puts CLK_STATUS at `0x11c` and
+FIFO_STATUS at `0x08`, but on this 6G DSI both sit **+4** (`0x120`, `0x0c`) — the reference file says so and the
+measured values confirm it (`0x11c` = `0x23f` is CLK_CTRL's core-clock bits, `0x08` reads 0 while `0x0c` holds
+`0x11111010`). Anything that reads CLK_STATUS through the generated macro is reading CLK_CTRL.
+
+**Fix (`patches/0022-dsi-verify-link-clocks.patch`, flashed 22:28):** `msm_dsi_host_power_on()` now requires
+`DYN_BYTECLK|DYN_PCLK` in CLK_STATUS after `link_clk_enable()`; if they are missing it logs the status and FIFO,
+disables/reprograms/re-enables the link clocks once, and if they still are not toggling returns `-EAGAIN` instead
+of handing the DPU a dead link. This is the honest complement to mechanism (1): `clk_set_rate()` cannot report the
+RCG failure, so the driver has to look at the hardware.
+
+**Result on the first boot with it (22:30):** `dsi_err_worker=0`, `sw reset=0`, `0xdddd1019=0`, no DSIDBG dump,
+no "link clocks stalled" message — i.e. the link came up inside spec, cleanly, with the check silently satisfied.
+Compare the boot before it (22:19, sw-reset removal only): 2 × `dsi_err_worker`, 1 × `0xdddd1019`.
+
+**Open:** whether the panel is visibly on — `screenshots` only prove the compositor renders, and the user had gone
+quiet. `host/d1-boot-cycle.sh` reboots and records the signature per boot so this is counted over several boots
+rather than concluded from one.
+
+## 2026-10-30 22:20 — D1 root cause narrowed to our own DSIDBG sw-reset; fix built
+
+The controlled reboot at 22:05 reproduced the black panel and the probe caught the whole window (files saved in
+`logs/displayboot-2026-10-30/`, plus `/var/log/displayboot/` on the phone):
+
+```
+5.374946  WARNING clk-rcg2.c:136 update_config        <- msm_dsi_host_power_on+0xf0 (link_clk_set_rate)
+5.376426  WARNING update_config                        (second)
+5.399099  DSIDBG fifo_status=0x99991018
+5.399307  dsi_err_worker: status=4   (DSI_ERR_STATE_FIFO)
+5.399315  DSIDBG sw reset after FIFO error
+5.779778  DSIDBG enable_video
+5.800714  DSIDBG intf1 timing engine 1
+5.800720  DSIDBG fifo_status=0xdddd1019               <- repeats every ~33 ms, 8x total
+5.817846  fb0: sys_fillrect: framebuffer is not in virtual address space
+```
+
+`0xdddd1019` is the same value as the 2026-10-29 dead-panel boot, and per the ginkgo prior art it means MDP
+overflow + 4-lane HS underflow — the DPU is feeding a link that is not draining. Two mechanisms, both measured:
+
+1. **The failed RCG update cannot be seen by the DSI driver.** `update_config()` (`clk-rcg2.c:130`) polls
+   `CMD_UPDATE` for 500 µs, then `WARN()`s and returns `-EBUSY` — but CCF's `clk_change_rate()` calls
+   `core->ops->set_rate()` and **discards the return value**, so `clk_set_rate()` returns 0 and
+   `msm_dsi_host_power_on()` walks on to `enable_video` with a link clock that never took the new rate. This is
+   the same silent-drop pattern as `a6xx_flush()` on the GPU side.
+2. **Our own debug hack then finishes the job.** `dsi_err_worker()` ran
+   `else if ((status & DSI_ERR_STATE_FIFO)) { pr_info("DSIDBG sw reset after FIFO error"); dsi_sw_reset(); }`,
+   and `PROGRESS.md` item (3) of the 2026-10-23 list already says *"a sw reset in video mode wrecks the FIFO"*.
+   Eight FIFO errors therefore meant eight software resets against a running video-mode FIFO, after which the
+   panel never scanned — exactly the "black screen with backlight, power button does nothing" state, which only
+   a fresh power-on cycle (the two power-button presses) recovers.
+
+**Fix applied** (`patches/` to be generated): the DSIDBG sw-reset arm is removed — video-mode FIFO overflow is now
+counted and left to the DPU to re-sync, which is the upstream behaviour; only a genuine
+`DSI_ERR_STATE_MDP_FIFO_UNDERFLOW` still triggers `dsi_sw_reset()`.
+
+**Side effect found and fixed:** `displayboot.start` originally ran its 3-minute sampling loop in the foreground,
+so the `local` service delayed later default-runlevel services and the phone took ~6 minutes to re-associate WiFi
+after the reboot. The loop is now backgrounded (`( … ) &`); WiFi came back in ~40 s on the earlier flashes.
+
+**Not yet proven:** whether removing the reset is sufficient, because the failed RATE remains unfixed (mechanism
+1). The next boot tells us: if `dsi_err_worker` still bursts `0xdddd1019` **and the panel still comes up black**,
+the sw-reset was not the whole story and the link-clock retry becomes the next change. Panel state itself still
+needs eyes on the device — the screenshot proxy only proves the compositor is healthy.
+
+## 2026-10-30 22:05 — user reports the D1 black-screen is happening on *every* reboot; boot probe installed
+
+User report (verbatim intent): on reboot they get a **black UI with the backlight on**, the **power button does
+not turn the display off**, and after a while the lock screen appears **after two power-button presses**.
+
+That is the 2026-10-29 20:55 failure (see that entry): panel powered but never scanning, compositor healthy,
+"power button does nothing" because the presses go to a compositor nobody can see. Evidence from the boot that
+was running at 21:24–22:00 (sampled at 22:00, uptime 2211 s):
+
+```
+t=5.844888 … 6.182240   dsi_err_worker: status=4     (x8)
+t=5.984830             [drm] fb0: msmdrmfb frame buffer device
+card0-DSI-1: dpms=On status=connected   backlight actual=141/4095  bl_power=0
+phoc started +29s   phosh +33s   greetd +28s
+```
+
+- `status=4` is `DSI_ERR_STATE_FIFO` (`dsi_host.c:91`) — **not** an underflow, so `dsi_err_worker()`'s
+  `MDP_FIFO_UNDERFLOW` branch is not taken; the `FIFO` branch runs `dsi_sw_reset()`.
+- The errors are entirely inside the **kernel's own first modeset** (fbdev, `fb0` at 5.98 s), 23 s *before*
+  phoc exists. Whatever state that leaves the link in, the compositor inherits it.
+- This boot has **0** `update_config` warnings, unlike the 10-29 failure (8 × `update_config` +
+  19 × `dsi_err_worker` + two power-on attempts). So the two boots share the symptom but **not** the
+  `clk-rcg2` signature — do not merge them into one root cause without evidence.
+- **The 8 error lines were already rotated out of the dmesg ring by 22:07** (re-counting gave 0 of everything).
+  That is the documented trap in the skill: a probe that reads dmesg late keeps nothing.
+
+Consequence: installed `/etc/local.d/displayboot.start` (`local` runlevel) — from t=0 it writes panel/compositor
+state every 2 s to `/var/log/displayboot/state.log`, snapshots **dmesg at t=10/20/30/45/60/90/120/150/180 s**, and
+takes screenshots every 10 s once phoc's session bus exists. A *good* screenshot on a dark panel means the fault
+is DSI/link (D1); no session bus or a black screenshot means the compositor never came up (D2). Source kept at
+`phone/displayboot.start`.
+
+Next: one deliberate reboot to capture the window, then read the log rather than guessing (reboot is justified
+here — this is a reproducible boot-time fault, not "reboot and see if it helps").
+
+## 2026-10-30 21:58 — verification pass over WiFi: UI upright, sensors publishing, the settings panel is the liar
+
+USB is not usable right now — the host keeps failing enumeration on port 3-4 (`new high-speed USB device
+number 58/59`, `Device not responding to setup address`, `error -71`), which is a cable/port/device fault, not a
+configuration problem. Everything below was verified over WiFi instead.
+
+- **UI orientation: upright.** Screenshot after relaunching `phosh-mobile-settings`: status bar at top, gesture
+  bar at bottom, all text readable. Taken twice (21:51 and 21:55/21:57) with the phone in a fixed upright pose.
+- **Orientation value: `normal`**, from `AccelerometerOrientation` on the system bus, in the same pose that raw
+  accel reads `X=0.40 Y=-9.92 Z=0.00` — i.e. the identity matrix is correct and the retracted udev rule was
+  indeed the cause of the earlier upside-down UI.
+- **All five sensors publish:** `LightLevel = 0.0` (dark room at night), `ProximityNear = false`,
+  `HasAmbientLight = true`, `HasAccelerometer = true`, and `ssccli` returns live accel/light values.
+- **The Sensors panel shows `Updating...` for all three rows while all of the above is true.** It is a
+  panel-side quirk (it also produced the two earlier false alarms: `Bottom up`, then `No Sensors found`), so it
+  is now documented in `references/snapdragon-sensor-core-mainline.md` as decoration only — values come from
+  `ssccli` / the SensorProxy D-Bus properties, and a screenshot is only good for judging layout.
+
+Skill knowledge written this session: new `postmarketos-device-bringup` reference
+`references/snapdragon-sensor-core-mainline.md` (hardware discovery from vendor JSON, `hexagonrpcd -s` against
+`/dev/fastrpc-adsp-secure`, faking Android socinfo, `-R` root layout, value-level verification, the
+no-mount-matrix rule with its evidence, and the busybox/`--line-buffered` and detached-process pitfalls).
+
+## 2026-10-30 21:55 — RETRACTION: the accelerometer mount-matrix "fix" was the bug; orientation needs no rule
+
+User reported the **UI upside down** this evening. Measured in one fixed pose (raw accel identical both times,
+`X=0.40, Y=-9.93`):
+
+| udev `ACCEL_MOUNT_MATRIX` | `AccelerometerOrientation` | UI |
+|---|---|---|
+| `-1,0,0;0,-1,0;0,0,1` (the rule I installed at 07:02) | `bottom-up` | upside down |
+| none (identity) | `normal` | upright |
+
+So **the SSC already delivers data in the device frame** and the vendor `.orient` does not need re-applying.
+Retracting the 07:15 entry above: that "Orientation: Normal" screenshot was taken off a panel that had not
+refreshed, so it did not prove anything. The earlier `face-up → face-down` result with a Z-inverting matrix only
+established that the udev property *is* honoured on the SSC backend — which was true but beside the point.
+
+Actions: rule removed from the phone and deleted from the repo (`phone/90-violet-accel-mount-matrix.rules` gone,
+step 4 of `phone/install-sensors.sh` is now a retraction note), `CHECKLIST.md` §6 rewritten with the corrected
+table above. Lesson recorded both places: read `ssccli --sensor accelerometer` **and** `monitor-sensor --accel`
+in the same pose before believing any orientation complaint, and never trust the Sensors panel right after an
+`iio-sensor-proxy` restart.
+
+## 2026-10-30 08:12 — G1 fix flashed and running; sensors survive a real reboot; boot-time G1 watcher installed
+
+**Flashed at 08:04** (`fastboot flash boot boot-mainline.img`, 44932 KB OKAY, `dtbo` untouched), phone back up in
+40 s on `7.2.10-sm6150`. The image carries the G1 fix (`a6xx_rgmu_start()` now retries GPUSTART once and then
+**returns `-ETIMEDOUT` instead of letting `hw_init` write into an unpowered GPU**) plus both diagnostic sets.
+
+**Sensor persistence is now proven across a real reboot** — nothing was started by hand:
+`rc-service hexagonrpcd-adsp-sensorspd status → started`, `ssccli --sensor light` returns lux,
+`ssccli --sensor accelerometer` returns live values, and `iio-sensor-proxy` reports
+`HasAccelerometer = true` on the system bus. The mount-matrix udev rule also survived (orientation was already
+verified as "Normal" before the reboot).
+
+**The ath10k flood is gone for real:** `ath10k_core.debug_mask` is absent from `/proc/cmdline` and
+`dmesg | grep -c "htt rx netbuf"` is 0 — the ring now holds ~1500 useful lines instead of 94 % spam.
+
+**G1's intermittent leg was not re-hit, and that is reported rather than glossed:** an ATL/NewPipe launch after
+the reboot and a 40-cycle rapid `power/control` auto↔on storm with a GL submit each (60 logged resumes) both
+came back clean — 0 `hangcheck`, 0 GX power-up failures. The earlier capture stands at roughly 1 failure in 90
+resumes, so the fix is *in place and unexercised*, not *proven*.
+
+**Because of that, a boot-time watcher is installed** (`/etc/local.d/g1watch.start`, `local` runlevel, verified
+firing with a probe line): it appends
+`RGMU GX (not up|failed)|cp_init:|hangcheck|adreno_idle|offending task|fenced register|gpu fault` to
+`/var/log/g1-events.log` (rotated at 1 MB, `awk`+`fflush()` because busybox `grep` has no `--line-buffered`).
+So the next natural occurrence is captured even if nobody is watching dmesg.
+
+**Open, in priority order:** (1) *why* GX fails to power up on that 1-in-90 resume — the retry may paper over a
+real RGMU/IFPC race; the second resume in the captured failure came 130 ms after a healthy one with
+`suspend_count=3832`, which points at a collapse/power-up race rather than a random fault. (2) Whether the
+`-ETIMEDOUT` path behaves well in use (submit fails, next submit retries) instead of killing clients. (3) D1 and
+D2 remain untouched this session.
+
+## 2026-10-30 08:00 — G1 ROOT CAUSE FOUND: GX fails to power up, and `hw_init` writes into a dead GPU anyway
+
+Reproduced on demand, after ~90 clean resumes: **the trigger is launching an ATL/Android app (NewPipe)**, not
+GPU idling as such. With the `patches/0019` telemetry live, the failure is unambiguous — two consecutive
+resumes:
+
+```
+6323.208826  RGMU GX after GPUSTART: status=00000100 gx_on=1 poll_ret=0      <- healthy resume
+6323.209212  RGMU hw_init: suspend_count=3832 rbbm_status=00c00015 cp_sqe_cntl=00000001
+
+6323.338500  RGMU GX after GPUSTART: status=000000c0 gx_on=0 poll_ret=-110  <- GX DID NOT COME UP
+6323.338974  RGMU hw_init: suspend_count=3833 rbbm_status=00000000 cp_sqe_cntl=00000000
+6324.338673  adreno_idle: timeout waiting to drain ringbuffer 0 rptr/wptr = 0/C
+6324.338701  cp_init: CP_ME_INIT not consumed (rptr=0 wptr=0 rbbm_status=00000000 cp_sqe_cntl=00000000)
+6325.133712  hangcheck detected gpu lockup rb 0!  → hangcheck recover!  offending task: phoc
+```
+
+Reading of the evidence, all of it measured rather than assumed:
+
+- `poll_ret = -110` is `-ETIMEDOUT`; `status = 0x000000c0` still has `RGMU_GX_GDSC_POWER_OFF` (bit 6) set, so
+  **GX never powered up** on that resume. The healthy line before it shows what "up" looks like: `0x100`.
+- `hw_init` ran **regardless**: `rbbm_status=00000000`, `cp_sqe_cntl=00000000`. A live GPU never reads zero —
+  every healthy resume here reads `00c00015` / `00000001` — so the block was unclocked/unpowered and every
+  register write was dropped, including the `CP_RB_WPTR` doorbell (`CP_RB_WPTR` reads 0, not the 0xC written).
+- That is why the ring sat at `rptr/wptr = 0/C`: the CP never fetched `CP_ME_INIT` because it never received
+  the doorbell. `fenced_write()`'s AHB-fence check cannot catch it — a dead/zeroed GMU reads back "no
+  writedropped" and looks like success (see the 07:25 entry).
+
+**So G1 is two defects, in order:**
+1. **GX power-up fails intermittently** on the RGMU resume path (the `RGMU_SPTPRAC_PWR_CLK_STATUS` handshake
+   times out with GDSC still off).
+2. **The failure is not propagated**: `a6xx_pm_resume()`/`hw_init` continue into a powered-down GPU, turning a
+   recoverable "resume failed, retry" into a ringbuffer hangcheck + `recover_worker` that kills the offending
+   client (phoc, control-center, ATL — matching every field crash).
+
+Evidence kept: `logs/g1-2026-10-30/{dmesg-repro.txt,dmesg-full.txt}`.
+
+Two hypotheses from earlier in this session are now **dead**, recorded so they are not retried: "GPUSTART is
+acked before GX is powered" (no — the ack is honest, the poll times out *because* GX never came up) and
+"IFPC keepalive missing" (already present in 7.2.10).
+
+Next step is a fix for (2) first — retry the GX power-up and propagate `-ETIMEDOUT` instead of writing to a
+dead block — then attack (1), the handshake itself.
+
+## 2026-10-30 07:25 — G1: the doorbell write was silent by construction; instrumentation v2 staged (not flashed)
+
+Prior art first, per the standing rules:
+
+- **IFPC is ruled out.** Our 7.2.10 tree already carries the Qualcomm keepalive work
+  (`a6xx_gpu_keepalive_vote()` set around `a6xx_irq()` and preemption, `a6xx_preempt.c:68/119/248`), so
+  "GPU power-collapses mid-register-access" is already mitigated here.
+- **The Mar-2026 `adreno_idle()` recovery patch is not our bug.** It fills the old TODO by calling
+  `recover()` when the drain times out; our hangcheck already recovers (`hangcheck recover!` /
+  `offending task: main`). It addresses the missing recovery, not the cause.
+
+What the code *does* explain is why the failure leaves no trace. `fenced_write()` treats a **clear**
+`GMU_AHB_FENCE_STATUS` bit as success (`fence_status_check()`: "Success if !writedropped0/1"), and a collapsed
+GMU reads back as 0 — so a lost write looks healthy. And `a6xx_flush()` **discards the return value** of
+`a6xx_fenced_write(REG_A6XX_CP_RB_WPTR, …)` entirely. That is consistent with the observed state: ring holds
+exactly `CP_ME_INIT` + 1 packet (`wptr = C`), CP never fetched (`rptr = 0`), and dmesg contains no
+`fenced register write … fail` line.
+
+`patches/0020-ringbuffer-doorbell-diagnostics.patch` (built, `BUILD_RC=0`, string verified in `Image`,
+reverse-applies cleanly, **not flashed** yet):
+
+1. `a6xx_flush()` now checks the fenced write and logs `flush: CP_RB_WPTR=%u fenced write failed (%d)`.
+2. The `cp_init` failure path additionally logs raw `AHB_FENCE_STATUS`, `GMU_SPTPRAC_PWR_CLK_STATUS` and the
+   ring's own wptr, next to the existing `not consumed` line — that is what distinguishes "write lost" from
+   "CP wedged".
+
+It stays unflashed until the running long-idle test reports: flashing reboots the phone and would throw away
+the observation window.
+
+## 2026-10-30 07:15 — orientation fixed: mount matrix via udev, verified as "Orientation: Normal"
+
+Field report: the Sensors panel read **"Bottom up"** while the phone was held normally, and `left up` where it
+should have been `right up` — a clean 180° error in the XY plane. Cause: the SSC firmware reports an **all-zero
+mount matrix** (that is `.placement`, 12 zeros by design in the vendor configs), so `iio-sensor-proxy` fell back
+to identity, while the actual rotation lives in `.orient` (`x=-x, y=-y, z=+z`).
+
+Fix, one udev rule (`phone/90-violet-accel-mount-matrix.rules`):
+
+```
+SUBSYSTEM=="misc", KERNEL=="fastrpc-adsp-secure", ENV{ACCEL_MOUNT_MATRIX}="-1,0,0;0,-1,0;0,0,1"
+```
+
+Why this works and how it was proven: iio-sensor-proxy's `setup_mount_matrix()` (`src/accel-mount-matrix.c`)
+reads `ACCEL_MOUNT_MATRIX` from udev *for the SSC backend as well* — confirmed empirically by temporarily
+setting a Z-inverting matrix, which flipped `monitor-sensor` from `face-up` to `face-down` and back. The
+`libssc` warning "Mount matrix provided by firmware is all 0" is firmware-level and orthogonal to the udev
+property, which is what misled me at first. End state, read off the panel: **Proximity Far / Light 12.0 lux /
+Orientation Normal**.
+
+Dead ends recorded: writing `.placement` = diag(-1,-1,1) into the JSON changes nothing (still zeros; reverted
+to the pristine vendor file), and `nmcli` refuses a wildcard `ifname` for the USB link, so `172.16.42.2/16`
+still has to be re-added after each re-plug.
+
+Verification technique (user's correction, and it is the right one): the Sensors panel does **not** refresh
+when `iio-sensor-proxy` restarts — it sticks on "No Sensors found" — so restart `phosh-mobile-settings` and
+screenshot, rather than asking a human to tap through the UI.
+
+## 2026-10-30 06:31 — SENSORS WORK: all five read live values and iio-sensor-proxy exposes them
+
+`hexagonrpcd` was already installed (0.4.0-r3); what was missing was the *content* it serves and the right
+device node. Everything below is verified on the phone over USB:
+
+```
+ssccli --sensor accelerometer → X=-0.63 Y=0.10 Z=9.90 m/s²    (flat: gravity on Z, correct)
+ssccli --sensor light         → 5 / 7 / 0 lux
+ssccli --sensor gyroscope     → 0.000 0.000 0.000 m/s         (stationary, correct)
+ssccli --sensor proximity     → FAR
+ssccli --sensor magnetometer  → 188.3 / 281.1 / 21.0 µT
+monitor-sensor --accel        → "Has accelerometer", "Tilt changed: face-up"
+monitor-sensor --light        → "Has ambient light sensor", "Light changed: 5.000000 (lux)"
+```
+
+`iio-sensor-proxy` is what Phosh reads for auto-rotate and auto-brightness, so the UI side is done as well.
+
+**How it works, and the three things that were actually wrong:**
+
+1. **The device node is `/dev/fastrpc-adsp-secure`** — this port has no plain `/dev/fastrpc-adsp`, which is
+   what the packaged init script hardcodes. `hexagonrpcd -f /dev/fastrpc-adsp-secure -d adsp -s -R <root>`
+   attaches to the sensors PD (`Starting hexagonrpcd (INIT_ATTACH_SNS) on /dev/fastrpc-adsp-secure`) and the
+   DSP immediately starts asking for files.
+2. **Every missing file is logged verbatim**, which made this a mechanical exercise: `Could not open
+   /sys/devices/soc0/{hw_platform,platform_subtype,platform_subtype_id,platform_version,soc_id,revision}` and
+   `/mnt/vendor/persist/sensors/registry/{sns_reg_version,file1,file2}`. Mainline has no Android socinfo, so
+   the values are faked from the vendor configs (`hw_platform=MTP`, `soc_id=355`) and served from the `-R`
+   root together with the vendor's `sensors/{config,registry,sns_reg.conf}`.
+3. **Persistence**: init script patched to honour `hexagonrpcd_dev`,
+   `/etc/conf.d/hexagonrpcd-adsp-sensorspd` sets `hexagonrpcd_dev=/dev/fastrpc-adsp-secure` and
+   `hexagonrpcd_fw_dir=/usr/local/share/violet-sensors`, service added to the `default` runlevel. Only
+   `iio-sensor-proxy` needed a restart afterwards.
+
+Artefacts: `phone/install-sensors.sh` (idempotent end-to-end recipe, also re-fakes socinfo),
+`phone/hexagonrpcd-adsp-sensorspd.initd` (patched init script), `fw/sensors/violet-sensors.tar.gz` (staged
+configs + registry dirs). No kernel change, no DT change, no flash — the earlier `sdsp` DT idea stays dead.
+
+**Known cosmetic issue:** `Mount matrix provided by firmware is all 0, falling back to identity matrix` — the
+vendor configs have `.orient` (x=-x, y=-y, z=+z) but a zero `.placement`, so whether rotation direction is
+correct is untested (needs someone holding the phone). Fix via the config's placement or an iio-sensor-proxy
+mount matrix.
+
+Camera remains untouched; only the sensor subsystem is done.
+
+## 2026-10-30 06:20 — telemetry kernel flashed and running: S6 verified, a second flood found, and the GX hypothesis is rejected
+
+**Flashed at 06:03** (`fastboot flash boot boot-mainline.img`, serial `cb0bdec5`, "Sending 44928 KB OKAY,
+Writing OKAY, 1.27 s"; `dtbo` untouched). Boot came up first try, `./host/flash-g1.sh --verify` passed:
+`7.2.10-sm6150`, GPU `control=auto`, battery 73 %.
+
+**S6 is verified in the field.** Right after boot: dmesg **1445 lines with `Handover signaled` = 1** — the
+same-size ring that previously held 1131 spam lines (94 %). Boot-time lines now survive; that is what made the
+rest of this possible.
+
+**A second flood was hiding behind it** — `ath10k_snoc … htt rx netbuf pop: <16 bytes>` hex dumps, from
+`ath10k_core.debug_mask=0x7fffffff` in `mk-bootimg.sh`'s cmdline. It evicted the ring again within **6 minutes**
+(first surviving line was at t=382 s). Two fixes: runtime `echo 0 > /sys/module/ath10k_core/parameters/debug_mask`
+(the param is 0644, no reboot, done at 06:10) and the flag is now **removed from `mk-bootimg.sh`** with a comment
+explaining why. Anyone re-enabling it for WiFi work should set it at runtime and reset it afterwards.
+
+**The GX-power hypothesis is rejected for ordinary resumes.** The new telemetry ran on ~40 resumes (boot + 12
+scripted resume/suspend cycles + a manual burst):
+
+```
+RGMU GX after GPUSTART: status=00000100 gx_on=1 poll_ret=0      (every single time)
+RGMU hw_init: suspend_count=0…39 rbbm_status=00c00015 cp_sqe_cntl=00000001
+```
+
+`RGMU_SPTPRAC_PWR_CLK_STATUS` reads `0x00000100` with `RGMU_GX_GDSC_POWER_OFF` (bit 6) already clear, and
+`poll_ret=0` means the very first poll succeeded — **GX is up before `hw_init` writes anything, in every observed
+resume**. So "GPUSTART acked before GX powered, CP writes dropped" does not explain G1. (`rbbm_status=00c00015`
+= `CP_BUSY|CP_AHB_BUSY_CX_MASTER|bit4|GPU_BUSY_IGN_AHB{,_CP}`, i.e. the snapshot is taken before the CP finishes
+init, as expected.)
+
+**Short idles do not reproduce it.** 12 scripted `eglprobe` resume→GL→suspend cycles all returned
+`[64, 128, 191, 255]` (the correct pixel), 0 `hangcheck`, 0 `adreno_idle` timeouts. Combined with the field
+data, the remaining untested variable is the **duration** of the suspended state (the field hangs followed
+~100 min of suspend, not 6 s). Long-idle repro is running: `tools/g1-longidle-repro.sh` blanks the panel, holds
+the GPU suspended for 40 min (verified `runtime_status=suspended`, `suspended_time` delta reported), then fires
+25 surfaceless-GL bursts and dumps the telemetry.
+
+**Method note:** the `cp_init: CP_ME_INIT not consumed (rptr= wptr= rbbm_status= cp_sqe_cntl=)` diagnostic has
+not fired yet — it is the line that will identify the failing state if any of these runs reproduces the hang.
+
+## 2026-10-30 04:55 — sensors: no kernel work needed after all — the packaged daemon attaches to `/dev/fastrpc-adsp`
+
+Read the actual Alpine `hexagonrpcd` package (`0.4.0-r3`, aarch64, fetched and unpacked locally) instead of
+reasoning about it. Its `/etc/init.d/hexagonrpcd-adsp-sensorspd` runs:
+
+```
+command_args="-f /dev/fastrpc-adsp -d adsp -s"
+```
+
+`-s` = attach to sensorspd, applied to the **plain ADSP FastRPC device** that this port already has (the audio
+`allocpd` path runs through it). **Retracting my earlier framing:** no `sdsp` DT node, no compute-cb SID
+hunting, no kernel rebuild — `patches/proposed/0020-sensors-sdsp-fastrpc.md` now carries a SUPERSEDED banner.
+
+The same package pins the file layout: `-R <dir>` serves `<dir>/sensors/config/`, `<dir>/sensors/registry/` and
+`<dir>/sensors/sns_reg.conf`, default root `/usr/share/qcom/<soc>/<vendor>/<device>`; `10-fastrpc.rules` sets
+`/dev/fastrpc-*` to `fastrpc:fastrpc` 0600 and `.pre-install` creates that user/group.
+
+So the first sensors attempt is **userspace only**. Staged for it: `fw/sensors/violet-sensors.tar.gz`
+(2.8 KB) = `sensors/config/talos_{lsm6ds3c,ak991x,stk3x3x,power}_0.json`, `sensors/sns_reg_config` (also as
+`sns_reg.conf`), `sensors/registry/` and `mnt/vendor/persist/sensors/registry/registry/` (the output path named
+inside `sns_reg_config`), all with the `fastrpc` user as owner once unpacked. Procedure is in `CHECKLIST.md` §6.
+
+Still unverified, and it needs the phone: whether the sensorspd on this ADSP firmware accepts mainline's
+FastRPC session at all, and whether `iio-sensor-proxy` in Alpine carries the libssc backend (if not, `ssccli`
+still proves the data path, but Phosh rotation would need that backend or a small bridge).
+
+## 2026-10-30 04:05 — sensors: hardware identified from the vendor configs; the missing piece is a known, packaged daemon
+
+Answering "can we read ambient light / gyro / etc. and use them?" — **yes in principle, and the path is now
+concrete**, but nothing is implemented yet.
+
+**The hardware, read out of the vendor's own sensor configs** (`vendor.img:/etc/sensors/config/talos_*.json`,
+codename "talos" = SM6150; staged in `fw/sensors/`):
+
+| Sensor | Part (SNS module) | SSC bus | addr | DRI irq |
+|---|---|---|---|---|
+| Accel + gyro | ST **LSM6DS3-C** (`sns_lsm6ds3c`) | SPI inst. 2 | — | 81 |
+| Magnetometer | AKM **AK0991x** (`sns_ak0991x`) | I²C inst. 1 | 0x0C | 83 |
+| Ambient light + proximity | Sensortek **STK3x3x** (`sns_stk3x3x`) | I²C inst. 1 | 0x47 | 92 |
+
+The STK3x3x config carries both `.als` and `.ps` groups, so auto-brightness and proximity are in scope, not
+just rotation. IMU orientation is `x=-x, y=-y, z=+z`; rails `/pmic/client/sensor_vdd`, `sensor_vddio`.
+
+**Why an AP driver cannot be used:** `bus_instance` indexes the **SSC's own** I²C/SPI controllers, and the
+vendor DTB has no accel/ALS node on any AP bus — so mainline's `st_lsm6dsx` or `stk3310` cannot be pointed at
+these parts. Everything must come through the SSC (QRTR service 400, protobuf in QMI).
+
+**Correction to the 2026-10-28 scoping:** `sns_reg_config` is **not** a registry. It is 553 B of instructions
+mapping sysfs attributes (`hw_platform`, `soc_id`, `revision`, …) and naming the *output* path
+`/mnt/vendor/persist/sensors/registry/registry`. The ADSP **generates** the registry from the JSON configs plus
+`soc_id`. So there is no registry blob to push — the missing capability is runtime *file access* for the sensor
+PD, which is what `hexagonrpcd` provides.
+
+**The dependency is packaged already:** Alpine community has `hexagonrpcd` 0.4.0-r3 (aarch64 built) shipping
+`hexagonrpcd-adsp-rootpd`, **`hexagonrpcd-adsp-sensorspd`** (sensors PD on ADSP — exactly violet's topology,
+since QRTR node 5 is the ADSP and it advertises service 400), `hexagonrpcd-sdsp`, `10-fastrpc.rules` and an
+OpenRC service. `libssc 0.4.4` + `ssccli` are already installed on the phone and already reach service 400;
+only enumeration fails.
+
+**Remaining unknowns, in order:** (1) the config path the `adsp-sensorspd` init script expects, and whether the
+sensors PD is exposed by *mainline* fastrpc at all — `talos.dtsi` declares only `adsp` and `cdsp` fastrpc nodes,
+while `fastrpc.c` already understands the `sdsp` domain and the binding allows `label = "sdsp"`. A candidate node
+is written up in `patches/proposed/0020-sensors-sdsp-fastrpc.md` and is deliberately **not applied** to the
+pending boot image (untested DT that could disturb the working audio `allocpd` path). (2) a writable persist
+path for the generated registry, which mainline does not mount.
+
+**Cost split:** step (a) — install `hexagonrpcd`, serve `fw/sensors/`, run `ssccli`/`monitor-sensor` — is
+**WiFi-only, no kernel change**. Only if the sdsp PD turns out to be missing does this need the cable.
+
+**Usable today: nothing for motion or light.** The PMIC ADCs are the only IIO consumers, and there is no
+software substitute for an IMU or an ALS.
+
+## 2026-10-30 03:40 — G1 telemetry kernel built and staged; flash blocked (phone left USB and WiFi)
+
+**Built and verified, nothing flashed yet.**
+
+- `make ARCH=arm64 LLVM=1 Image dtbs` → `BUILD_RC=0`; `Image` 36313096 B at 03:16. The three G1 telemetry
+  strings are present in the built `Image` (checked with `strings`): `RGMU GX after GPUSTART`,
+  `cp_init: CP_ME_INIT not consumed`, `RGMU hw_init: suspend_count`.
+- `boot-mainline.img` rebuilt at 03:21 from that Image + DTB + the r9 initramfs.
+- **S6 gate built as a module**: `CONFIG_QCOM_Q6V5_COMMON=m` / `CONFIG_QCOM_Q6V5_PAS=m`, so the handover-spam
+  change is in `qcom_q6v5.ko`, not the Image. Rebuilt, stripped (16 KB), installed to
+  `/lib/modules/7.2.10-sm6150/kernel/drivers/remoteproc/qcom_q6v5.ko` on the phone and `depmod`-ed, so it takes
+  effect on the next boot without another flash cycle. The change reports the first handover repeat and then
+  every 6000th instead of once a second (≈1 line/100 min instead of 94 % of the log ring).
+- Instrumentation saved as **`patches/0019-rgmu-g1-telemetry.patch`** (2 files, +60 lines) and verified to
+  reverse-apply cleanly against the tree (`patch -R --dry-run -p1` → both files OK), so the patch and the built
+  Image agree. Content: (a) `a6xx_rgmu_start()` polls `RGMU_SPTPRAC_PWR_CLK_STATUS` for GX-on after the
+  GPUSTART ack and logs `status/gx_on/poll_ret`; (b) `a6xx_hw_init()` logs
+  `suspend_count/rbbm_status/cp_sqe_cntl` just before `cp_init`; (c) `a6xx_cp_init()` logs
+  `rptr/wptr/rbbm_status/cp_sqe_cntl` when `CP_ME_INIT` is not consumed instead of silently returning `-EINVAL`.
+- **`host/flash-g1.sh`** — one command: brings the USB link up, asks for fastboot, flashes **`boot` only**
+  (`dtbo` untouched, hard-coded rule in the comments), reboots, waits for the phone, then prints the kernel,
+  the dmesg line count, the `Handover signaled` count, the RGMU boot lines and the G1 signature. `--verify`
+  checks without flashing, `--wait` waits for the phone first.
+
+**U1 (USB networking) is solved as a side effect** — `enp0s20f0u4` with `172.16.42.2/16` reaches the phone's
+`172.16.42.1/16` at **4 ms RTT** with no loss, which is what made the module push and (intended) flash practical.
+The interface name can change after the gadget re-enumerates, so `flash-g1.sh` discovers
+`enp0s20f0u[0-9]` each time and re-adds the address if missing.
+
+**BLOCKED — no flash happened.** At ~03:30 the host logged `usb 3-4: USB disconnect, device number 26`
+(a clean disconnect, not a device error) and the phone then disappeared from USB, from `fastboot devices`
+and from WiFi (ARP `INCOMPLETE`, gateway still reachable, so the laptop's network is fine). Whether the cable
+was unplugged or the phone powered off cannot be determined remotely. **No partition was written**: if the phone
+is running at all, it still runs the old kernel with the GPU pinned and the new module staged for the next boot.
+
+**Resume with one command:** `./host/flash-g1.sh` (phone plugged into the laptop).
+
+## 2026-10-30 23:05 — G1 reproduced with attribution: `CP_ME_INIT` is left unconsumed at a resume
+
+**First clean capture of the G1 hang with the offending task named, and with the ringbuffer content decodable.**
+NewPipe (ATL, Vulkan renderer) was launched at 23:00:18 while the phone sat on the lock screen, then unlocked;
+the first rendering pass produced two hang/recover rounds inside 3 s:
+
+```
+[ 8023.194646] [drm:adreno_idle] *ERROR* 06010200: timeout waiting to drain ringbuffer 0 rptr/wptr = 0/C
+[ 8023.695652] [drm:hangcheck_handler] *ERROR* 06010200: hangcheck detected gpu lockup rb 0!
+[ 8023.707274] [drm:hangcheck_handler] *ERROR* 06010200:     completed fence: 27630
+[ 8023.718079] [drm:hangcheck_handler] *ERROR* 06010200:     submitted fence: 27632
+[ 8024.206643] [drm:adreno_idle] *ERROR* 06010200: timeout waiting to drain ringbuffer 0 rptr/wptr = 0/C
+[ 8024.216146] [drm:recover_worker] *ERROR* 06010200: hangcheck recover!
+[ 8024.225993] [drm:recover_worker] *ERROR* 06010200: offending task: main (android-translation-layer …NewPipe.apk…)
+[ 8025.703646] [drm:hangcheck_handler] *ERROR* 06010200: hangcheck detected gpu lockup rb 0!   (fences 27631/27633)
+[ 8026.261460] [drm:recover_worker] *ERROR* 06010200: hangcheck recover!
+```
+
+**The ring content identifies the stuck command.** `devcoredump` captured the state as `/sys/class/devcoredump/devcd2`
+(saved as `logs/g1-2026-10-29/devcd2.txt`); decoding its ascii85 ringbuffer (byte order: u32 big-endian) gives
+`70c80008 0000002f 00000003 20000000 00000000 00000000 00000000 00000000 00000000` at dword 0 — i.e. the
+**`CP_ME_INIT` packet with payload `0x2f, 3, 0x20000000, 0, 0, 0, 0, 0`**, which is exactly `a6xx_cp_init()`'s
+8-dword payload — followed by one more packet (`70620002`, the secure-mode switch). Header + payload + the next
+packet = **12 dwords = 0xC**, which is precisely the `wptr` in `rptr/wptr = 0/C`.
+
+So the state at hang is: **`a6xx_hw_init()` was running, it wrote `CP_ME_INIT` into a fresh ring (rptr still 0),
+and the CP never fetched it.** A client job (fences 27630→27632) was waiting behind it, hangcheck fired 500 ms
+later, and recovery re-ran `hw_init`, whose `CP_ME_INIT` also went unconsumed (second identical timeout).
+Therefore the failing step is *"the CP does not start"*, not the job itself and not the ringbuffer bookkeeping.
+
+**What this rules out and what it does not:**
+- It is **not** "every resume leaves the CP dead": 8 resume/suspend cycles in the same hour (idle-triggered,
+  `tools/g1-cycle-test.sh` predecessors) ran `hw_init` → `cp_init` with **no** drain timeout at all.
+- The trigger correlates with the *first real client submission* after a long GPU idle (~100 min suspended at
+  the time), which is what the 06:56–07:31 field data said too.
+- The devcoredump's `registers:`/`registers-gmu:` sections are **empty** (`gpu-initialized: 0`, `rbbm-status: 0`),
+  so it carries no RBBM/CP/GMU register values: post-hoc dumps cannot show the GX power state at fault time.
+  Kernel-side telemetry around `a6xx_rgmu_start()` and `a6xx_hw_init()` is required to see whether GX is up
+  when `CP_ME_INIT` is written.
+
+**Doc correction:** the 2026-10-18 **MILESTONE** entry's "Remaining" list ("on 2nd+ cycles the first submitted
+job locks the GPU up") is **superseded** by the same-day **(night) — repeat-power-cycle bug FIXED** entry
+(verified with 5 consecutive EGL clears) and by `RULED-OUT.md` §134 (AHB fence / GPUSTART OOB). It must not be
+cited as live evidence; the only live G1 evidence is the 2026-10-29 captures.
+
+**Holding measure applied (userspace, reversible, not a fix):** GPU runtime PM pinned on
+(`power/control=on` on `5000000.gpu`, `506d000.gmu`, `card0`) so `hw_init` does not re-run between jobs.
+Revert with `power/control=auto`; costs battery because GX stays powered.
+
+**Repro recipe that works without a compositor or an unlocked session:** `python3 tools/eglprobe.py`
+(surfaceless EGL + `glClear` + `glReadPixels`) in a loop — it submits real command streams to the GPU while the
+phone is locked. `tools/g1-cycle-test.sh` wraps that into resume/suspend cycles.
+
+## 2026-10-30 00:55 — A1 done: the driver now loads itself with the SMB5 init
+
+`/etc/modprobe.d/violet-vbat.conf` -> `options violet_vbat smb5_init=1 debug_state=1`
+`/etc/modules-load.d/violet-vbat.conf` -> `violet_vbat`
+
+Verified **without a reboot** by reloading from config alone (`modprobe violet_vbat`, no arguments):
+
+```
+smb5_init param = 1   debug_state = Y
+SMB5 after: icl_options=0x01 (mode_chg=1) icl=1800 mA status5=0x99
+```
+
+So the input-path fix survives a reboot without manual intervention; the only thing not yet observed is a
+cold boot (deliberately not taken, reboots are expensive).
+
+**B1 armed:** `/tmp/rest-anchor.sh` runs under `setsid` (5 269) for ~3 h, appending any sample with
+|I| < 150 mA to `/tmp/rest-anchors.txt` as `epoch vbat ibat capacity status`. Whenever the phone is
+unplugged and idle, real rest anchors accumulate and B1 can be computed from that file.
+
+## 2026-10-30 00:40 — rate study, 17.5 min at 1.58 A: counter and OCV agree to 45 %, per-minute OCV is useless
+
+19 dmesg state lines (1/min) analysed independently of the driver, recomputing both estimators from raw `v`
+and `i` rather than trusting the logged `soc_ocv`:
+
+| estimator | dSoC over 1052 s at 1.58 A mean |
+|---|---|
+| Coulomb integration (i·dt / 3.58 Ah) | **+12.94 points** |
+| OCV model (`V - I*122 mOhm` through the vendor table) | **+8.93 points** |
+| published `capacity` | 66 % -> 78 % (**+12**) |
+
+- The counter and the published value agree to 0.9 points, so the integration path is doing exactly what it
+  claims.
+- Counter vs OCV differ by **1.45x** over the window. Crucially the **per-minute ratio scatters from 0.5x to
+  5.4x, and two windows came out negative** (OCV falling while charging at 1.6 A). That is the quantitative
+  proof that OCV is usable as a LEVEL but not as a RATE under load - which is why the 00:25 patch stopped
+  correcting toward it continuously and why the earlier "4x" reading of a single 48-min window was an artefact.
+- The residual 1.45x is attributable to (a) polarisation growth during charge that a constant Rbatt cannot
+  capture, and (b) the vendor OCV table's plateau slope for a 3.58 Ah FCC assumption. Neither is separable
+  without a rest measurement, and neither is a scale error.
+
+**Net position of the gauge:** correct current sign; coulomb counting owns the rate (validated against
+physics); OCV owns the level, applied only when resting or when the two disagree by 20+ points; SoC persisted
+in SDAM with an `0xA5` marker; monotonic clamp against 1-point jitter. Absolute accuracy ~+/-5-8 %, limited by
+the OCV table and the 25 degC assumption, not the code.
+
+## 2026-10-30 00:25 — SMB5 input path was in SDP-current mode; prior art found; one hypothesis retracted
+
+**Research first, then the conclusion — this entry supersedes the 23:15 "4x current scale" claim, which is
+RETRACTED.**
+
+Prior art found for the exact PMIC: **asidko/pm6150-charger-mainline** (postmarketOS, PM6150, miatoll/sunfish)
+plus its `docs/REGISTER_SEQUENCE.md` and `docs/DESIGN_DECISIONS.md`. It documents that stock mainline leaves
+SMB5 on the bootloader's SDP fallback (~500 mA) and names the bit that silently enforces it:
+
+> `USBIN_ICL_OPTIONS_REG` (0x1366): BIT(0) = `USBIN_MODE_CHG` (0 = SDP-current mode, 1 = high-current).
+> With BIT(0) cleared the PMIC stays in SDP-current mode and silently ignores the ICL just programmed.
+> Registers read back correctly, the state machine reports FAST_CHARGE, but actual VBUS current never
+> exceeds ~500 mA.
+
+**Our device matched that exactly** (measured, not inferred):
+
+```
+apsd=0x10 (float)  icl_options=0x02 (mode_chg=0 usb51=1)  icl=1500 mA  status5=0x99 valid_vin=1 chg_en=1
+```
+
+Correction to my own earlier note: `USBIN_CURRENT_LIMIT_CFG` 0x1e = 30 x 50 mA = **1500 mA**, not "~3 A".
+
+**Fix applied** — `smb5_init` module param (0 = read-only snapshot, 1 = write) implements the documented
+9-register sequence in this order: AICL off (0x1380=0) → ICL 1.8 A (0x1370) → FCC 2 A (0x1061) →
+`mode_chg=1, usb51=0` (0x1366) → ICL_OVERRIDE (0x1342) → ICL_OVERRIDE_AFTER_APSD (0x1365) → unsuspend
+(0x1340) → master enable (0x1042). JEITA, float voltage, safety timer, OTG and watchdog are deliberately not
+touched. Verified after load:
+
+```
+SMB5 after: icl_options=0x01 (mode_chg=1, usb51=0)  icl=1800 mA  status5=0x99 valid_vin=1 chg_en=1
+```
+
+Three minutes of monitoring afterwards: no VBUS collapse, `valid_vin` stays 1, `status=Charging`,
+capacity 76 -> 77 %, current 1.28-1.58 A.
+
+**Retracted hypothesis — the QG current is NOT demonstrably 3x overstated.** That claim rested on assuming the
+input was capped at 500 mA. It is not: `ap sd=0x10` is **FLOAT** (dedicated-charger class), and with the init
+applied the energy balance closes — battery 1.3-1.6 A x 4.23 V = 5.5-6.7 W plus ~2 W system against
+1.8 A x 5 V = 9 W of input. A 3x scale error cannot fit that. The current reading is therefore consistent with
+physics, and the 23:15 entry's "4x" conclusion was wrong.
+
+**Still open, honestly:** one 48-minute window (21:20-22:08) where OCV rose +6.7 points while the integrated
+charge implied ~+25. Candidates, none yet eliminated: the input source class changed mid-window (the cable was
+physically moved and replugged around then), or OCV-rate error in the 50-60 % plateau. A 30-minute 5 s-interval
+study is now collecting on the phone (`/tmp/rate-study.txt`, started 22:15, setsid so it survives SSH exit —
+the first attempt silently died after one sample because plain `nohup` did not survive).
+
+## 2026-10-30 00:05 — K1 verified (glissando won the seat) and the current reading settled to a physical value
+
+**K1 passes, confirmed by the user unlocking with glissando.** In the real user session
+(`greetd --session=phosh`, `user` session bus):
+
+- `sm.puri.OSK0` served by `/usr/local/libexec/glissando/bin/glissando --allow-replacement` (pid 12350)
+- `phosh-osk-stevia` process count: **0**
+
+That closes the 22:10/22:55 seat-race work: the launcher fix holds at a genuine session bring-up, not just
+when stevia is removed by hand.
+
+**The current reading looks physical once the session is up.** With the same module loaded, `current_now`
+fell from **1.26 A** (during the greeter session) to **0.55 A** (after the user session started), with
+`status=Charging` and `capacity=64 %`. 0.55 A is exactly what a laptop USB 2.0 port can deliver into the pack
+after the phone's own load, so the earlier 1.1–1.3 A figures are now looking like a *greeter-session*
+artefact rather than a wrong LSB — plausibly the charger re-negotiated its input limit when the session
+changed (ICL was read as ~3 A earlier, which a USB 2.0 SDP port never supplies).
+
+**Consequence for the 4× discrepancy (23:15 entry):** the OCV rate said ≈0.30 A, QG said ≈1.26 A. If the
+true current during that window was ~0.55 A and fluctuating, the residual disagreement is ~2× rather than 4×,
+and the prime suspect becomes the burst-average register not tracking sudden input-limit changes rather than
+a scale error. Still not proven — B1 (unplug for 60 s, or a wall charger) remains the test.
+
+**Display note (00:00):** the black screen the user hit was **not** D1 — `dsi_err_worker` count 0, no
+`clk-rcg2` warnings, no GPU faults, compositor and connector both healthy. A greeter restart restored it.
+
+## 2026-10-29 23:15 — the QG current scale is inconsistent with the pack's own OCV rate (open)
+
+Chasing the SoC *rate* discrepancy turned into a concrete, bounded open question. All of the following are
+measured, not inferred:
+
+**The driver is internally consistent.** Register `PERPH_SUBTYPE` (`QG_BASE+0x05`) reads `0x04` =
+`QG_ADC_IBAT_10A`, so the 305.176 µA/LSB scale is the correct branch, and the decode matches the vendor
+byte-for-byte (`sign_extend32(raw, 15)`, `qg_iraw_to_ua()` in `qg-util.c`). Both available current
+registers agree with each other: `QG_LAST_BURST_AVG_I` (`0xc6`) = **-3142** raw, `QG_S2_NORMAL_AVG_I`
+(`0x82`) = **-3610** raw (~1.1 A at 10 A scale, ~0.55 A at 5 A scale). The `BURST_AVG_HOLD_FOR_READ` sequence
+the vendor uses is already implemented, so that is not the cause either.
+
+**The pack disagrees with it.** Two independent zero-current extrapolations (`V = a + b·I`, intercept = rest
+OCV, done by stepping an 8-thread load on/off at 1 Hz):
+
+| time | R | OCV(I=0) | SoC from OCV |
+|---|---|---|---|
+| ~21:20 | 121.9 mΩ | 3.8644 V | 51.4 % |
+| ~22:08 | 116.7 mΩ | 3.9107 V | 58.1 % |
+
+That is **+6.7 points in 48 min**, i.e. ≈ 0.30 A average into a 3.58 Ah pack. The driver integrates
+**≈ 1.1–1.3 A** over the same window, which would be ≈ +29 points (OCV +200 mV). The two estimators
+disagree by **~4×**, and the OCV one matches the physics: the phone is on a **laptop USB port** (device
+`1d6b:0103`, `bMaxPower` 2 mA, USB 2.0 data link at 425 Mb/s), which cannot deliver 1.1 A *into the pack*
+after the phone's own load.
+
+**Not the cause (checked and excluded):** LSB branch (subtype says 10 A, and the code follows it), byte
+order, sign (both registers negative while charging), missing hold sequence, and the vendor formula.
+
+**Two candidates left, and the test that separates them is physical:**
+1. *Current is inflated* (~4×) — i.e. `QG_LAST_BURST_AVG_I` on this PMIC does not scale as documented for
+   this subtype. Test: unplug for 60 s and compare `vbat` against the last charging reading; or put the
+   phone on a wall charger and compare the OCV-derived SoC gain per hour against the integrated charge.
+2. *The vendor OCV table is ~4× too flat* in the 50–60 % plateau (72 mV per 10 points per the table). Test:
+   the same rest measurement anchors one true (OCV, SoC) pair and settles it.
+
+**Interim behaviour, deliberately chosen:** because the current scale is unverified, the gauge does **not**
+trust the integrator — the OCV model is primary and the counter only smooths between samples (fast
+correction >10 points off, slow otherwise). So a wrong current scale can no longer push the percentage
+away from the pack's own voltage. Published SoC tracks **58.8 % (OCV)** vs **63 % (counter)**.
+
+## 2026-10-29 22:55 — OSK launcher hardened: bounded retry instead of one shot
+
+Follow-up to the 22:10 seat race. A single `pkill` before one start only covers the ordering where
+stevia is already up when we come up; phosh can (re)start its own OSK at any point during bring-up, so the
+launcher now retries:
+
+```
+attempt=0; rc=1
+while [ "$attempt" -lt 3 ]; do
+    attempt=$((attempt+1))
+    for rival in phosh-osk-stevia squeekboard; do pkill -f "$rival" && sleep 1; done
+    "$PREFIX/bin/glissando" --allow-replacement; rc=$?
+    [ "$rc" -eq 0 ] && break                       # ran a whole session, exited normally
+    [ $(( $(date +%s) - start )) -gt 10 ] && break  # survived a while then died = real crash, stop retrying
+    sleep 2
+done
+```
+
+The `>10 s` guard is what keeps this from being a restart loop: a seat race kills glissando within
+milliseconds, while a genuine crash happens later — only the former is worth retrying. The `fallback`
+path below is unchanged, so a keyboard still always exists. Installed and syntax-checked
+(`sh -n` OK).
+
+**Live race simulation was attempted three ways and failed for tooling reasons, not product reasons:**
+`pgrep -x phosh` returns empty (the greeter session runs **phrog**, not phosh), `/proc/<phoc>/environ` is
+not readable as `user`, and the greeter has **no `/run/user/108`** bus socket (uid 108, socket missing) —
+so the DBus env of that session cannot be reconstructed from outside. Process-level verification is what
+was available, and it answers the question that matters: **glissando (pid 24324, user `greetd`) is the only
+OSK running; no `phosh-osk-stevia` process exists**. Full confirmation still needs one real session start
+(K1).
+
+## 2026-10-29 22:40 — battery percentage rewritten as a gauge (coulomb counting + verified IR + OCV anchoring)
+
+Goal was a real state-of-charge, not a voltage lookup. What the gauge does now, and the measurement behind each part:
+
+| Piece | Implementation | Evidence |
+|---|---|---|
+| Current sense | QG `LAST_BURST_AVG_I`, sign **positive = charging** | Charger registers prove charging while the raw value is negative; the old code flipped it and counted down |
+| Coulomb counting | `charge += I·dt`, 5 s poll | Capacity rises 60→61 % while charging at 1.3 A |
+| Pack resistance | `Rbatt` = **122 mΩ measured** (fallback; SDAM's learned 120 kept when sane) | Load step: 8 busy loops, 540 mA swing, 50 samples at 1 Hz, least squares **dV/dI = 121.9 mΩ** |
+| IR compensation | `OCV = V − I·Rbatt` | — |
+| Overpotential | **removed**: the measured dV/dI already includes fast polarisation, so adding a separate constant double-counted it and biased SoC ~8 points low (target moved 49 % → 58 % when removed) |
+| Absolute reference | OCV table (vendor Alium 3600 mAh, 25 °C) → SoC, re-anchored continuously: fast (1/20/poll) when >10 points off, slow (1/200) otherwise | counter and model now agree within ~3 points (61 % vs 57.6 %) |
+| Persistence | SoC + our marker `0xA5` written to SDAM (`0xb646/0xb647`) | capacity stayed 80 → 80 across a double module reload |
+| Monotonic clamp | SoC only moves in the direction current implies, released by rest anchor, charger termination, or a ≥2-point model correction | stops the 1-point twitching without locking in a wrong anchor |
+
+**Hardware check first:** the PMIC does **not** maintain SoC itself — `QG_SOC_MONOTONIC_REG` (`0x48bf`) reads `0xff` — so computing it is not a choice.
+
+**Remaining uncertainty:** the vendor OCV table and 25 °C assumption (±5–8 %), and Rbatt is measured at one current. Both are refined by a rest measurement (unplugged, no current for a few minutes), which needs hands on the device.
+
+## 2026-10-29 22:10 — the keyboard on the lock screen was stevia: glissando lost a seat race at session start
+
+Symptom the user reported: the lock screen shows the **stevia** keyboard, not glissando.
+
+**What was actually running:** `/usr/bin/phosh-osk-stevia --allow-replacement` (pid 5529) owning
+`sm.puri.OSK0`, and **no glissando process at all**. glissando was not crashing on its own — our own launcher
+(`/usr/local/bin/glissando-launch-system`) is written to fall back:
+
+```
+for osk in /usr/bin/phosh-osk-stevia /usr/bin/squeekboard; do exec "$osk" --allow-replacement; done
+```
+
+so the fallback firing is the *symptom*; the cause is in glissando's stderr:
+
+```
+glissando: another input method is already running on this seat
+glissando: lost sm.puri.OSK0 (replaced by another keyboard or no session bus)
+```
+
+phosh 0.58 (Alpine edge) starts its own OSK from the shell. It owns the input seat before the
+`sm.puri.OSK0` service (our glissando launcher) comes up, glissando refuses to start, and the session ends up
+on stevia for its whole lifetime.
+
+**Two false leads worth recording:** (1) the `symbols.toml: TOML parse error … missing field 'layers'` I hit
+first was self-inflicted — I ran the binary by hand *without* `GLISSANDO_DATA_DIR`, so it read an empty
+default path; all three installed `symbols.toml` copies hash-match upstream `d1d407d`
+(`1204f1c3d1aa68c5e0ea27fe0c2479c7`). (2) The installed `en.toml` is byte-identical to upstream too. The
+layout data was never broken.
+
+**Fix:** the launcher now frees the seat before starting glissando —
+
+```
+for rival in phosh-osk-stevia squeekboard; do
+    if pkill -f "$rival" 2>/dev/null; then sleep 1; fi
+done
+```
+
+Installed to `/usr/local/bin/glissando-launch-system`. phosh restarts the `sm.puri.OSK0` service when the
+keyboard is needed, so killing the rival does not leave the session without a keyboard.
+
+**Verified:** with stevia stopped, the launcher brings glissando up and it keeps the seat —
+`pid 24324 /usr/local/libexec/glissando/bin/glissando --allow-replacement`, stevia gone. Still to confirm at
+the next real session start (K1 in CHECKLIST).
+
+**Also observed:** `phoc` is currently owned by **`greetd`**, i.e. the phone is sitting in the *greeter*
+session, not the user session — which is why the OSK in front of the user is the system one
+(`glissando-launch-system`, the variant meant for the greeter/lock screen) and why `/proc/<phoc>/environ` is
+not readable as `user`.
+
 ## 2026-10-29 21:20 — charging was never broken: `violet-vbat` had the current sign inverted
 
 After the battery died and the phone came back on cable, the gauge reported `status=Not charging`,
@@ -115,7 +1860,7 @@ phone.
 
 **Scrubbing pass applied to every published file:** home AP SSID → `<home-ap-ssid>`, AP BSSID →
 `<ap-bssid>`, the phone's LAN address → `<phone-ip>`, fastboot serial → `<serial>`, the phone's WiFi MAC →
-`<device-wifi-mac>`, personal e-mail → GitHub noreply, `~…` → `~`/`$PROJECT`. Verified by scanning
+`<device-wifi-mac>`, personal e-mail → GitHub noreply, `/home/vipi…` → `~`/`$PROJECT`. Verified by scanning
 a **fresh clone** of the public repo (no e-mails, keys, tokens, private IPs, MACs, serials, SSID or local
 paths), and every link in the markdown resolves.
 
@@ -474,7 +2219,7 @@ batt-log.txt captured ~330 mA discharge (plug=0, QG window 5.3 s, vbat 4.32 V, m
 gsd-power had `sleep-inactive-battery-type='suspend'`; on battery the phone suspends when idle and mainline does not come back (WiFi gone, black screen, power button did not wake it). Set `sleep-inactive-battery-type` and `-ac-type` to `nothing` for the greetd session (gsettings). Real fix (suspend/resume) is separate and not done. r10's own gauge confirmed the plugged/full state: capacity 100, Full, 0 mA, 4.385 V, matching violet-vbat (so the earlier 82 was transient).
 
 ## 2026-10-26 night - battery: real gauge work (QG-lite driver), in validation
-`violet-vbat` rewritten to read the pm6150 QG hardware directly (same register formulas as the downstream qpnp-qg: V = raw*194.637 uV, I = -raw*305.176 uA on this 10A part; RT FIFO + accumulator via MASTER_HOLD; SDAM SoC byte at 0xb647 for continuity with r10 and written back) and coulomb-count a vendor-profile OCV-anchored SoC (FCC 3580 mAh). Findings: QG S2 FIFO entry = 128 samples x 100 ms = 12.8 s (CTL2=0x26, CTL3=0x0a); when current is below the S3 thresholds the QG sleeps (FIFO/accumulator empty, LAST_ADC_I = 0) so on the charger at full no current data exists; r10's SDAM SoC (82) was stale (QG catch-up after r10 boot), the pack was really ~full (4.39 V, -16 mA). Needs a discharge with load to validate the current path. Log: `batt-log.txt` (over WiFi ssh <phone-ip>).
+`violet-vbat` rewritten to read the pm6150 QG hardware directly (same register formulas as the downstream qpnp-qg: V = raw*194.637 uV, I = -raw*305.176 uA on this 10A part; RT FIFO + accumulator via MASTER_HOLD; SDAM SoC byte at 0xb647 for continuity with r10 and written back) and coulomb-count a vendor-profile OCV-anchored SoC (FCC 3580 mAh). Findings: QG S2 FIFO entry = 128 samples x 100 ms = 12.8 s (CTL2=0x26, CTL3=0x0a); when current is below the S3 thresholds the QG sleeps (FIFO/accumulator empty, LAST_ADC_I = 0) so on the charger at full no current data exists; r10's SDAM SoC (82) was stale (QG catch-up after r10 boot), the pack was really ~full (4.39 V, -16 mA). Needs a discharge with load to validate the current path. Log: `batt-log.txt` (over WiFi ssh <lan-ip>).
 
 ## 2026-10-26 night - battery % jitter fix
 User saw the % go up and down (voltage moves with load). violet-vbat now samples every 10 s into a 1/8 EMA and only lets the reported capacity move down while unplugged / up while plugged. Installed live (rmmod/modprobe) and in /lib/modules/.../extra.
@@ -614,8 +2359,8 @@ the codec-DMA error 0x3 needs the same disassembly. No new kernel patch this rou
 
 ## 2026-10-26 12:05 — WiFi WORKS on mainline: station associates, DHCP, ping and DNS over wlan0
 
-**Result (kexec boot, Image #137+):** `wlan0` associated to the home AP (`<home-ap-ssid>`, <ap-bssid>, 2.4 GHz ch 2, -90 dBm),
-got `<phone-ip>/24` by DHCP, `ping -I wlan0 1.1.1.1` 3/4 answers (~43 ms; losses only from the very weak signal) and DNS resolves.
+**Result (kexec boot, Image #137+):** `wlan0` associated to the home AP (`<home-ssid>`, <mac>, 2.4 GHz ch 2, -90 dBm),
+got `<lan-ip>/24` by DHCP, `ping -I wlan0 1.1.1.1` 3/4 answers (~43 ms; losses only from the very weak signal) and DNS resolves.
 
 **Root cause:** the WCN3990 HL3.x firmware answers `WMI_VDEV_START_REQUEST` for a *station* vdev with status -1 when the vdev has no
 peer yet. ath10k (and mac80211) only creates the station's BSS peer *after* the vdev is started; an AP vdev works because ath10k creates
@@ -634,7 +2379,7 @@ failed vdev start drop an orphaned early peer. Module parameter in sysfs: `/sys/
 **Why the earlier self-peer attempt failed:** it created the peer with the vdev's *own* MAC; the firmware never reports that peer
 (no HTT peer-map event, wait timed out) and the host then deleted the vdev with the peer present, which asserts the firmware.
 
-**Not done:** `50-wifi-stable-mac.conf` is still moved away (MAC is randomised per connect: <device-wifi-mac> this run); signal is poor
+**Not done:** `50-wifi-stable-mac.conf` is still moved away (MAC is randomised per connect: <mac> this run); signal is poor
 (-90 dBm, phone is far from the AP or the antenna/cal data is not tuned); roaming and 5 GHz untested; a plain reboot of mainline (not
 kexec) is untested because `boot` still holds r10.
 
@@ -642,7 +2387,7 @@ kexec) is untested because `boot` still holds r10.
 
 **Where it stands (Image #136, kexec):** `wlan0` autostarts, scans (APs listed in `nmcli`), and **an access point works**: `hostapd` on the phone (`violet-ap-test`, ch 6, WPA2, HT20)
 started its AP vdev with no error and the laptop saw its beacons at 89 % (so the radio's TX and RX paths work; the phone can be a hotspot). What fails is **association as a
-station**: the user typed the password for `<home-ap-ssid>` (profile saved in NetworkManager), and every attempt dies at
+station**: the user typed the password for `<home-ssid>` (profile saved in NetworkManager), and every attempt dies at
 `mac vdev 0 start center_freq 2417 phymode 11ng-ht40/ht20/11g -> vdev-start-response reports status error: -1 -> failed to start vdev 0 ... -22`
 (mac80211 retries the three phymodes within ~30 ms, all rejected). Note the home AP is also marginal here: laptop −77 dBm, phone −85..−91 dBm from this desk.
 
@@ -668,7 +2413,7 @@ Operational fixes made along the way: `violet-modem` now waits 120 s per attempt
 ## 2026-10-26 07:00 — WIFI WORKS on mainline: wlan0 up, firmware stable, active scan returns real access points (Image #121, kexec)
 
 Result of `modem-test.sh q1` (fresh kexec of Image #121 + DTB with the changes below): `wlan0` registered, UP, firmware ran for 5+ min with no crash, and
-`iw dev wlan0 scan` returned `BSS <ap-bssid>  signal -85 dBm  SSID <home-ap-ssid>` (active scan = TX and RX work). Not yet done: associate to a network
+`iw dev wlan0 scan` returned `BSS <mac>  signal -85 dBm  SSID <home-ssid>` (active scan = TX and RX work). Not yet done: associate to a network
 (needs the user's SSID and password), a MAC address (ath10k logs "invalid MAC address; choosing random"), and an autostart service (the modem is still started
 by hand).
 
@@ -687,7 +2432,7 @@ by hand).
    OnePlus 7T (https://lists.infradead.org/pipermail/ath10k/2026-March/016890.html); the guard is `if (QCA_REV_WCN3990(ar)) return;` in `ath10k_thermal_set_throttling()`.
 
 **Update 07:30 — it now comes up by itself after a plain kexec boot** (`ml-boot.sh auto2`, nothing typed on the phone): `wlan0` registers ~98 s after the kexec, NetworkManager
-lists it (`wlan0:wifi:disconnected`) and `nmcli device wifi list` shows the real AP `<home-ap-ssid>` (WPA1/WPA2, ch 2). Works with the greeter and the display running too
+lists it (`wlan0:wifi:disconnected`) and `nmcli device wifi list` shows the real AP `<home-ssid>` (WPA1/WPA2, ch 2). Works with the greeter and the display running too
 (the MDSS SMMU fault storm only slows the modem's first boot; it does not break it).
 - **Autostart:** `/etc/init.d/violet-modem` (source `phone/violet-modem.initd`) starts `tqftpserv` and `rmtfs`, boots the modem, waits up to 60 s for `wlan0`, and stop/starts the modem
   up to 4 times if it does not appear (the first cold start usually hits the 40 s fatal first, the automatic restart then works; the log is `/var/log/violet-modem.log`).
@@ -1671,7 +3416,7 @@ RESTART2 EINVAL":
   `EINVAL` and no reboot at all.
 
 Working call: raw **arm64 `syscall(142, 0xfee1dead, 672274793, 0xA1B2C3D4, "bootloader")`**. Verified twice: the
-phone lands in fastboot (`<serial> fastboot`, `product: violet`) within ~15 s, no buttons, no partition writes.
+phone lands in fastboot (`cb0bdec5 fastboot`, `product: violet`) within ~15 s, no buttons, no partition writes.
 
 Installed: `/usr/local/bin/reboot-bootloader` on the phone (source `phone-reboot-bootloader.sh`, arg guard so
 `--help` does not fire it) and `./enter-fastboot.sh` on the host (calls it, waits for fastboot, `--check` to poll).
@@ -1710,7 +3455,7 @@ State to keep in mind:
 Also found while rebuilding: `mk-bootimg.sh`'s `__symbols__` step never worked (`dtc -I dtb -O dtb -@` cannot invent
 labels), so our DTB carried 0 symbols vs the vendor's 1 — recorded in `RULED-OUT.md`. Irrelevant on the legacy path.
 
-**New tooling for the human-in-the-loop problem:** `$PROJECT/cue.sh` + `make-cues.py` +
+**New tooling for the human-in-the-loop problem:** `/home/vipi/violet-mainline/cue.sh` + `make-cues.py` +
 `need-hands.sh` play a *distinct* sound per situation (ok / fail / fastboot / power / net / ask) instead of one
 generic chime; `need-hands.sh fastboot|power|net [sec]` cues, then polls for the transport and plays `ok` when it
 lands. Use it whenever a flash, boot or cable action is needed — the user does not see notifications.
@@ -3164,7 +4909,7 @@ ran). Diagnosing this needs UART on the board, or a byte-level diff of the two h
 Goal was to test whether a real ABL hand-off (rather than kexec) is what the touch controller needs.
 Built `boot-mainline.img` from the current kernel + DTB with `mk-bootimg.sh` and flashed it to `boot`
 twice (once with `__symbols__`, once without). **Both were refused by ABL**: the device drops straight
-back to fastboot (`18d1:d00d`, serial `<serial>`) and never exposes USB.
+back to fastboot (`18d1:d00d`, serial `cb0bdec5`) and never exposes USB.
 
 That re-confirms the 2026-10-13 result already recorded above: *"ABL accepts our kernel outright; our
 device tree is the sole blocker"*. Everything listed there was already matched (PE header/CONFIG_EFI,
@@ -3997,3 +5742,979 @@ PINCTRL_QCS615, INTERCONNECT_QCOM_QCS615, DRM_MSM, QCOM_IOMMU, PSTORE_RAM, PSTOR
 **Known next steps:** shenchao panel desc in `panel-novatek-nt36672a.c` (only `tianma,fhd-video` is
 matched today) + DSI wiring; eMMC supplies; USB; touch; then the pmOS packages; then the QEMU `virt`
 control boot; then flash and read the ramoops log.
+
+## 2026-11-02 13:00-13:35 IST — item 1 (reboot/shutdown hang) measured: NOT a service hang; suspend kills the USB gadget but does not by itself freeze the shutdown
+
+**Symptom being fixed:** `sudo reboot` shows plymouth for a few seconds, then the phone freezes; after ~1 min a 10 s power-button hold is the only way out (user's report, plan item 1).
+
+### What the frozen boot's own ramoops says (build #183, `logs/pstore-2026-11-02-13/dmesg-ramoops-0`)
+One panic, at 965 s uptime, 1295 lines, from a *clean* boot — full timeline (t in s):
+```
+642.47  PM: suspend entry (s2idle)          647.97  PM: suspend exit   (5.5 s, no button pressed)
+642.59  dwc3-qcom a600000.usb: port-1 HS-PHY not in L2
+647.99  dwc3-qcom a600000.usb: failed to enable ep0out        <- gadget broken by the resume
+647.51  novatek-nvt-ts 0-0001: Error reading from 0x00: -6
+650.3   wlan0 re-associated (WiFi survived, USB did not)
+903.83  q6afe/tasdev: amp 0 shutdown (session teardown)      909.5  amp 0 shutdown: 0
+922.76  rfkill: input handler enabled
+923.78  ipa: received modem offline event; remoteproc1: stopped remote processor modem
+944.80  rcu: INFO: rcu_preempt detected stalls — CPU1 not responding
+946-963 ath10k: failed to start hw scan / failed to transmit: -108 (the WLAN is only taken down here)
+954.80  After 10 seconds, these CPUs still haven't responded to the NMI: 1
+963.52  watchdog: BUG: soft lockup - CPU#2 stuck for 22s! [kworker/2:1]  (100% system, 1% hardirq)
+965.4   panic -> "SMP: stopping secondary CPUs" -> "SMP: failed to stop secondary CPUs 1" -> frozen
+```
+**Reading it.** No OpenRC service blocked. A CPU (1) stopped answering IPIs ~21 s before the stall was
+reported, i.e. at 923.8 s — the same 0.02 s as the modem stop. Everything after (RCU stall, the
+`kick_all_cpus_sync` softlockup in a BPF-free workqueue, the panic) is downstream of that one dead core.
+This is the same family as the 2026-10-24/25 stall analysis (`PROGRESS.md` 3600-3712), and note the
+`cleanup_irq` mask patch **is** in #183 with **zero** `cleanup_irq` lines on this boot — so that patch
+did not cover this instance.
+
+### Plan item 1 suspects, measured and killed (all on the live phone, no reboot)
+| suspect | measurement | verdict |
+|---|---|---|
+| `hexagonrpcd-adsp-sensorspd` stop hangs | `phone/hex-stop-measure.sh`: rc-service stop returned in **2 s**, rc=0, daemon gone, restart ok | **not it** (this boot; the daemon was blocked in `fastrpc_internal_invoke` at the time, and still left) |
+| modem stop / rmtfs ordering | `phone/modem-stop-wedge-test.sh`: `rc-service violet-modem stop` with ath10k live -> modem `offline` in 0.3 s, **90 s clean**, no rcu/lockup lines | **not it on its own** |
+| D-state in sync/umount | both clean reboots today unmounted all 4 filesystems (loop0p1, mmcblk0p86/p74/p71) | **not it** |
+
+### The user's suspend hypothesis: gadget half CONFIRMED, freeze half NOT sufficient
+Suspend/resume was suspected because the freeze boot had suspended and today's clean reboots had not.
+Reproduced deliberately (hook restored, `echo mem > /sys/power/state`, rtc wake +15 s):
+```
+299.30 PM: suspend entry (s2idle)   302.72 port-1 HS-PHY not in L2
+305.10 failed to enable ep0out      305.10 novatek-nvt-ts 0-0001: Error reading from 0x00: -6
+305.98 PM: suspend exit
+```
+After that resume `/sys/class/udc/a600000.usb/state` = **not attached** while configfs still lists
+`usb-signaller-developer/UDC = a600000.usb`: the elogind hook's `post` step rebinds the UDC and dwc3
+fails, so **USB is dead and the phone is reachable only over WiFi**. That is the hook bug the handoff
+predicted, now with a two-for-two repro (frozen boot + today).
+**But** a reboot issued from exactly that state completed: pstore ends `[628.53] reboot: Restarting
+system`, 4 filesystems unmounted, phone back in 50 s. So a broken gadget is a real bug, **not the cause
+of the shutdown freeze**. 3 of 3 reboots today were clean (19 s, 19 s, ~30 s).
+
+### Instrumentation that works, and one that does not
+- **Works:** 2 s `dmesg` harvester on ext4 with `sync` (`/var/log/shutdown-harvest.log`) — survived
+  every reset; laptop-side `dmesg -wT` stream; pstore console.
+- **Does NOT work: `rc_logger`.** OpenRC 0.63.2 ignores it: set `rc_logger="/var/log/rc.log"` in
+  `/etc/rc.conf`, restarted a service -> file still 0 bytes. So the handoff's `/var/log/rc.log` plan is
+  dead on this build.
+- **Does NOT work (so far): the inittab stage trace.** `phone/install-shutdown-trace.sh` rewrote
+  `::shutdown:/sbin/openrc shutdown >>/dev/kmsg 2>&1` (backup `/etc/inittab.bak-hermes`), yet the next
+  shutdown produced **0** `rcsh:` lines in both the harvester log and pstore, while the same shutdown did
+  unmount everything. Treat as unverified; the service-stop stage is still unmeasured.
+- **Hands-free recovery:** `qcom_wdt` at `/dev/watchdog0` — 30 s, `MAGICCLOSE` **not** supported,
+  `SETTIMEOUT` not supported, so once opened it can only be cleared by a reset. Arming it just before a
+  reboot (`host/reboot-test.sh`, `WATCHDOG=1`; `phone/reboot-from-here.sh`) means a frozen shutdown
+  self-resets instead of needing the 10 s power hold. Verified it arms and does not fire on 3 clean runs
+  (shutdown+soc reset ~15-20 s < 30 s).
+
+### Changes made to the phone today (revert list)
+1. `softlockup_panic` was set 1 -> 0 for the diagnostics, but it is a **boot-time default at 1** on this
+   kernel: after the 13:32 reboot it reads 1 again. So a future wedge will panic again (~22 s) and the
+   panic path hangs in `SMP: failed to stop secondary CPUs` -> power-button hold. Setting it to 0 per
+   boot is what buys an inspectable, non-panicking stall.
+2. Sleep hook **moved back** to `/etc/elogind/system-sleep/no-hexagonrpcd-on-suspend.sh` (was in
+   `/root/sleep-hook-off/`). It is now known to break the gadget on resume -> USB dead until reboot.
+3. `/etc/inittab` shutdown line carries the `>>/dev/kmsg` trace; revert with
+   `phone/install-shutdown-trace.sh --revert`.
+4. `sleep-inactive-{battery,ac}-type` are still `'nothing'`: `gsettings set` over ssh silently no-ops
+   (needs the phoc session bus), so idle suspend stays off and USB stays up — left as found.
+
+### Open
+- The freeze did not reproduce in 3 reboots today; 2 of the 3 plan suspects are dead and the third
+  (suspend) is only half-right. Next measurement must name the OpenRC stage: the `/dev/kmsg` trace needs
+  a working form (or per-service markers) before the next freeze is worth chasing.
+- The wake source of the 5.5 s resume in the frozen boot is still unknown (`pm_wakeup_irq`,
+  `wakeup_sources` were not captured before the panic).
+
+## 2026-11-02 13:45-14:35 IST — suspend/resume root-caused (two separate bugs); shutdown freeze reproduced, stage now known
+
+New cable, both devices moved to <lan>.x (laptop .11, phone .7); USB gadget is `enp0s20f0u4`.
+
+### Bug A — ADSP firmware crashes on resume if `hexagonrpcd` is alive during sleep
+Confirmed by driving it the wrong way on purpose: suspended via `/sys/power/state` (which does **not** run
+the elogind hook), so hexagonrpcd stayed up. On resume:
+```
+[1731.20] remoteproc remoteproc0: recovering adsp
+           remoteproc0 state = crashed
+[2448.30] remoteproc remoteproc0: can't lock rproc adsp: -4
+[2448.30] remoteproc remoteproc0: Boot failed: -4
+```
+It cannot be restarted from userspace (`echo start > state` fails with -EINVAL/-EINTR); the boot is left
+without sensors and without audio until a reboot. The elogind hook (variant C below) prevents it on the
+paths that matter (Phosh idle / power button / `loginctl suspend`).
+
+### Bug B — dwc3 cannot re-enable its control endpoint on resume, so USB never comes back
+Every s2idle resume (with or without the hook unbinding the UDC) logs
+```
+dwc3-qcom a600000.usb: port-1 HS-PHY not in L2      (diagnostic only, suspend proceeds)
+dwc3-qcom a600000.usb: failed to enable ep0out      (on resume)
+```
+and `/sys/class/udc/a600000.usb/state` stays **not attached** while configfs still lists the gadget:
+USB is dead for the rest of the boot, WiFi keeps working. Measured recoveries:
+| action | result |
+|---|---|
+| write the UDC name into the gadget's `UDC` file again (configfs rebind) | **no effect**, no kernel messages at all |
+| `echo a600000.usb > /sys/bus/platform/drivers/dwc3-qcom/unbind` then `bind` | **USB back in ~4 s**, `state=configured`, host re-enumerates, ssh works — no reboot |
+So `patches/0036` does the driver-level rebind after resume. It is a workaround for a dwc3-qcom resume
+bug (the controller is not re-initialised, ep0 stays unconfigured), **not** a fix.
+
+### What is installed (patches/0036)
+- `/etc/elogind/system-sleep/no-hexagonrpcd-on-suspend.sh` (variant C): stops hexagonrpcd, unbinds the UDC
+  **only when nothing is attached** (dwc3_gadget_suspend has nothing to soft-disconnect then and returns
+  -EAGAIN, which aborts the whole suspend — that is what the original hook was for), and after resume does
+  the dwc3-qcom rebind if the UDC did not come back on its own. Verified via `loginctl suspend`:
+  logbookd `e-suspend: Operation 'suspend' finished`, then `sleep-hook(post): after driver rebind:
+  state=configured`, USB usable.
+- new service `violet-udc-repair` (default runlevel): same repair for resumes that bypass elogind, plus an
+  ADSP check that logs `ADSP WEDGED - sensors/audio need a reboot` when it cannot be recovered.
+  It refuses to act when `/run/openrc/softlevel` is `shutdown` (see suspect below).
+- `gsettings set ... sleep-inactive-{battery,ac}-type suspend` **needs phosh's session bus**, not the ssh
+  environment: read it from `/proc/<phosh>/environ` (`unix:path=/tmp/dbus-XXXX`). Without it, `set`
+  silently no-ops and `get` still prints the old value — that is why the handoff's keys kept reading
+  `'nothing'`.
+
+### Shutdown freeze (item 1): second occurrence, and the stage is now known
+A plain `sync; reboot` over WiFi at 14:15 froze: no USB, no WiFi for ~4 min. The 2 s harvester on ext4
+survived and shows the shutdown reaching the **end** of OpenRC's work:
+```
+[622.9] Stopped ZRAM swap device /dev/zram0  [ ok ]
+[623.3] EXT4-fs (loop0p1): unmounting ...   (all four filesystems)
+        <- log ends here; no "reboot: Restarting system"
+```
+So the hang is in the **final kernel reboot path**, not a blocked service and not a mount/umount stall —
+the opposite end from the 11:19 panic dump (which wedged before unmounting, with CPU1 dead and
+`SMP: failed to stop secondary CPUs 1`). Both are the "a CPU stops answering IPIs" family.
+**Suspect introduced by this session, to rule out first:** `violet-udc-repair` unbinds dwc3-qcom when the
+gadget is stopped at shutdown (configured -> not attached), i.e. it could race the kernel shutdown. The
+`softlevel=shutdown` guard is in the script now, and the next A/B test is: 2 reboots with the service
+stopped vs 2 with it running.
+Console-ramoops of that freeze was overwritten by the power-button reset, so the harvest log is the only
+evidence that survived — the harvester is worth keeping on by default.
+
+## 2026-11-02 14:45 IST — prior art checked for the two suspend bugs (the standing "search first" rule)
+
+**ADSP crash on resume — confirmed prior art, our hook matches pmaports.**
+pmaports MR 5400, `google-sargo: stop HexagonRPCD on suspend` (Richard Acayan, 2024-07-30) — commit
+`fe00027849`, message verbatim: *"There is a bug in FastRPC when waking from suspend. Since HexagonRPCD is
+currently only useful for a few moments when the ADSP is requesting the sensor registry, it can just be
+stopped without affecting sensor support. Add a pre-suspend hook to stop HexagonRPCD so it doesn't crash
+the ADSP when the device wakes up."* That is exactly bug A and exactly what our variant-C hook does, so it
+is not a violet-specific mystery: it is a known FastRPC/ADSP defect, worked around in userspace upstream
+too. Nothing in mainline `hexagonrpc` fixes it (issues tracked at github.com/linux-msm/hexagonrpc).
+
+**dwc3 `failed to enable ep0out` on resume — the two upstream fixes that match this area are ALREADY in
+our tree, so neither is the missing piece.**
+- `usb: dwc3: gadget: Fix controller timeout at dwc3_gadget_suspend()` (Roger Quadros, 2023): split
+  suspend into `dwc3_gadget_soft_disconnect()` and a `soft_connect()` that issues the core soft reset
+  before re-enabling run/stop. **Present** in `drivers/usb/dwc3/gadget.c` (our `dwc3_gadget_suspend()`
+  and `dwc3_gadget_soft_connect()` are that shape).
+- `usb: dwc3: gadget: Bail out in pullup if soft reset timeout happens` (Krishna Kurapati / Thinh Nguyen,
+  2023): if `dwc3_core_soft_reset()` returns -ETIMEDOUT, do not go on to set up event buffers and start
+  the gadget. **Present**: our `dwc3_gadget_soft_connect()` does `ret = dwc3_core_soft_reset(dwc); if (ret)
+  return ret;`.
+- `usb: dwc3: qcom: re-enable wakeup interrupts on failed resume` (Qualcomm, 2026-09): about
+  `clk_bulk_prepare_enable()` failing partway in `dwc3_qcom_resume()`. Not our case — our clocks and the
+  interconnect come back (the only abort-path symptom we see is `port-1 HS-PHY not in L2`, which is a
+  diagnostic, not an error return).
+**Therefore:** the soft reset is *succeeding* in our case; the failing step is the EP0 **command**
+(`__dwc3_gadget_ep_enable(ep0out, DWC3_DEPCFG_ACTION_INIT)` → `dwc3_gadget_ep_cmd()` times out →
+`"failed to enable ep0out"` in gadget.c:3011). Upstream has no patch for that, and it is not purely
+suspend-specific either: the same message appears at **boot** on earlier builds in
+`logs/archive/misc/mainline-run14.txt` (t=1.29 s) and `logs/archive/kexec/kexec-tlmm2-console.txt`
+(t=1.33 s). So it is an intermittent EP-command timeout of this controller, which a suspend/resume cycle
+makes much more likely — not a suspend-sequencing bug we can fix by reordering the glue driver.
+
+**Consequence for the plan:** the userspace repair (driver-level re-probe of `dwc3-qcom`, ~4 s, verified)
+is presently the honest remedy, and it is what a kernel-level fix would do anyway (re-init the core after a
+failed gadget start). The kernel experiment worth one build (NOT written as a patch yet, and not obviously right — see below):
+in `dwc3_gadget_soft_connect()`, `__dwc3_gadget_start()`'s return value is **ignored** (`gadget.c:2817`),
+so after a failed ep0out enable the code still calls `dwc3_gadget_run_stop(dwc, true)`. At minimum that
+return should be checked and the gadget left disconnected (same philosophy as the 2023 "bail out if soft
+reset timeout" patch). A retry after `dwc3_core_init(dwc)` is the stronger version, but note the resume path
+already runs `dwc3_core_init_for_resume()` (core.c:2557/2595) *before* `dwc3_gadget_resume()`, so the core is
+already re-initialised when the EP command times out — which makes "just re-init again" less likely to be
+the real fix and more likely to be the same 4 s workaround expressed in C. Measure before building.
+
+## 2026-11-02 15:00-15:25 IST — plan item 4 VERIFIED (suspend/resume), plus a real audio-inhibit bug found and fixed
+
+Full cycle, `host/suspend-resume-test.sh --loginctl` (elogind path = the one the power button and
+idle-suspend use), artefact `logs/suspend-loginctl-2026-11-02_15:01:32`:
+```
+301.01 sleep-hook(pre): udc state=configured
+301.01 PM: suspend entry (s2idle)
+303.06 dwc3-qcom a600000.usb: failed to enable ep0out      <- kernel bug, unchanged
+303.94 PM: suspend exit
+303.95 udc-repair: state configured -> not attached, re-binding a600000.usb (attempt 1)
+311.08 sleep-hook(post): after attempt 1: state=configured
+```
+Result: USB shell OK, UDC configured, **ADSP running**, wlan <lan-ip>, `wake_irq=19`
+= `pm8941_pwrkey`. That answers the open question in the plan ("the wake source is unknown"): with a
+short press the power key is the wake source. A 10 s hold instead resets the SoC (uptime restarts) — that
+is what happened during the first attempt, so the wake-source datum was lost once.
+
+Audio after resume: sink `violet_speaker` (PulseAudio `module-alsa-sink hw:0,2`) stays loaded, `paplay`
+returns 0 before and after a cycle. Not audible-verified by a human.
+
+**New bug, found by testing the plan's own criterion "with music playing it must not suspend": it did.**
+A 190 s stream with `sleep-inactive-*=suspend`/60 s suspended ~65 s in (RTC alarm woke it, so the phone was
+not stranded). Cause: pmOS ships a `sleep_inhibitor` plugin for exactly this (`is-alsa-playing`:
+`grep -qF 'state: RUNNING' /proc/asound/card*/pcm*/sub*/status && exit 254`) but
+`/etc/sleep-inhibitor.conf` enables only `ssh-session-open` and `apk-running`. Enabled it (patches/0037).
+Verified: while playing, `elogind-inhibit --list` shows
+`sleep-inhibitor ... sleep ... Plugin ALSA playing  block`, and a repeat 150 s run at a 60 s idle timeout
+produced **zero** suspend entries (PASSED).
+
+Two harness bugs found and fixed while doing this (both had produced meaningless verdicts):
+- `gsettings` and `paplay` **must run as the login user**: as root, dconf refuses the write
+  (`failed to commit changes to dconf: The connection is closed`) and paplay cannot reach the session's
+  PulseAudio, so the first version of the audio test armed nothing and played nothing while reporting
+  "no suspend".
+- the test's "reachable" used to mean "the interface exists"; after a resume the gadget re-enumerates with
+  no IPv4 for a second or two, which yielded empty post-captures. It now requires a real ssh round trip.
+
+## 2026-11-02 15:25 IST — item 1: the repair-service race is ruled out; reboot #5 clean
+
+The inittab -> /dev/kmsg trace worked on this shutdown (earlier attempts produced nothing, reason still
+unknown), so OpenRC's stop order is now visible in the kernel log:
+```
+15:25:25  * Stopping user.user ...
+15:25:25  * Stopping local ...
+15:25:25  * Stopping violet-udc-repair ...
+15:25:26  [ ok ]
+15:25:27  ipa 1e40000.ipa: received modem stopping event
+          (connection reset; phone back on USB, uptime 166)
+```
+`violet-udc-repair` is stopped **before** the modem/gadget teardown, so the unbind/bind it performs after a
+resume cannot race the shutdown. The `softlevel=shutdown` guard stays as belt-and-braces. Reboot was clean.
+
+Running tally for item 1 today: clean at 13:13, 13:22, 13:32 and 15:25; frozen at the 11:19 boot and on the
+14:15 `sync; reboot`. The two freezes differ in stage (11:19: CPU1 died before unmounting, panic -> hang at
+`SMP: failed to stop secondary CPUs 1`; 14:15: all four filesystems unmounted, then nothing). **New lead:** the
+14:15 freeze happened on a boot where the ADSP had crashed and been recovered earlier in the session (the
+`/sys/power/state` suspends at 1722/1852 left `remoteproc0: crashed`, `can't lock rproc adsp: -4`). Worth
+testing whether a recovered ADSP/modem leaves shutdown wedge-prone - i.e. reproduce by crashing the ADSP,
+recovering, then rebooting, which is cheap and does not need a frozen phone to prove.
+
+## 2026-11-02 15:45 IST — plan item 3 (recording quiet) fixed; fix-quality audit of every change
+
+**Item 3, root cause: capture gain, confirmed by measurement.** Sound Recorder writes FLAC stereo 44.1 kHz to
+`~/.local/share/org.gnome.SoundRecorder/Recording N` (not `~/Music`, which is why the first searches missed the
+files). Decoding the user's own takes and measuring frame RMS (100 ms frames, 0.4 s trimmed at both ends, mean of
+the top 20 % of frames) at `ADC1=20`, `TX_DEC0=88`:
+
+| source | speech level | peak |
+|---|---|---|
+| `Recording 1`, ~30 cm | -28.2 dBFS | -5.8 dBFS |
+| `Recording 2`, close | -26.9 dBFS | -6.0 dBFS |
+| `dandelions-10s.wav` (music) | -13.8 dBFS | -5.1 dBFS |
+
+So speech sat ~14 dB under song level - exactly the complaint, and the peak was not the problem (crest ~21 dB,
+i.e. transients, not loud speech). `ADC1 Volume` is already at its hardware maximum (range 0..20), so the only
+knob is `TX_DEC0 Volume` (range 0..124, 1 dB/step, 36 dB of headroom). 88 -> **100** is +12 dB and is the value
+alsa-ucm-conf itself uses for the TX-macro path (`+ cset "name='TX_DEC0 Volume' 100"`, codecs/lpass dmics commit
+2cc0c7d4). Measured after the change: speech -14.7 dBFS, peak -6.0 dBFS, **0 clipped samples**.
+The user confirmed playback at both 30 cm and 5 cm and closed the item.
+
+**Persisted** in `phone/violet-audio-setup` (with the measurements in the comment so nobody "optimises" it back to
+88) and installed to `/usr/local/bin/violet-audio-setup` on the phone. The right long-term shape is a UCM
+`HiFi.conf` shipping this value instead of a shell script - recorded in the audit below.
+
+**Fix-quality audit, per the user's question ("are these fixes or hacks?").** The criterion used: a *fix* makes the
+wrong state impossible (right value / ordering / ownership) and survives an upgrade; a *hack* repairs the state
+after the failure or avoids the failing path, and will fight any upstream fix. Result: 11 real fixes, 3 items with
+the right value in the wrong packaging, 6 sanctioned workarounds, 7 hacks, 1 component that must not be trusted yet
+(`violet-vbat.c`, inverted sign convention), 5 problems with no fix at all (reboot freeze, hardlockup/NMI, APSS
+watchdog, camera, NewPipe live 403). The full table is in `docs/STATUS.md` under "Fix-quality audit (2026-11-02)".
+
+**Named explicitly as hacks, so a future session does not mistake them for kernel work:** the
+`violet-udc-repair` dwc3 unbind/rebind after resume, the ADSP protection in the elogind hook (bypass it and the
+ADSP is dead until reboot), `&aggre1_noc { /delete-property/ clocks; }`, the novatek 30 s polling loop, the panel
+init as a vendor blob in a separate driver, the dsi_phy magic values (LDO 0x1c, ICP 0x3f, HS_TIMER 0x3fd08) and
+patch 0016's unminimised experiment knobs.
+
+**Harness bugs found today, both of which had already produced a false result** (recorded so they are not repeated):
+1. `gsettings` and `paplay` must run as the **login user**. As root, dconf answers `failed to commit changes to
+   dconf: The connection is closed` and paplay cannot reach the session's PulseAudio - the first version of the
+   audio test therefore armed no timer and played nothing while printing "no suspend".
+2. **busybox `find` on violet silently ignores `-newermt`** - every mtime-filtered search returned nothing, which
+   made "no file was recorded" look true. List with `ls`/`find` + `-exec ls -l` instead.
+Also: `grim` and `wtype` on this device are **0-byte binaries**, so no screenshots over ssh.
+
+## 2026-11-03 (evening) — IMX586 SMIA test: the sensor streams without the 0x3000 init table
+
+Loaded the proposed driver (`patches/proposed/imx586.c` + a `smia_test` block in probe, lane check relaxed to 2 or 4
+because the booted DTB still has 2 lanes) on build 7.2.10-sm6150, dtbo erased. Output from the phone:
+```
+IMX586 detected (id 0586)
+SMIA pre: fcnt(0005)=ff lanes(0114)=02 extclk(0136/7)=0c00 mode(0100)=00
+SMIA stream-on(0100=01) w=0: fcnt +100ms=06 +200ms=0d mode=01
+```
+- Frame counter 0x0005 was 0xff (never streamed), then incremented ~7 per 100 ms after writing only `0x0100=0x01`
+  (SMIA mode-select; note the stream-ON value is 0x01, the task text's `0x00` is stream-off). **The sensor generates
+  frames on the SMIA map with no init table at all.** The 0x3000-block RPi table is not needed to stream and is
+  likely wrong for this part (it writes 0x3000=0x00 and never touches 0x0100).
+- EXTCLK divisor 0x0136/7 = 0x0c00 = 12.0 MHz (8.8 fixed point), but our MCLK is 24 MHz: the sensor's PLL is
+  computed for the wrong input clock, so link rate/pixel clock would be 2x what CAMSS expects. Must write 0x1800.
+- 0x0114 (lane mode) = 0x02 at power-on; Sony SMIA usually 0x01=2 lane, 0x03=4 lane — meaning of 0x02 unverified.
+- Not yet done: whether CSI IRQs move with 0x0100=1 and a sane PLL/lane setup. Next: stop writing the 0x3000 table,
+  set 0x0136/7=0x1800, lane mode, a known SMIA mode (PLL regs 0x0301-0x030f, 0x0342/0x0340 timing, 0x034c-0x034f
+  size), 0x0100=1, then check csiphy/csid/vfe IRQs.
+The in-tree (2-lane experiment) driver was saved as `patches/proposed/imx586.c.intree-2lane-experiment.bak`.
+
+## 2026-11-03 (late) — IMX586 rewritten to the SMIA map: sensor streams, still no CSI frame
+
+Power-on SMIA defaults read from the sensor: RAW10 (0x0112=0a0a), 8000x6000 full-res output (0x034c=1f40, 0x034e=1770),
+line length 0x24e0, frame length 0x17b0, EXTCLK 12 MHz, VT PLL pre=2 mpy=0x168, OP PLL pre=2 mpy=0x18c, binning 0x0901=0x11.
+`patches/proposed/imx586.c` (module params `smia=1`, `smia_lanes`=raw 0x0114 value, `smia_test`) now writes ONLY SMIA
+registers: EXTCLK 0x1800, pre-PLL dividers doubled (4) to keep the 12 MHz rates, OP mpy 0x129 (aiming at 891 MHz
+link, unverified), 2x2 binning, 4000x3000 output, frame length 0x17b0, then 0x0100=1. The 0x3000 table is no longer
+written (still in the file, used when smia=0).
+Result: sensor streams (frame counter 0x04 after 120 ms) with lane mode 0x01 and 0x03; capture on
+csiphy1->csid0->vfe0_rdi0->video0 (SBGGR10 4000x3000, pBAA) still yields 0 bytes, csiphy1 IRQ stays 0; csid0/vfe0 IRQs
+tick 1-2 per start (reset-done style, not data). Booted DTB wires the sensor to **csiphy1** with **2 lanes**.
+Note: `rmmod imx586` warns (imx586_power_on from cleanup_module, "fail to enable inclk") - remove path resumes the device.
+`v4l-utils` installed on the phone via apk (media-ctl, v4l2-ctl). Trial script: scratchpad trial.sh (reload both modules,
+link, set formats, capture 6 s, print IRQs).
+Next: read CSID/CSIPHY status regs while streaming (lane-detect/ECC/CRC errors), verify the OP PLL actual link rate
+(settle count: vendor 0x11 vs ours 0x0e implies the vendor link rate differs), try the vendor lane map.
+
+## 2026-11-03 (night) — CSIPHY1/CSID0 register dump while streaming (SMIA init)
+
+`phone/csi-regdump.py` (python3 + /dev/mem works on the phone; CSIPHY1 = 0xac66000, CSID0 = 0xacb3000) run 4 s into a
+capture of the SMIA 4000x3000 stream (sensor streaming, 0 bytes captured):
+- All four data-lane blocks (0x000/0x200/0x400/0x600) AND the clock lane (0x700) are programmed even though the DTB
+  endpoint has 2 lanes; lane settle reg 0x008 = **0x11** (vendor `phydump.txt` shows **0x0e** - the earlier note had
+  these reversed). Everything else in the lane blocks matches the vendor dump (0xd7/0x08/0x50/0x0a/0xb8/0xaa/0x55/0x3f).
+- Common block: ours 0x814=0x85 0x818=0x01 0x81c=0x02 0x8b8=0x80 0x8d8=0x04 0x8dc=0x85; vendor 0x814=0xd5, 0x818=0x01,
+  0x81c=0, and non-zero 0x830-0x85c (0xff/fb/7f/ef - looks like status/lane-detect bits that ours never sets). Vendor
+  dump was taken in an error path, so those may be status snapshots, but 0x814 (lane/clock enable) differs.
+- CSID0: 0x100=00100101 0x104=41 0x114=10081188 0x118=124813c8 0x300=802bf007; no error bits visible.
+Open: which bits of 0x814 select lanes (kernel writes CTRL5 clk-enable | lane mask), and whether the sensor really
+drives clock-lane HS (settle 0x11 implies a faster link than 0x0e; vendor link rate is probably lower than 891 MHz).
+Next: try OP mpy for a lower link (e.g. 0x0e settle), set DT lanes to match sensor, rerun the dump.
+
+## 2026-11-03 (night) — E1: sensor on csiphy0, 4 lanes, SMIA init (boot-mainline-cam-csiphy0.img)
+
+DTB: `&camss` port@0 (csiphy0) `data-lanes=<0 1 2 3>`, sensor endpoint `<1 2 3 4>` (both dtsi copies: dt/ and the kernel tree).
+Flashed `boot` only (fastboot entered with the raw reboot syscall: `/usr/local/bin/reboot-bootloader` no longer exists
+after the userdata rebuild, so `enter-fastboot.sh` fails). Booted 7.2.10-sm6150, dtbo untouched. Rollback image:
+`boot-mainline-cam.img`. NB: `mk-bootimg.sh` still emits an image when the DTB build FAILED (it reuses the stale DTB) -
+always check the `make` output / `fdtget` first.
+Result (module smia_lanes=3, capture 4000x3000 pBAA via csiphy0->csid0->vfe0_rdi0): sensor streams (fcnt=04), but still
+0 bytes. CSIPHY0 now matches the vendor dump exactly: 0x814=0xd5, status bank 8b0=04 8b8=80 8c4=10 8d0=02 8d8=04
+8dc=d5, lane settle 0x008=0x11 (vendor 0x0e). csiphy0 IRQ 0, csid0 IRQ 1, vfe0 IRQ 2.
+Conclusion: the wiring (csiphy0, 4 lanes) is now consistent with the vendor. The receiver config equals the vendor's
+except settle. Remaining suspects: sensor MIPI output (PLL/timing 0x0310, 0x0808-0x0813, 0x0820-0x0823) and the 2x
+link-frequency (settle 0x11 vs 0x0e). Next (E2): mine the HAL memdump for the vendor's MIPI/PLL registers, set
+LINK_FREQ to the real value.
+
+## 2026-11-03 (night) — memdump/asset mining for the vendor MIPI/PLL registers: nothing usable found
+
+Searched `~/violet-ios/cam/`:
+- `ofilm_imx586_sensormodule.bin` (and the semco/sunny copies) is only the Chromatix *schema* (588 slaveAddr/registerData/delayUs
+  descriptors, 72 B each, whole file = descriptors, no values). It contains no register values.
+- `memdump/r*.bin` (251 regions): the only SMIA-looking hits are address lookup tables (`0x136,0x136,0x137,0x137,...`
+  and `0x340,0x340,0x341,...` at r99/r127 offsets 0x5199c / 0x529ec) - pairs of addresses, no data.
+- Byte-pattern searches for the EXTCLK write (reg 0x0136 = 0x18, 0x00) in LE/BE, 3/4/8-byte records over the memdump,
+  camera.qcom.so, sensor_imx586.so, tuned_/semco_ bins: no hits. The vendor's tables are not stored in a form we can
+  find by value; they are compiled into the HAL or built at runtime.
+Not tried: disassembling camera.qcom.so / sensor_imx586.so (REA) for the register arrays, or capturing the CCI writes
+live on the vendor kernel.
+
+## 2026-11-03 (night) — FIRST IMX586 FRAME: vendor register tables recovered and applied
+
+**Capture works.** `/dev/video0` returned a 15,024,000-byte frame (4000x3000 RAW10, pBAA, stride 5008); decoded it is a real image
+(creased white fabric; raw range 62-88, black level ~64) - `docs/imx586-first-frame.png` (crude demosaic, no black-level/WB).
+What fixed it: the sensor was not given the vendor's register set. Recovered from the Ofilm `*_sensormodule.bin`
+(Chromatix binary; 8-byte-field records: a 10-qword record per register `[id,0,id+1,ADDR,1,id+2,2,1,0,1]`, and the data
+array after each block as `[value,0]` pairs at `block_end+1`): an init block (103 regs, starts 0x0136=0x18) and five mode
+blocks (93 regs each: 8000x6000, 4000x3000, 4000x2250, 2000x1500, 1920x1080). Tables: `patches/proposed/imx586-vendor-tables.h`
+(init + 4000x3000). Vendor values: 0x0114=3 (4 lanes), EXTCLK 0x1800, 4000x3000 PLL 0x301=5 0x303=4 0x305=4 0x306/7=0x0158
+0x30b=1 0x30d=0x0c 0x30e/f=0x023e 0x310=1, LL 0x2310 FL 0x0bf8, bin 0x0901=0x22 - the 0x3xxx/0x4xxx/0x9xxx tuning blocks
+were the missing part (our guessed PLL used 0x30d=4/0x30e=0x129). Driver: `smia=1` writes init then mode, then 0x0100=1;
+LINK_FREQ constant changed to 574 MHz (DT still says 891 MHz; the driver accepts either until the DTB is reflashed).
+Setup that produced it: csiphy0, 4 lanes, `smia_lanes=3`, csiphy0 -> csid0 -> vfe0_rdi0 -> video0, SBGGR10 4000x3000.
+LESSON (cost two invalid runs): **wireplumber opens /dev/video* and /dev/media0**, so `rmmod qcom_camss imx586` silently fails
+("in use") and `insmod` then fails with "File exists" - the test runs the OLD module. Stop wireplumber (kill, then relaunch
+as `user` with `/var/tmp/wp.env`) before reloading, and check `insmod` output. The earlier "vendor table" run before this was
+therefore invalid, and the E1 result stands (only the first load after boot used the new .ko).
+Also: no `pkill -f` over ssh (it matches its own command line).
+Open: DT link-frequency 574 MHz + reflash; modes other than 4000x3000; exposure/gain/black level; M3 libcamera/app.
+
+## 2026-11-03 (night) — IMX586 capture from a clean boot (boot-mainline-cam-final.img)
+
+DT `link-frequencies` = 574 MHz (both dtsi copies), driver strict on 574 MHz, `smia_lanes` default 3. `imx586.ko` installed at
+`/lib/modules/7.2.10-sm6150/extra/imx586.ko` (+ depmod): it autoloads at boot and prints `IMX586 detected (id 0586)`. Flashed
+`boot` only (fastboot entered via the raw reboot syscall); rollback `boot-mainline-cam.img` / `boot-mainline-186-rollback.img`.
+Without touching any module, `/var/tmp/cap.sh` (link csiphy0->csid0->vfe0_rdi0, SBGGR10 4000x3000, exposure=3000) returned a
+15,024,000-byte frame; rendered with black level 64 + gray-world WB it is a clear picture (`docs/imx586-first-frame.png`: plastic
+over weave, sharp). Raw range 63-103 -> badly underexposed (signal ~12/1023 over black): exposure/gain control path not yet checked
+(frame length 0x0bf8 vs ctrl writes lpfr=3070; verify 0x0202/0x0204 actually apply). Not done: other modes, AE, libcamera/app (M3),
+flat-field/colour. Capture helper on the phone: `/var/tmp/cap.sh [exposure] [gain]`; unpacking/render snippet is in this session's notes.
+
+## 2026-11-03 (night) — exposure/gain verified; libcamera streams the IMX586
+
+- Exposure and analogue gain apply: mean raw level (black 64) with exposure,gain = 200,0: 64.2; 1500,0: 65.3; 3000,0: 66.6;
+  3000,600: 70.2; 3000,900: 85.0; vblank 12000 with exposure 12000: 74.2 (88.7 at gain 600). The earlier dark frame was a dim
+  scene plus the short default exposure, not a broken control. A longer frame (V4L2 vertical_blanking) is needed for exposures
+  past ~3000 lines.
+- libcamera 0.7.2 (`simple` pipeline handler + software ISP with GPU debayer on FD612) is already installed; `libcamera-tools`
+  added with apk. `cam -l` lists `imx586`; `cam -c1 --capture=5` streams 4000x3000 at ~6.1 fps (bytesused 48,384,000 = BGRX 4032-px
+  stride), AE range exposure 8-14978, gain 0-978. `docs/imx586-libcamera-frame.png` is a real scene (red/blue swapped in my
+  render only: BGRX read as RGB). Warnings to fix for a polished stack: the driver lacks the selection rectangles
+  (V4L2_SEL_TGT_CROP/_DEFAULT/_BOUNDS), V4L2_CID_CAMERA_ORIENTATION/LOCATION, a libcamera `imx586` sensor-properties/helper
+  entry (soft IPA: "Failed to create camera sensor helper for imx586", so AE/gain are uncalibrated - the image is dim).
+- Next (M3): add the selection/orientation controls to the driver, a CameraSensorHelper + properties for imx586 in libcamera (or a
+  local override), then try GNOME `snapshot` (installed). wireplumber must be left running; do not rmmod the camera modules
+  while it holds them.
+
+## 2026-11-03 (night) — M3: live preview verified in the real camera app (GNOME snapshot)
+
+Driver got selection rectangles (8000x6000) and the fwnode orientation/rotation controls; DT `orientation = <1>`, rotation. Flashed
+`boot-mainline-cam-m3.img` (rotation 90): libcamera lists "Internal back camera", the kernel-side warnings are gone.
+Launched `snapshot` 51.0 in the user session (needs the session bus address from `phosh`'s environ in /var/tmp/wp.env, `setsid`,
+and an unlocked phone - lock screen password is the user's) and captured the phone screen over VNC: a sharp live preview of the
+laptop on the desk, **but rotated 180 degrees** -> DT `rotation = <270>` (`boot-mainline-cam-m3b.img`). Colour is bluish
+(uncalibrated, no sensor helper / CCM / WB in libcamera's soft ISP). VNC capture: tunnel script in the scratchpad; the tunnel binds
+[::1]:5901 only, so use `vncdo -s localhost::5901`.
+
+## 2026-11-03 (night) — vendor colour data applied: libcamera `imx586.yaml`; "no cameras found" incident
+
+Colour: `tuned_ofilm_imx586.bin` (vendor Chromatix) holds the cc13 colour-correction table as 18-float records (9-float 3x3 CCM, then a
+CCT trigger range). Extracted 5 CCMs (1-2450 K, 2800-3000, 3600-4200, 4700-5300, 5800-10000 K; first AEC set) into
+`phone/imx586.yaml` (+ BlackLevel 4096), installed as `/usr/share/libcamera/ipa/simple/imx586.yaml`. Result via `cam`: natural colours
+(yellow bananas, green bottle, orange lid) - `docs/imx586-libcamera-tuned.png`; the earlier blue cast is gone. Not used yet: gamma
+(`mod_gamma15`), lens shading (`lsc34`), black level (bls12 - 4096 assumed from the measured 64/1023), per-unit EEPROM calibration (0x50/0x51).
+Incident: GNOME Camera said "no cameras found" because my manual `kill` + relaunch of wireplumber (to make PipeWire re-read the tuning)
+left **no wireplumber running**; relaunching with a hand-built environment also died within seconds - it must be started with PipeWire's own environment (see `phone/` `wp.sh` approach: copy XDG_*/DBUS_SESSION_BUS_ADDRESS from /proc/$(pgrep pipewire)/environ, `setsid`). PipeWire's libcamera monitor lives in wireplumber, so no
+camera node existed. Fix: `setsid` + `< /dev/null` (`/var/tmp/wp.sh`); node `imx586 [libcamera]` is back. A reboot also restores it
+(autostart). Rule: after touching wireplumber, check `wpctl status` shows the camera before telling the user to try the app.
+
+## 2026-11-03 (night) — "blue" colour: the binned mode's CFA is RGGB, not BGGR
+
+User reported the app preview was blue and that a lid that is red in real life appeared blue. A direct RAW10 capture (v4l2, no libcamera)
+rendered with both Bayer orders settled it: read as RGGB the red/orange lids, orange snack and red-brown cloth are right; read as
+BGGR they are blue. The vendor 4000x3000 binned mode therefore outputs **RGGB**; the driver had declared SBGGR10. Fix: `mode.code =
+MEDIA_BUS_FMT_SRGGB10_1X10` (`patches/proposed/imx586.c`); module reinstalled and swapped live (wireplumber stopped, `rmmod qcom_camss
+imx586`, `modprobe`, wireplumber restarted from PipeWire's environment - `/var/tmp/swap.sh`). Capture/render helpers must now use
+`pRAA` / RGGB; libcamera's `cam` and the app need no changes. Earlier "natural colour" judgement of the `cam` frame was made after an
+RGB/BGR flip of my own and was wrong; the app screenshot + red lid is the ground truth. Not yet re-verified in the app after the fix
+(phone was in use). Also: `cam` cannot open the camera while the app/wireplumber stream is active (it hangs until timeout) - close the app first.
+
+## 2026-11-03 (night) — colour verified in GNOME Camera; why "No Camera Found" kept happening
+
+- **Colour fixed and verified in the app** (UI over VNC, user's lid/jar): with the driver advertising SRGGB10 the preview shows the orange jar lid,
+  the red-brown tablecloth and the steel flask correctly; neutral surfaces neutral. (`libcamera` Ccm tuning + RGGB fix.) Still open: the image looks
+  hazy/low-contrast (no gamma/contrast curve yet), it opens dark and takes seconds to brighten (the soft IPA's AGC starts from a minimum exposure and
+  there is no libcamera sensor helper for imx586), no autofocus (VCM at 0x0c on CCI1 not driven).
+- **Root cause of the disappearing camera node:** elogind (`10-violet.conf`: `KillUserProcesses=yes`) sends SIGTERM to every process of an ssh
+  session when it ends, including `setsid`/`nohup` ones. Found with `strace -e signal=all` on wireplumber (`SIGTERM si_pid=<elogind> si_uid=0`).
+  The libcamera monitor lives inside wireplumber, so each ssh-launched wireplumber died within seconds-to-a-minute and the app showed
+  "No Camera Found" / closed. Fix: start wireplumber via the session D-Bus (service file `org.violet.WirePlumber.service`), which puts it in the
+  graphical session's cgroup `/c1`. A reboot restores the stock autostart. (Memory note: reference-violet-ssh-processes-die.)
+- Working over WiFi: ssh user@<lan-ip> (USB-NCM interface name/addresses keep changing).
+
+## 2026-11-03 (night) — dark start fixed; gamma/contrast cannot come from the tuning file
+
+- Dark start: the soft IPA starts from the sensor's current exposure/gain, so the driver defaults matter. `IMX586_EXPOSURE_DEFAULT` 1608 -> 2800 and
+  `IMX586_AGAIN_DEFAULT` 0 -> 500: in GNOME Camera the median luminance at 5 s after tapping the icon is already 93 (steady state 91 at 10 s).
+  (Before: it opened dark and brightened over seconds.)
+- Vendor gamma15 table (tuned_ofilm_imx586.bin @0x4e90c: 65 points 0..1024, effective exponent ~0.61, i.e. less lifted than sRGB) found, but libcamera's soft
+  `Adjust` algorithm takes gamma/contrast from application controls, not from `imx586.yaml`; adding `gamma:`/`contrast:` to the yaml changed nothing
+  (measured p1/p99 identical) so they were removed. The soft ISP only honours BlackLevel, Awb, Ccm, Agc (and Adjust's controls) from the yaml.
+- Residual: the preview is somewhat hazy/low-contrast (blacks ~34/255, highlights ~165/255); candidates are the missing lens-shading/tone data or real lens haze.
+- Tooling: `opencam.sh` (scratchpad) = VNC wake + swipe-up unlock + tap Camera + shots at 2/5/10 s; `swap2.sh` live-swaps imx586.ko and restarts wireplumber via D-Bus.
+
+## 2026-11-03 (night) — rear-main module EEPROM read (factory calibration)
+
+CCI bus 1 (i2c-3), 16-bit register addressing, CCI reads limited to 8 bytes per message (16 -> ENOTSUPP; `phone/camera-cal/i2cr.py`, `eepdump.py`,
+plain /dev/i2c-3 ioctls, no i2c-tools needed). Two 8 KB banks, both alias at 0x2000: `0x50` has ~2 KB of data at 0x0000-0x07ff (header
+`01 07 13 05 17 07 15 06 3e ff ff ff 1a 2d 04 01 ...` then 16-bit big-endian grids from 0x80) and `0x51` is fully populated (the second half of the
+16 KB part). Dumps: `phone/camera-cal/rear-main-eeprom-0x50.bin`, `-0x51.bin`. The Qualcomm CAMX layout for this Ofilm module lives in the HAL's
+compiled eeprom map, so the field offsets are not documented here yet.
+Consumability: libcamera's soft ISP (0.7.2) takes only BlackLevel, Awb (gray-world, no tuning keys), Ccm and Agc from the tuning file - there is no
+lens-shading or per-unit white-balance input, so the EEPROM LSC/AWB data cannot be applied through the tuning file. Using it would need a custom
+shader/ISP stage (GPU debayer) or a libcamera patch.
+
+## 2026-11-03 (night) — rear aux (Samsung S5K5E8) and front (OmniVision OV13855) cameras brought up; all three verified in GNOME Camera
+
+Identification (from the vendor HAL strings and `vendor.img`, extracted with `debugfs` into `~/violet-ios/cam2/`): **rear aux = S5K5E8**, **front = OV13855**
+(DW9767 VCM, PDAF). Both have `com.qti.sensormodule.<module>_*.bin` data in the same Chromatix format as the IMX586 (parser: `patches/proposed/gen/modparse.py`):
+S5K5E8 ofilm = 35-reg init + 4 modes (2592x1944, 1296x972, 1304x980, 800x600, 60 regs each, 2 lanes) + stream seq; OV13855 ofilm = 212-reg common init + modes 4224x3136 / 2112x1568 (4 lanes).
+Wiring measured on the phone (scan in the driver probe, rails/clock/reset like the imx586 recipe):
+- **front OV13855**: I2C 0x36 on **CCI master 1 (i2c-3)**, chip id read at 0x300b = 0xd855, reset TLMM 37 (active low), MCLK2, **csiphy2, 4 lanes**.
+- **rear aux S5K5E8**: I2C **0x18** on **CCI master 0 (i2c-2)** (not 0x10; id 0x5e80 at reg 0x0000), reset TLMM 45, MCLK1, **csiphy1, 2 lanes**. The vendor DT's cci-master numbers for sensors do not match reality (imx586 also differs).
+- rails shared with the main camera (vana1_2 gpio4, camera_ldo gpio3, l13a). The VCM at 0x0c / EEPROM 0x50/0x51 belong to the main camera (CCI1).
+Drivers: generated from one template (`patches/proposed/gen/gen_sensor.py` -> `s5k5e8.c`, `ov13855.c`; single mode each: S5K5E8 1296x972 SGRBG10 336 MHz link, OV13855 2112x1568 SBGGR10 360 MHz link), DT in `dt/violet-sm6150-camera.dtsi`
+(CAMSS ports 0/1/2 = main/aux/front). Modules in `/lib/modules/7.2.10-sm6150/extra/`. Boot image `boot-mainline-cam-multi2.img` was written to `boot` **over WiFi with dd**
+(no USB cable: backup `device-backup/boot-before-multi-cam.img`, md5 verified, partition 64 MiB) - fastboot remains the rollback path.
+libcamera now lists 3 cameras (`Internal back camera` x2, `Internal front camera`) and GNOME Camera shows a switch button: **front, aux and main were each verified streaming in the app**
+(UI over VNC). Tuning: `phone/s5k5e8.yaml`, `phone/ov13855.yaml` (vendor cc13 CCMs by CCT range from `com.qti.tuned.ofilm_*.bin`, black level 4096).
+Not done / known limits: single mode per sensor; no autofocus (main camera VCM at 0x0c, aux VCM at 0x0c? on CCI0 not driven; front DW9767 not driven); orientation of aux/front not verified
+(DT rotation 270 is a guess for both); CFA order of the new sensors was guessed (S5K5E8 GRBG, OV13855 BGGR) and looks right; no lens-shading/gamma: libcamera's soft ISP cannot consume them.
+
+## 2026-11-04 — violet-qg replaces violet-vbat (vendor profile, batt-id, real temperature)
+
+`patches/qg/violet-qg.c` (+ `gen_profiles.py` -> `violet-qg-profiles.h`) replaces `violet-vbat`: the three vendor LC_M6300 profiles, discharge/charge SoC-OCV tables, capacity vs temperature (4016 mAh at 29 C, was a hard-coded wrong 3580), cutoff/float rescaling, hold-99/hold-1 and msoc catch-up as in downstream qg-soc.c, PON from S7 OCV or the stored SDAM SoC. The vendor SoC estimator is a closed userspace piece, so the coulomb-counting/OCV estimator is ours.
+DT: `bat_therm` (0x4a) and `bat_id` (0x4b) channels on pm6150_adc, flashed as `boot-mainline-batt.img` (backup `device-backup/boot-before-batt-20261104.img`). `patches/qg/0001-iio-adc5-add-bat_therm_100k_pu.patch` adds the missing bat_therm table entry to qcom-spmi-adc5 (module, installed; original kept as `.zst.orig`). bat_id reads 767906 uV = 69 kOhm -> ATL profile (68k), selected automatically. Old module kept as `violet-vbat.ko.zst.bak`.
+
+## 2026-11-04 — charger policy + `usb` supply in violet-qg
+
+Live register dump (read-only, debugfs regmap `0-00`): SBL already programs hardware JEITA (0x1090=0x1b, thresholds 0x94-0x9b close to the vendor LC_M6300 soft/hard values), float voltage 0x1070=0x50 (4.4 V), safety timer 0x10a2=384 min, termination/recharge thresholds. So JEITA/termination/recharge are enforced in hardware and left untouched (see asidko "registers not to touch").
+Added to `patches/qg/violet-qg.c`: input-path sequence re-run on every plug-in with the limit chosen from APSD (SDP 500 mA, CDP 1.5 A, DCP/float/OCP `icl_max_ma`=1800), `usb` power supply (online, usb_type, current_max, supplies `battery`), battery `status` from the charger state machine (TERM -> Full, PAUSE/DISABLE/INHIBIT -> Not charging), `health` from CHGR_STATUS7 (cold/cool/warm/overheat), poll 2 s. Not done: unplug/replug and SDP behaviour (phone was on the laptop port the whole time, APSD = float), Type-C Rp current, PD/QC, thermal mitigation tables.
+Replug test (2026-11-04 22:34): unplug seen as plug=0 with the pack discharging (-47 mA), replug re-ran the input-path sequence (`apsd=0x10 -> icl 1800 mA, read back 1800, mode_chg=1`), battery went Full -> Charging (CHGR_STATUS1 = fast charge), `usb` online=1. The laptop port still detects as FLOAT, so the SDP (500 mA) branch has not been exercised.
+
+## 2026-11-04 — discharge test of violet-qg (first on-battery run)
+
+First run exposed a real bug: at a 2 s poll the coulomb increment is < 1 unit of batt_x100, so the integer division truncated it to zero and the counted SoC never moved (99.00 flat for 12 min at ~100 mA). Fixed with a sub-unit remainder carry (`cc_rem`); the rest/rescue corrections now scale with dt (~100 s time constant) instead of a fixed /20 per poll.
+Second run (~10 min at 0.5-1 A, then ~5 min rest, unplugged, logs read over WiFi <phone-lan-ip> — reachable once the phone's WiFi leaves power-save, first ping takes 1-2 s): counted SoC fell 0.31 %/min at 0.75 A (physics: 0.75 A / 4015 mAh = 0.31 %/min), reported capacity stepped 100 -> 99 -> 98 -> 97 one point at a time ~40 s apart, pack 29 -> 34.9 C. At rest the OCV estimate (95.4-96.1) and the counted value (95.66-95.8) agree within ~0.4 point. Under load the V - I*Rbatt estimate reads 2-3 points low, as designed (not used for correction under load).
+
+## 2026-11-05 — Type-C PD (sink-only) works; PMIC needs the 9 V window
+
+`boot-mainline-typec.img` (backup `device-backup/boot-before-typec-20261105.img`): `&pm6150_typec` enabled sink-only (`power-role = "sink"`, `data-role = "device"`, `sink-pdos` 5 V/3 A + 9 V/3 A, `vdd-pdphy-supply = L17`), no vbus-supply, not linked to the dwc3 role switch (USB gadget unchanged). `qcom,pmic-typec` binds, `/sys/class/typec/port0` + `port0-partner` appear, PD 3.0.
+Moto TurboPower 68 W offers: 5 V/3 A, 9 V/3 A, 15 V/3 A, 20 V/3.4 A, PPS (3.3 V.., 5 A / 3.4 A). The sink requested 9 V/3 A -> `tcpm-source-psy-c440000.spmi:pmic@0:typec@1500` voltage_now 9000000.
+Problem found: at 9 V the SMB5 flagged USBIN over-voltage (`0x1310` bit 3), charge state PAUSE (`0x1006` = 6), battery "Not charging" while on the charger. Cause: USBIN_ADAPTER_ALLOW_OVERRIDE (`0x1344`) was 0, so the PMIC only accepts the 5 V window. Fix in `violet-qg.c`: follow the tcpm supply (notifier + poll); contract 9 V -> `0x1344` = FORCE_9V (0x02), 5 V -> FORCE_5V, anything else -> 0 (hardware default, PMIC protects itself); cleared on unload. After the write: OV bit clear, state taper, battery Charging +469 mA at 4.40 V. Not done: switcher frequency per voltage (vendor 1050 kHz at 9 V, default left), ICL above 1.8 A, requesting 15/20 V or PPS, fast-charge current measurement from a low SoC.
+Cold reboot with the PD charger plugged in (2026-11-05 00:17): module autoloaded, batt-id 68 kOhm -> ATL, PD contract 9 V/3 A, `0x1344` = 0x02 written at probe, `0x1310` = 0x10 (no OV), state taper, battery Charging. Observed side effect: between boot and module load the charger is paused on over-voltage and the phone runs from the pack (~1 A for a few seconds; SoC 96 -> 95 %). Docs updated the same day: README.md/STATUS.md (charging row, "do not trust yet"), CHECKLIST C1, patches/README.md, HANDOFF-PROMPT.md, dt/README.md (snapshot `violet-sm6150.dts.20261105-typec`). Next (planned 2026-11-05): drain the pack, plug the PD charger, log charge current/temperature over WiFi; then decide ICL / 15-20 V / PPS.
+
+## 2026-11-05 — rear torch works (DT only)
+
+`boot-mainline-torch.img` (backup `device-backup/boot-before-torch-20261105.img`): `&pm6150l_flash` enabled with one `led-0` node, `led-sources = <1>, <2>` (vendor flash/torch ids 0 and 1, the dual rear LED), `led-max-microamp = 500000` (torch cap, vendor allows 2 x 900 mA), `flash-max-microamp = 1800000`, `flash-max-timeout-us = 1280000`. The built-in `leds-qcom-flash` driver binds; `/sys/class/leds/white:flash` appears (brightness 0-255 = torch, flash_brightness/flash_strobe/flash_timeout for strobe). User confirmed by eye: writes of 25 and 100 lit the LED at two levels, 0 turned it off. `brightness` is `root:feedbackd 0664` and the user is in `feedbackd`, so no udev rule is needed. Not done: camera strobe (needs `CONFIG_V4L2_FLASH_LED_CLASS`, not set), front flash (channel 3 + enable GPIO), raising the torch cap, checking Phosh's flashlight toggle.
+Phosh torch tile (2026-11-05): Phosh 0.57's torch manager scans LEDs named `*:torch*`/`*:flash*` and reads `GM_TORCH_MIN_BRIGHTNESS` from udev; gmobile's torch hwdb has no violet entry, and its udev rule (`61-gmobile.rules`) builds the key from `$attr{[devicetree/base]compatible}`, a path that does not exist on this kernel (`/sys/class/devicetree` is absent), so the key ends in `dt:`. Added `/etc/udev/hwdb.d/61-violet-torch.hwdb` on the phone (`gmobile:name:white:flash:dt:*` -> `GM_TORCH_MIN_BRIGHTNESS=10`), `udevadm hwdb --update`, `udevadm trigger --subsystem-match=leds`, restarted greetd. The torch tile now appears in quick settings (user-confirmed). Not yet confirmed: that the tile switches the LED and its brightness slider. Undo: delete the file + `udevadm hwdb --update`. The file lives only on the phone (not in the image); keep a copy in `phone/` if the rootfs is rebuilt.
+Torch end to end (2026-11-05): user confirmed the Phosh tile switches the LED and its brightness control works. The torch is done apart from the camera strobe (needs `CONFIG_V4L2_FLASH_LED_CLASS`) and the front flash.
+Correction (2026-11-05, same day): the wildcard hwdb entry above (`gmobile:name:white:flash:dt:*`) was a workaround for a lookup that does not resolve here, and was replaced. `/etc/udev/hwdb.d/61-violet-torch.hwdb` was removed; `/etc/udev/rules.d/61-violet-torch.rules` (copy: `phone/61-violet-torch.rules`) sets `GM_TORCH_MIN_BRIGHTNESS=10` only on the LED whose `OF_FULLNAME` is `/soc@0/spmi@c440000/pmic@5/led-controller@d300/led-0`. Root cause of the empty key is not proven: gmobile's rule uses `$attr{[devicetree/base]compatible}`, the phone's udev is 251; the likely cause is that this udev cannot resolve that path. Proper long-term fix: confirm that and submit a violet entry upstream to gmobile (or fix the lookup), then drop the local rule.
+
+## 2026-11-05 — 3.5 mm headphone playback: CLAIMED working here, but this entry is WRONG
+
+> **CORRECTION (2026-11-06).** The "works" conclusion below was false. The two pieces of evidence it rested on
+> did not hold: (1) the mic RMS 8218 "proof" was ambient noise - at that ADC gain the floor is 5-7k, and the
+> later A/B showed baseline higher than "playback"; (2) the "companders gated the DAC" story was never isolated.
+> The real blocker was the front end: **MultiMedia3 into the codec-DMA port is silent on this firmware**; only
+> MultiMedia4 reaches the WCD9375. The by-ear L/R confirmation from that day is therefore suspect as well - the
+> configuration in use now (MM4 + two sinks + default-sink switching) is the one verified by ear on 2026-11-06.
+> Kept below only as a record of what was believed at the time.
+
+The headphone route added earlier (MultiMedia3 -> `RX_CODEC_DMA_RX_0` -> rx_macro -> `swr1` -> WCD9375 HPHL/HPHR)
+was correct; the silence was the **codec compander**. With `HPHL_COMP`/`HPHR_COMP` enabled the compander wants its
+control stream on SoundWire data port 3, which a 2-channel stream never carries, so the R-DAC output is gated and the
+jack only clicks. Turning both codec COMP switches off (and the macro `RX_COMP1/2`) produced sound immediately; no
+DT, port-table or pad change was involved (the earlier RX-port-table and RX-pad experiments were chasing the wrong
+layer, and are harmless: they now match the working qcm6490/qcm6490 tables).
+
+Evidence:
+- Codec register access finally obtained read-only: the RX slave's `wcd937x_csr` regmap is not registered, but the
+  **TX** slave's is (`/sys/kernel/debug/regmap/sdw:3:0:0217:010a:00:3-wcd937x_csr/registers`); the analog space is
+  visible there. Idle -> during playback: `0x3008` 00 -> c1 (RX supplies), `0x3009` 0c -> f4 (HPHL/HPHR PA),
+  `0x30c9/0x30ca`, `0x3465/66` follow; with COMP off `0x3414` = 00 instead of 03.
+- Subjective: the user heard the trimmed "Demons" clip through the earbuds, full scale, **left in left ear and right
+  in right ear**.
+- Objective: the phone's own mic, with the earbud on the phone, recorded the same clip at AC RMS 8218 (peak 16384)
+  while the TAS speaker amp logged no activity at all, so the sound was the jack and not the speaker.
+  (Note: at max ADC gain the mic also picks up room noise ~5-6k RMS, so only a large delta over the idle floor is
+  meaningful.)
+- Desktop path: PulseAudio's sink `violet_speaker` is `module-alsa-sink device=hw:0,2` — the same PCM — so any app
+  follows the route live. Verified at app level: `paplay` played the clip, and Firefox streaming
+  (`pactl list sink-inputs` -> `application.name = "Firefox"`, `media.name = "AudioStream"`, sink `RUNNING`).
+
+Tooling (installed on the phone and copied to `phone/`): `violet-hph [jack [N]|speaker|status]` sets the route and
+full-scale levels (HPH 20/20, RX digital 124/124 = 0 dB); `violet-hph speaker` reverts. Helper scripts:
+`phone/codec-live.sh` (codec register diff during playback), `phone/hph-where.sh` (jack vs speaker, mic-measured),
+`phone/swr-master-regs.sh` (SWR master dumps), `phone/hph-regs.sh`.
+
+Still missing — jack auto-switch: `Headphone Jack` reads **off** with the headset plugged in, so MBHC never reports
+the plug. `MBHC Switch` starts off and has to be set by hand. Next step (needs one boot flash): add the MBHC DT
+properties the reference boards carry (`qcom,hphl-jack-type-normally-closed`,
+`qcom,ground-jack-type-normally-closed`, mbhc button/threshold set), make the codec start MBHC at probe, and wire a
+route switch (PulseAudio profile or a small listener on the jack kcontrol).
+
+Screenshot tooling for this phone (grim is a 0-byte binary): `gdbus call --session --dest org.gnome.Shell.Screenshot
+--object-path /org/gnome/Shell/Screenshot --method org.gnome.Shell.Screenshot.Screenshot false false /tmp/shot.png`
+with `DBUS_SESSION_BUS_ADDRESS=unix:path=$(grep -o '/tmp/dbus-[^ ]*' /proc/net/unix | head -1)` and
+`XDG_RUNTIME_DIR=/run/user/10000`. `wf-recorder` fails (VAAPI probe).
+
+## 2026-11-05 — jack auto-switch: UCM profile + SoundWire wake IRQ (plug test pending)
+
+Two proper pieces instead of the hand-run `violet-hph` / `violet-audio-setup` scripts:
+
+1. **UCM2 profile** (`phone/ucm2/Xiaomi/violet/{violet,HiFi}.conf`, symlink `conf.d/sm8250/Xiaomi Redmi Note 7 Pro.conf`; installed on the
+   phone under `/usr/share/alsa/ucm2`). Devices: `Speaker` (MM3 -> PRI_MI2S_RX -> TAS2563), `Headphones` (MM3 -> RX_CODEC_DMA_RX_0 -> rx_macro -> swr1 ->
+   WCD9375, compander switches OFF, `JackControl "Headphone Jack"`, `JackHWMute "Speaker"`), `Mic`. PulseAudio's udev-detect now loads the card with UCM,
+   creates `alsa_output.platform-soc_0_sound.HiFi__Speaker__sink` / `...HiFi__Mic__source`, and watches the jack: "Headphone Jack is now unplugged" in its log.
+   `/etc/xdg/autostart/violet-audio.desktop` was retired (moved to `/root/violet-retired/`; script copy `phone/violet-audio-setup`).
+   Gotchas: (a) the verb must enable a default route (`PRI_MI2S_RX ... MultiMedia3`), because PA opens the PCM while probing the profile and MultiMedia3 refuses to
+   open with no back-end ("Failed to find a working profile"); (b) with the UCM `ctl-remap` include, `amixer -c 0 cget name=...` fails ("sysdefault:0"), use `amixer -D hw:0`.
+2. **Why MBHC never reported a plug**: the headset-detect interrupts are SoundWire in-band interrupts of the WCD9375 TX slave (swr2). Vendor swr2 has a dedicated
+   wake interrupt (`swr_wake_irq`, SPI 623, `qcom,swr-wakeup-required`) that brings the bus out of clock stop; mainline `swr2` in `violet-sm6150.dts` had only the core
+   IRQ (the comment even said "wake 623"), so a plug while the bus idled was never delivered (`mbhc sw intr` only counted when audio happened to wake the bus).
+   Added `interrupts = <137>, <623>; interrupt-names = "core", "wakeup"`. The `qcom,*-jack-type-normally-closed` props suggested earlier are WRONG: vendor
+   `qcom,msm-mbhc-hphl-swh/gnd-swh = <1>` = normally open = the mainline default. Registers confirm MBHC is armed (0x3014=bd: L_DET_EN, NO, insertion detect).
+   Image `boot-mainline-swrwake.img` (DTB-only change; backup `device-backup/boot-before-swrwake-20261105.img`; DT snapshot `dt/violet-sm6150.dts.20261105-swrwake`).
+   After boot: `/proc/interrupts` shows `swr_wake_irq`. Plug test: pending (needs a headset in hand).
+
+## 2026-11-05 (later) — jack auto-switch: instrumented-verified end to end, NOT yet verified by ear
+
+Plug test at 22:26 (earbuds with mic): kcontrols `Headphone Jack`+`Mic Jack` on, HPH Type stereo (46/45 ohm), PulseAudio profile -> `HiFi (Headphones, Mic)`,
+default sink -> `...HiFi__Headphones__sink`, active port Headphones; unplug 17 s later: all off, profile/sink/port back to Speaker. All from logs/controls (`logs/hph-2026-11-05/watch7.log`);
+nobody has yet listened to the earbuds after an automatic switch, and the headset mic is not wired into the profile.
+Findings, in order:
+1. SoundWire TX wake IRQ (SPI 623) missing in `violet-sm6150.dts` -> plug events not delivered while the bus idled (`dt/...20261105-swrwake`).
+2. `wcd-mbhc-v2.c`: `hph_status` accumulated HEADPHONE|LINEOUT; removal cleared one -> jack stuck on (`patches/0041-asoc-wcd-mbhc-clear-all-plug-types-on-removal.patch`).
+3. Headset ceiling: vendor `qcom,msm-mbhc-hs-mic-max-threshold-mv = 2550`; mainline default 1700 mV classified the mic earbuds (idle ~1950 mV) as line-out. DT `qcom,mbhc-headset-vthreshold-microvolt = <2550000>`.
+4. One playback front-end for two outputs cannot work with UCM: PA opens the new device's PCM before enabling the device, and MultiMedia3 will not open with no back-end routed.
+   Added MultiMedia4 (DT `dai@3` + `mm4-dai-link`, `dt/...20261105-mm4`); Speaker = hw:0,2, Headphones = hw:0,3, both routes enabled in the verb.
+5. OPEN: `module-switch-on-port-available` is not loaded in the running session after boot (loads fine in an isolated pulseaudio with the same default.pa, and by hand);
+   without it the profile does not follow the jack. `phone/50-violet-jack.pa` drop-in did not fix it. The 22:26 test had the module loaded by hand.
+Images: `boot-mainline-jack.img` is flashed (final: no DBG prints). Backups: `device-backup/boot-before-swrwake-20261105.img` is the pre-work boot.
+
+## 2026-11-06 — SWR RX bus "link failed to connect" after idle (investigation, nothing changed yet)
+
+Observed after a clean boot: ~100 s idle, then first playback to the Headphones sink: `swr1: swrm_wait_for_frame_gen_enabled: link status not disconnected / link failed to connect`,
+RX slave `sdw:2:...:4` UNATTACHED, every stream -> `DPN_PortCtrl register write failed` (-5). Not yet reproduced deliberately; not yet A/B-tested against the pre-LOHIFI profile.
+Prior art (web search, memory rule "research first" — this was skipped earlier in the session):
+- qcom soundwire runtime-PM patch: "link failed to connect" is only logged before `sdw_bus_exit_clk_stop()`; it is a symptom, not a root cause (lkml.iu.edu/hypermail/linux/kernel/2202.2/09523.html).
+- Johan Hovold, X13s (2023): slaves stuck UNATTACHED, tied to runtime PM / clock-stop changes (lkml.org/lkml/2023/6/5/303).
+- wcd9378 review thread: codec does not recover from bus clock-stop; downstream workaround keeps the slave runtime-active (lkml.iu.edu/2607.3/10373.html).
+- wcd937x-sdw "unbalanced pm_runtime_enable" fix (0ffc5a40): already present in this tree (`pm_runtime_set_suspended` at end of probe).
+Candidate fixes, NOT applied: RX slave `clk_stop_mode1` (as wsa881x) vs keeping the RX slave runtime-active while the card is bound. Needs a deliberate repro first.
+
+## 2026-11-06 — correction + Opus analysis of the SoundWire races (nothing flashed)
+Correction: a command the user rejected still applied its source edit (RX `clk_stop_mode1` in wcd937x-sdw.c + patches/0042). It was never built or flashed (running kernel = boot-mainline-jack.img);
+reverted the source and deleted patches/0042 on 2026-11-06 00:5x. Do not reintroduce it as a fix: it is a workaround and the vendor runs mode0 on both masters.
+Opus read-only analysis (hypotheses, only the first two checked against the tree by me):
+- (B) TX slave "Slave 1 initialization failed: -5" at ~17 s => INTMASK1 never programmed => MBHC irq dead for that boot. Likely reset race: DT `wcd937x_reset_active` has `output-high`
+  (violet-sm6150.dts ~1353) releasing the codec before the driver's reset pulse; driver requests the GPIO GPIOD_OUT_LOW (wcd937x.c:2916). Upstream boards use output-low / bias-disable only.
+- (A) RX slave UNATTACHED after idle clock stop: RX SWR pad config (drive 2, slew-rate 1) came from atoll; vendor sm6150-lpi.dtsi uses drive-strength 8 + bias-bus-hold on clock and data, no slew.
+  Local patch 0029 (pinctrl-sm6150-lpass-lpi) may mis-place the slew bits. TX pads, configured like the vendor, survive clock stop.
+- Driver gap: wcd937x_sdw_runtime_resume does not wait for slave re-init (first stream after idle fails -EIO).
+Cheap non-flash tests proposed: read pinconf-groups for gpio3-5; count "initialization failed" per boot; toggle swr1 power/control on-off 10x.
+
+### 2026-11-06 — non-flash checks (measured, no change to the phone)
+- Deterministic repro of (A) without audio: `echo auto/on > /sys/devices/platform/soc@0/<master>/power/control`, 6 cycles each (idle 6 s, resume):
+  RX master 62ef0000: 6/6 resumes log "SWR bus clsh detected" and the RX slave ends UNATTACHED. TX master 62ed0000 (control): 6/6 resumes clean, slave Attached.
+  Same driver, same codec, same method; only the bus (pads/ports/clock path) differs.
+- /sys/kernel/debug/gpio (LPI chip): gpio0-2 (TX) 8 mA keeper; gpio3 (RX clk) 2 mA no pull; gpio4/5 (RX data) 2 mA keeper; gpio6 (codec reset) out, 2 mA (DT asks 16 mA: unsupported value, clamped?).
+- Vendor sm6150-lpi.dtsi rx_swr_clk_active / rx_swr_data_active: drive-strength 8 + bias-bus-hold (sleep state: drive 2). Ours: 2 mA, slew 1, clock bias-disable (copied from atoll).
+
+### 2026-11-06 — vendor RX pads flashed (boot-mainline-rxvendor.img): hypothesis REFUTED
+RX pads now drive 8 + bus-hold (vendor rx_swr_*_active), slew dropped. Result, same 6-cycle test: RX master still 6/6 "SWR bus clsh detected" and slave UNATTACHED; no change.
+Pad drive is not the cause of (A). Kept in DT because it matches the vendor (comment says so), NOT as a fix. Backup of the pre-change boot: device-backup/boot-before-rxvendor-20261106.img (= boot-mainline-jack.img).
+Same boot: BOTH slaves logged "Slave 1 initialization failed: -5" at 17.04 s, i.e. same instant on both buses -> supports the codec-reset-race idea for (B) (DT `wcd937x_reset_active` output-high vs driver reset pulse). Not tested yet.
+Open for (A): RX vs TX difference elsewhere (port/timing config, rx-macro clock path, swr1 master registers after resume). Next non-flash step: compare master registers/clock enable counts RX vs TX across a resume.
+
+### 2026-11-06 — RX vs TX comparison across suspend/resume (no flash): no root cause yet
+- Not deterministic per bus: on one boot the RX master suspend/resume was clean (slave Attached, no clash, clock counts normal); minutes later on the same boot a suspend produced "bus clsh detected" and the slave went UNATTACHED.
+- Failing signature (dyndbg trace, RX master, slave already UNATTACHED): every resume -> "SWR CMD error, fifo status 0x3e00010f, flushing fifo" (slave not answering); every suspend -> "SWR bus clsh detected". Master power cycling alone never recovers the slave; a stream start did (earlier test).
+- Clock enable counts (clk_summary) before/suspended/after: RX core MCLK/NPL 2->1->2, rx-mclk 1->0->1; TX core MCLK 4->3->4, tx-mclk 1->0->1. Nothing visibly missing on RX. q6afe "Unknown cmd 0x100f6" is logged at each cycle on BOTH buses (TX stays healthy), so not the discriminator.
+- No dev_dbg output from soundwire qcom/bus/slave during resume (only the error prints). wcd937x-sdw runtime resume does only a regcache sync (RX has no regmap).
+- Still open: what makes the RX slave stop answering after a clock-stop; and the boot-time both-slave init failure (B). Candidate non-workaround steps left: reset-pin DT test for (B); a clock-stop trace from the master registers; a vendor-driver comparison of the swrm clock-stop sequence.
+
+## 2026-11-06 — vendor (downstream) vs mainline sequence diff
+Source: github.com/LineageOS/android_kernel_xiaomi_sm6150 branch lineage-21 (tip ae1507a8, Xiaomi-derived), techpack/audio: soc/swr-mstr-ctrl.c, asoc/codecs/wcd937x/wcd937x.c, wcd937x_slave.c, msm-cdc-pinctrl.c. Saved only in the session scratchpad; the violet-pmos tree has no techpack/.
+VERIFIED by reading both sides (me, after the Sonnet agent's report):
+- (B) vendor wcd937x_probe: `wcd937x_reset(dev); usleep_range(5000, 5010);` with the comment "5msec delay to provide sufficient time for soundwire auto enumeration of slave devices as per HW requirement" before `component_bind_all` (wcd937x.c:2852-2866). Mainline wcd937x_probe goes straight from wcd937x_reset() to component_master_add_with_match() (wcd937x.c:2953-2955), no delay.
+- (A) vendor swrm_runtime_resume, clock-stop-mode0 branch: `MCP_BUS_CTRL = 0x2; usleep_range(100,105); state = UP` and nothing else. Mainline swrm_runtime_resume (qcom.c ~1760-1792): BUS_CTRL, then clears + re-enables CLASH_DET, 100 us, frame-gen wait, sdw_bus_exit_clk_stop (slave traffic right away). Mainline's clash handler also permanently masks CLASH_DET until the next resume (qcom.c:774-781).
+NOT verified (agent inference): whether the missing 5 ms is the cause of (B); whether the clash/CMD_ERROR in (A) comes from the re-arm + immediate exit_clk_stop window; vendor never applies sleep pinctrl on suspend (not read); stock MIUI code may differ from the LineageOS mirror.
+
+### 2026-11-06 06:5x — 5 ms post-reset delay: built, NOT yet flashed
+The vendor-matching `usleep_range(5000, 5010)` after `wcd937x_reset()` is in wcd937x.c (patches/0042-asoc-wcd937x-wait-for-soundwire-enumeration-after-reset.patch, applied 01:09 by an earlier turn; wcd937x.o built 01:10).
+Kernel Image relinked 06:53 and packed as boot-mainline-delay5.img (sha256 a4444fe1650b...; includes the vendor RX pad DTB). The phone was last flashed with boot-mainline-rxvendor.img (no delay). Phone not connected at 06:5x; flash + 5-reboot count pending.
+Test plan: backup boot, flash, verify hash, 5 reboots: count "initialization failed" (baseline seen on 3 of the last ~5 boots), check "mbhc sw intr" works with a plug.
+
+### 2026-11-06 07:3x — 5 ms post-reset delay: result (boot-mainline-delay5.img, flashed, hash a4444fe1650b verified)
+5 reboots, measured ~65 s after each boot: "Slave 1 initialization failed" count = 0, 0, 0, 0, 0. Before the delay, init failures were seen on most boots recently observed in this session
+(TX only on one, both slaves on another, none on one; counts were not logged systematically, so the baseline is anecdotal). Supports the vendor-matching delay as the fix for (B); small sample, plug detection per boot not yet checked by a physical plug.
+(A) unchanged: RX slave status after ~65 s idle = UNATTACHED, Attached, Attached, UNATTACHED, UNATTACHED (3 of 5 boots show the RX slave not Attached when idle); TX shows Alert (interrupt pending) on all 5.
+Next: physical plug test on the current boot; then (A).
+
+### 2026-11-06 07:4x — WORKAROUND: PulseAudio jack policy module loaded from session autostart
+Plug cycle on the 5 ms-delay kernel: kernel jack control followed (off at unplug, on at replug, Mic Jack ~7 s later), but PulseAudio stayed on Headphones: the session daemon (autospawned: `pulseaudio --start --log-target=syslog`) has no module-switch-on-port-available, though default.pa:33 loads it and no error is logged.
+Loaded by hand it persists. Daemons I start from an ssh session die with the session (KillUserProcesses) and are replaced by a module-less autospawned one, which confused earlier tests.
+WORKAROUND installed: /usr/local/bin/violet-pulse-policy + /etc/xdg/autostart/violet-pulse-policy.desktop (copies in phone/). Root cause still OPEN; remove both when found.
+
+### 2026-11-06 08:0x — headphone playback hangs when the RX slave is UNATTACHED; vendor pads NOT the cause
+Symptom (user): with the headset plugged, songs do not start at all (speaker plays fine). Cause chain, measured:
+- profile/sink switching is fine (watch-final.log: Headphones<->Speaker followed the jack through 2 plug cycles with violet-pulse-policy loaded).
+- Stream start to the Headphones sink fails when the RX SoundWire slave (sdw:2...:4) is UNATTACHED: dmesg "WCD937x Playback: ASoC error (-5): snd_soc_link_prepare", "DPN_PortCtrl register write failed for port 1" (330 times in 8 s: PulseAudio retries), paplay times out (rc=124), codec amp regs 0x3008/0x3009 stay 00.
+- Image A = delay5 + vendor RX pads: hung on the first test. Image B = delay5 + OLD (atoll) pads (boot-mainline-delay5-oldpads.img, now flashed, hash a4f18a093da1): works right after boot (rc=0, amps on: 3008=c1 3009=fc, no errors) while the slave is Attached, but after ~60-90 s idle the slave is UNATTACHED again and the first play hangs with the same errors. So the RX pads do not explain it; the earlier success was timing (slave still Attached). The vendor-pad DT is kept as dt/violet-sm6150.dts.20261106-delay5-rxvendor, the tree has the old pads again (as flashed).
+- Acoustic method (phone mic, 1 kHz Goertzel): control tone through the speaker -> amp 10613 ratio 0.94; earbud tone at 0 dB digital gain not detected at the mic (earbud far quieter than speaker; inconclusive by itself). The codec amp registers are the better indicator.
+Open: (A) RX slave drops to UNATTACHED ~60 s after boot when idle and does not come back on stream start (or on master runtime-PM cycling). Candidate (vendor-evidence, untested): mirror vendor mode0 resume (do not re-arm CLASH_DET / no immediate exit_clk_stop traffic), or recover the slave (bus reset) on prepare failure.
+
+### 2026-11-06 08:3x — RX bus failure is the STREAM START, not idling (measured) — and the phone went unreachable
+- Pinning the RX master awake (power/control=on) right after boot does NOT keep the slave Attached (Attached at 33 s, UNATTACHED within 10 s, both of 2 boots): clock-stop idling is not the trigger.
+- With the UCM profile hidden (PulseAudio cannot load the card), the RX slave stayed Attached for 211 s with zero "clsh"/"clk already disabled" lines. Normal boots show "wcd937x: clk already disabled" at ~34.7 s then "SWR bus clsh detected" at ~38.4 s and the slave UNATTACHED: it is something PulseAudio does when it loads the card (profile probe opens/closes the headphone PCM).
+- Hand replay on that clean boot: mixer routes (verb) = harmless; opening the headphone PCM hw:0,3 for 1 s = "write error: I/O error" on the FIRST try with the slave Attached, 1 clash line; a second try -> slave UNATTACHED, 3 lines. So starting an RX SoundWire stream fails/breaks the bus. Candidates now: RX port/stream parameters in the swr1 DT (qcom,ports-* tables), the stream prepare ordering vs codec/RX-macro power-up, the 'DPN_PortCtrl' write path. NOT idle/clock-stop, NOT pads, NOT the 5 ms delay.
+- A traced repeat (dyndbg on stream.c/bus.c/qcom.c/slave.c) was started with the UCM profile hidden; the phone did not come back after its reboot (no ssh over USB-link-local or WiFi, NCM gadget enumerates). STATE LEFT ON THE PHONE: /usr/share/alsa/ucm2/conf.d/sm8250/"Xiaomi Redmi Note 7 Pro.conf" is MOVED to /root/violet-ucm-hidden.conf (restore with: sudo mv /root/violet-ucm-hidden.conf "/usr/share/alsa/ucm2/conf.d/sm8250/Xiaomi Redmi Note 7 Pro.conf"). Without it PulseAudio has no card (no speaker/headphone audio).
+
+## 2026-11-06 (21:5x) — jack switching FIXED: it was never PulseAudio's policy, it was the bus
+
+Checked the previous session's work and reproduced both failures live. Two independent bugs, both now
+fixed on the running phone (no reboot, no flash):
+
+**1. PulseAudio does not follow the jack.** With `Headphone Jack` = on and the Headphones port available,
+forcing the card to "HiFi (Mic, Speaker)" left it there indefinitely: `module-switch-on-port-available` is
+loaded, but this card's UCM port availability never drives a switch. Also `amixer cget name='Headphone Jack'`
+fails (CARD-iface control) - it has to be resolved to a numid through `amixer controls` first; that is why
+earlier scripts silently read an empty jack value.
+
+**2. The RX codec slave detaches when idle, and a stream started in that state dies.** Reproduced:
+`sdw:2:0:0217:010a:00:4` = UNATTACHED -> play -> `SWR CMD error, fifo status 0x3e00012e`, `DPN_PortCtrl
+register write failed for port 1`, `Program params failed: -5`, `WCD937x Playback: ASoC error (-5) at
+snd_soc_link_prepare()`. The player then stalls ("songs do not start"). Root cause of the detach is not
+chased further; the useful finding is that a **runtime-PM resume of the slave re-attaches it**: writing `on`
+to the master/slave `power/control` took it from UNATTACHED to Attached in ~1 s, with only the known benign
+`SWR bus clsh detected` line. Holding it `on` while the jack is in use keeps it Attached (60 s+ observed,
+slave PM "suspended" is fine as long as it stays Attached).
+
+**What is installed now** (all in `phone/`, live on the device):
+- `violet-jack-watch` (`/usr/local/bin`): polls the kernel jack control 1 Hz; on change sets the UCM profile
+  (Headphones/Speaker), enables MBHC, and while the jack is in use calls the bus guard every loop.
+- `violet-bus-guard` (`/usr/local/sbin`, root): `ensure|hold|release|status` over the RX master/slave
+  `power/control` (sudo -n from the watcher; sysfs is root-only).
+- `violet-jack-watch-run` + `/etc/init.d/violet-jack-watch` (OpenRC, `command_background`, added to the
+  default runlevel): runs the watcher as user `user` so it is in the same session as PulseAudio and survives
+  ssh sessions (elogind kills ssh-started daemons).
+
+Verified live: jack on -> profile "HiFi (Headphones, Mic)" within 1 s; three consecutive `paplay` runs
+rc=0 with the slave staying Attached and **zero** ASoC/SWR errors; sink = `...HiFi__Headphones__sink`.
+Not verified: behaviour across a reboot (the service is enabled; this needs one boot to confirm) and the
+unplug direction (same code path, but I could not unplug it myself).
+
+Caveat: holding the bus awake while headphones are in use costs a little idle power; released again when
+the jack goes out.
+
+## 2026-11-06 (22:1x) — switching architecture changed: one sink, route under it
+
+User test exposed the flaw in the UCM-profile approach: music played in the headphones, unplug -> speaker
+fine, plug again -> **the app's stream stalled**. Reproduced: after the re-plug the player's sink-input stayed
+alive but the sink stopped consuming (`paplay` hung, rc=124), while the codec was powered (0x3008=c1,
+0x3009=fc) and the mixer was right. Cause: switching the PulseAudio **card profile** re-creates the sinks and
+wedges a stream that is playing across the switch.
+
+New arrangement (live on the phone):
+- The card profile is pinned to `HiFi (Mic, Speaker)`: **one** sink, `module-alsa-sink hw:0,2` (MultiMedia3).
+- `violet-jack-watch` now switches the **codec route** with `violet-hph jack|speaker` on jack changes instead
+  of switching profiles, and keeps re-asserting the pinned profile once a second.
+- `module-switch-on-port-available` is unloaded and Claude's `/etc/xdg/autostart/violet-pulse-policy.desktop`
+  is renamed to `.disabled` (it existed only to load that module).
+- `violet-jack-watch-run` now wraps the watcher in a restart loop.
+
+Verified live: with 30 s of music playing, `violet-hph speaker` then `violet-hph jack` flipped
+`PRI_MI2S_RX ... MultiMedia3` on->off and `RX_CODEC_DMA_RX_0 ... MultiMedia3` off->on while the sink stayed
+**RUNNING** and dmesg stayed clean - i.e. the route moves under a playing stream instead of tearing it down.
+State after: jack=on, slave Attached, route to jack, one sink (Speaker port of hw:0,2).
+Not verified by me: a physical unplug/replug during playback (that is the user's test).
+
+## 2026-11-06 (22:4x) — ROOT CAUSE of the headphone failures: clock-stop decision in soundwire/qcom
+
+Reproduced the user's report end to end: play in headphones -> unplug (speaker fine) -> plug -> **nothing plays**.
+State at failure: `sdw:2:0:0217:010a:00:4` = UNATTACHED for minutes, `DPN_PortCtrl ... port 1` failed,
+`Program params failed: -5`, `WCD937x Playback: ASoC error (-5) at snd_soc_link_prepare()`, and a runtime-PM
+resume no longer re-attached it (the earlier guard's forced resumes logged
+"slave was UNATTACHED -> forced resume -> UNATTACHED" every 2 s).
+
+**Root cause (upstream bug, still present in upstream master).** `drivers/soundwire/qcom.c` decides whether the
+controller may use clock stop from `slave->prop.clk_stop_mode1`, but
+- it does so in `qcom_swrm_enumerate()`, which races with the slave driver probe that sets the property (and only
+  the last enumerated slave counts) - the exact problem fixed upstream by Marek Szyprowski on 2026-10-28
+  ("soundwire: qcom: decide about clock stop support on runtime suspend"), not yet merged;
+- the condition is inverted relative to its own commit message (74e79da9fd46: "needs a full reset if clock stop
+  support is not available in slave devices"): it sets the flag when the slave *does* support it.
+
+Our WCD9375 has **no DisCo properties** (`dev-properties` on both slaves is empty, `clk_stop_mode1` = false), so
+`clock_stop_not_supported` stayed false: the controller entered clock stop on runtime suspend, lost its state, and
+the graceful `sdw_bus_exit_clk_stop()` on resume never re-initialised it -> link dead until reboot.
+
+**Fix (patches/0043-soundwire-qcom-reset-on-clock-stop.patch, built into `boot-mainline-cs-fix.img`):**
+take the decision at runtime suspend and invert it (a slave without clock-stop mode 1 forces the reset path).
+Verified on the phone after flash: RX slave **Attached through 120 s idle** with the userspace guard stopped, two
+consecutive `paplay` runs rc=0, dmesg clean. The userspace bus guard is no longer needed to hold the bus; it stays
+only as a recovery net.
+
+Rollback: `device-backup/boot-before-csfix-20261106.img` (md5 d67422ea..., identical to
+`boot-mainline-delay5-oldpads.img`). Flashed image `boot-mainline-cs-fix.img` (md5 ddebef70...).
+
+Also in this pass: headphone gain lowered to a comfortable level (PA gain 12/20, digital 110/124 = -14 dB; the
+previous full-scale 20/20 + 0 dB was painfully loud on real earbuds), and the UCM Speaker device renamed to
+"Speaker (3.5 mm jack follows the plug)" so the PulseAudio output label stops pretending it is always the speaker
+(takes effect after the next PulseAudio restart).
+
+## 2026-11-06 (23:1x) — the real blocker: MM3 -> codec-DMA is silent, MM4 works
+
+After the kernel fix the link stayed up (streams started clean, codec powered: 3008=c1, 3009=fc, companders off)
+but the jack was **still silent**, while the speaker route worked. Bisected with the phone's owner by ear:
+
+- 3 tones with pwr=ULP/LOHIFI x mode=CLS_H_NORMAL / CLS_H_HIFI / CLS_AB_HIFI: **none audible** on MM3.
+  (`CLS_AB_HIFI` is even rejected with EINVAL while PWR Mode = LOHIFI.)
+- 5 tones on **hw:0,3 (MultiMedia4)** with `RX_CODEC_DMA_RX_0 Audio Mixer MultiMedia4` on: **heard**.
+- On hw:0,3: speaker route (`PRI_MI2S_RX Audio Mixer MultiMedia4`) -> heard + TAS logs "amp 0 active";
+  jack route -> heard.
+
+So the legacy AFE/DSP path for **MultiMedia3 into the codec-DMA port produces no audio at all** on this firmware,
+with everything else looking correct; **MultiMedia4 works**. MM3 is fine for the speaker BE (that is how the
+speaker has always been tested), which is what made this so confusing.
+
+Final arrangement (live, verified by ear and by the speaker amp's own log):
+- UCM `Speaker` device `PlaybackPCM` is **hw:${CardId},3** (MultiMedia4) - one permanent sink on the PCM that works.
+- `violet-hph` switches the **MM4** routes (`RX_CODEC_DMA_RX_0 ... MultiMedia4` for the jack,
+  `PRI_MI2S_RX ... MultiMedia4` for the speaker); the card profile never changes.
+- `violet-jack-watch` polls the jack 1 Hz and calls `violet-hph` on change (OpenRC service, runs as user).
+- All amixer calls use **`-D hw:$CARD`**: `amixer -c 0` goes through PulseAudio's ALSA plugin, whose numid table is
+  shifted (Headphone Jack = 90 there, 89 on hw:0) - that made earlier reads silently read the wrong control.
+- Volume: PA sink 65 %, codec PA gain 12/20, digital 110/124 (~ -14 dB); 20/20 + 0 dB was painfully loud.
+
+## 2026-11-07 00:2x — stable headphone config (and the mistake that broke it earlier tonight)
+
+Working configuration, verified by ear (music in the headset, kernel log clean, `pcm3p` = hw:0,3 open,
+`pcm2p` closed):
+
+1. **The RX SoundWire master is held awake permanently** (`power/control=on`, helper
+   `/usr/local/sbin/violet-bus-guard hold`, called by the watcher every loop).  This is the load-bearing
+   piece: the codec-DMA playback path and the apps-side SoundWire driver share the RX master, and a
+   suspend/resume there wedges it - `SWR CMD error, fifo status 0x3e001005`, then every stream fails with
+   `write error: I/O error` / ASoC -5.  With the bus held, the kernel's reset-on-resume path (patches/0043)
+   never runs, so it is inert rather than harmful.
+2. **Two sinks, one per PCM** (this firmware binds front end to back end):
+   card `Speaker` on hw:0,2 -> PRI_MI2S_RX -> TAS amp; `violet_hph` (module-alsa-sink) on hw:0,3 ->
+   codec DMA -> WCD9375 -> jack.  `violet-jack-watch` switches the **default sink** on jack change.
+3. Per-sink volume; headphone ceiling from `/etc/violet-audio.conf` (`jack_hph_gain=12`,
+   `jack_digital_volume=94`) so the slider sits at 100 % for the loudest level wanted.
+4. Never move a live stream (the GStreamer player dies) and never run both PCMs at once (SWR CMD error +
+   PulseAudio died twice).
+
+Known trade-off: on plug/unplug the player pauses or stops (GStreamer follows the default device change);
+press play and it starts on the correct sink.  An MPRIS nudge is not reliable here (only Decibels exposed
+MPRIS during testing), so this is the Windows-like contract for now.
+
+Recovery recipe if the jack stops being detected or a stream errors with EIO: cycle the bus
+(`violet-bus-guard release; sleep 2; violet-bus-guard ensure`) - that brought both detection and playback
+back without a reboot during this session.
+
+## 2026-11-07 00:5x — REAL root cause of the two-day "one output at a time" bug: q6routing stale BE path
+
+Two independent reviews (Claude Opus via `claude -p --model opus`, plus a second subagent) both pointed at the
+same kernel bug rather than at the DSP.  Confirmed in source and on the device.
+
+**The bug** (`sound/soc/qcom/qdsp6/q6routing.c`, mainline): a front-end session keeps one `port_id`, but each
+`<BE> Audio Mixer MultiMediaN` switch owns its own DAPM path.  Enabling a second BE moved `port_id` and
+connected the new path while **leaving the old path connected**; `get` reported the old switch as 0 (it compares
+against `port_id`) and turning the old switch off returned early, so userspace could never remove it - only a
+reboot.  The ASM session then mapped its copp to a port DPCM had not started: playback blocks forever with **no
+kernel error**, while the stale back end (speaker amp) still powers up.  That is exactly "whichever output was
+used last works, the other dies until reboot".
+
+**Measured before the fix:** with only MM3 -> RX_CODEC_DMA_RX_0 routed (old route switched off first), the codec
+HP amp powered (`0x3008`=01, `0x3009`=fc) - so MM3 *can* reach the codec, the earlier "FE is bound to a BE"
+theory was wrong - but the stream hung and the TAS speaker amp *still* logged `amp 0 active` with its switch
+reading off.  Reviewers were right.
+
+**Fix:** `patches/0044-asoc-q6routing-disconnect-old-be-on-reroute.patch` - remember the selected mixer control
+per session and disconnect it before connecting the new one.  Shipped as `boot-mainline-routefix.img`
+(md5 4e92e6a8..., backup of the previous boot in `device-backup/boot-before-routefix.img`).
+
+**Verified after flash:** cross-routing MM3 now reports the old BE as off and the speaker amp stays quiet
+(no stale path); speaker and jack both play in sequence, `rc=0`, TAS `ACTIVE` for the speaker only, codec
+`0x3009=fc` for the jack, kernel log clean.
+
+Still open, separate: the SoundWire clock-stop wedge (patches/0043) - mitigated by holding the RX master awake;
+AudioReach is not reachable on this ADSP firmware (APR/ADM only), and an ADSP restart is not a safe recovery.
+
+## 2026-11-07 01:5x — headset "feeble + chopped speech": codec was in boot-default ULP / CLS_H_NORMAL
+
+Symptom (user): headset very quiet, "tuk tuk" noise, speech barely intelligible at every gain tried.
+Prior art searched: lkml wcd937x/wcd938x HPH volume patches (analog range, UCM digital-vs-analog volume), Android
+HAL commits (class-H LOHIFI/ULP modes, compander noise fix), wcd937x-sdw binding (rx-port-mapping = HPH,CLSH,COMP,LO,DSD).
+None describes this exact symptom - recorded as "nothing direct found".
+
+Measured (fresh boot): `RX_HPH PWR Mode`=ULP(0), `RX HPH Mode`=CLS_H_NORMAL(0). `violet-hph` (manual tool) sets
+LOHIFI + CLS_H_LOHIFI, but `violet-jack-watch ensure_mixers` never did, so the automatic path ran the codec in the
+low-power mode. A/B by ear (aplay direct to plughw:0,3, PulseAudio bypassed): all gains 16/116, 20/84, 20/100
+were equally chopped (so not a gain problem; buffer size 1024/4096 made no difference); after setting
+LOHIFI + CLS_H_LOHIFI (and a CLS_AB try, partly "Resource busy") the user reported **all clear and very loud**.
+Fix: `phone/violet-jack-watch` ensure_mixers now sets both modes; `/etc/violet-audio.conf` gain 16/116 -> 12/94
+(the documented comfortable level; user said "very loud"). Deployed, service restarted, mixer reads PWR=1 MODE=5.
+Also found: the 2026-11-07 01:2x readings 20/84 earlier were a stale watcher (conf edited after it started).
+
+Open: (1) "tuk tuk" not re-checked after the fix; (2) volume OSD shows an icon without label for `violet_hph`
+(hand-loaded module-alsa-sink: no ports, form_factor=internal, icon audio-card; speaker sink has port "Speaker").
+Label cause is a hypothesis, not yet checked in Phosh source.
+
+## 2026-11-07 01:4x — OPEN for next session: phone resets / USB+WiFi link disappears
+
+Observed while verifying the headset fix (laptop `journalctl -k`, port 3-4): the phone's USB gadget repeatedly
+disconnects/re-enumerates (device numbers 49 -> 92 between 01:11 and 01:40; 18d1:d001 and 1d6b:0103 alternate),
+and it dropped off both USB and WiFi several times (once for good until a manual reboot at ~01:23, again after
+~01:30, again ~01:40, ~2 min after boot).  Cause UNKNOWN - not yet isolated.  Facts only:
+- the flapping started (01:11) before the watcher/codec-mode change (deployed ~01:29), so that change is not
+  proven to be the cause, but it is not ruled out either (the dropouts also happened after it);
+- the codec modes/gains survived a reboot (PWR=LOHIFI, MODE=CLS_H_LOHIFI, 12/94) - fix is in place;
+- laptop and phone also landed on different WiFi subnets (<lan2>.x vs <lan>.x, SSID <other-ssid> vs
+  <home-ssid>), which hid the phone from the laptop at times - separate from the USB flapping.
+Next: after a drop, read /sys/fs/pstore (ramoops is configured), `last` kmsg, and the laptop-side USB log;
+A/B by stopping violet-jack-watch for a while to see whether the drops stop.
+
+## 2026-11-07 08:0x — crash/link-loss: first facts (cause still unknown)
+
+Prior art searched: dwc3/NCM gadget disconnect threads (sdm845 f_ncm lifecycle regression 56a512a9b410 - about
+DHCP/ifname, not our symptom; dwc3-qcom role-switch VBUS override threads), pmOS spontaneous-reboot reports
+(asus-grouper watchdog, PinePhone) - nothing matching "sm6150 resets minutes after boot".  Recorded as: nothing direct.
+
+Measured:
+- Laptop log: after each phone boot the gadget enumerates, then `usb 3-4: device descriptor read/64, error -110`
+  and repeated disconnect/reconnect pairs, then the link vanishes.  Phone uptime read 0 min at 08:00:52 with nobody
+  touching it -> **the phone resets itself**; the "link disappearing" is a reset, not (only) a USB fault.
+- `/sys/fs/pstore` is EMPTY after the reset (ramoops@a1600000 registered, console-size 4 MB): no panic record, so a
+  hard reset (PMIC/watchdog/power) rather than a kernel oops.  No bootreason in the cmdline.
+- State while up: charging 1.1-1.2 A from a PD source (`PD contract 5000 mV -> USBIN window override`), usb online,
+  typec port0 device/sink, thermal max ~42 C, udc configured.  `qcom,pmic-typec ... supply vdd-vbus not found,
+  using dummy regulator` at boot.
+Instrumentation added (debug only, remove after): `phone/violet-crashwatch` -> `/usr/local/sbin/violet-crashwatch`,
+started as root, logs 1 Hz battery/charger/typec/thermal/udc + all kernel lines to
+`/var/log/violet-crashwatch.log`, `sync -f` each second.  Next: read the tail of that log after the next reset.
+
+## 2026-11-07 08:1x — volume OSD label for the headset sink
+
+Symptom: with the headset plugged the volume OSD shows the volume icon but no label; on the speaker it shows
+"Speaker".  Source read (gnome-settings-daemon 51.0 = the version on the phone, `show_volume_osd()` in
+plugins/media-keys/gsd-media-keys-manager.c): the label (device description) is sent only when the sink's
+`device.form_factor` != "internal" OR its active port is not one of "analog-output-speaker"/"analog-output".
+Speaker sink: port `[Out] Speaker` (UCM name, not in the list) -> label.  `violet_hph` (hand-loaded module-alsa-sink):
+form_factor=internal and no port -> no label.  Matches both observations.
+Measured on the session bus (`dbus-monitor member=ShowOSD`, VOLUMEDOWN via key.py): speaker sink -> label "Speaker";
+`violet_hph` reloaded with `device.form_factor=headphone device.description=Headphones` -> label "Headphones".
+(First attempt failed: `sink_properties=` with spaces must be quoted `'...'` for module-alsa-sink.)
+Fix: `phone/violet-jack-watch` ensure_jack_sink loads the sink with those properties; deployed, service restarted.
+Confirmed on screen by the user 2026-11-07 (volume popup shows "Headphones" with the headset in).  Side effect of the tests: speaker sink was briefly lowered to 88/94 %, restored to 100 %.
+
+## 2026-11-07 08:1x — user clue for the link loss: it follows headset plug/unplug cycling
+
+At ~08:10:35 USB dropped right after the headset was plugged and unplugged repeatedly (user report, not yet
+reproduced by me).  The phone kept running (music playing) while USB (`error -71`, `device not accepting address`)
+and the laptop's route to it were gone, so this is not a full SoC reset in this instance - earlier uptime=0
+readings were resets, this one was not.  Hypothesis only: the jack events (MBHC/SoundWire/codec, or the
+watcher's reaction: ensure_mixers, bus-guard sudo, sink switching) disturb the USB gadget/link.  To test: with the
+crashwatch log (1 Hz, synced) read the lines around the drop; then cycle the jack while watching.
+
+## 2026-11-07 08:2x — crashwatch redone as an OpenRC service (first attempt died with the ssh session)
+
+The ssh-started logger (setsid nohup) was killed when my ssh session ended (KillUserProcesses), so it captured
+only 3 state lines and nothing about the 08:10 drop.  Redone as `/etc/init.d/violet-crashwatch`
+(`phone/violet-crashwatch.initd`), started with `rc-service violet-crashwatch start`; NOT added to a runlevel
+(user's call: no boot persistence), so it must be restarted after every reboot.  Log: `/var/log/violet-crashwatch.log`.
+
+## 2026-11-07 08:4x — crashwatch enabled at boot (user asked), size-capped
+
+User asked for it to start every boot so a future wedge is caught.  `rc-update add violet-crashwatch default`
+(init script has `need localmount`), log capped at ~16 MB with one rotated copy (`.log.1`).  The plug/unplug
+test at ~08:34 did NOT reproduce the wedge (USB stayed up, phone up 15 min).  Remove the service
+(`rc-update del violet-crashwatch; rm /etc/init.d/violet-crashwatch /usr/local/sbin/violet-crashwatch`) once the cause is found.
+
+## 2026-11-08 — first fast-charge measurement (pack at 41-42 %, Moto 68 W PD charger, 9 V/3 A contract)
+
+Phone reached over WiFi at <lan-ip> (laptop moved to <lan>.x; old <lan2>.x address was a different network). Six samples over 30 s: battery current steady **+1.994 .. +1.997 A**, vbat 4.157-4.160 V, pack 39.8 C, status Charging, `0x1006` = 3 (fast charge), `0x1061` = 0x28 (FCC 2000 mA, written by violet-qg), `0x1370` = 0x24 (ICL 1800 mA), `0x1344` = 0x02, `usb` current_max 1.8 A, tcpm psy 9.000 V / 3.000 A. The charge current is pinned to the FCC register we write (2 A), not to the input limit (9 V x 1.8 A = 16 W vs ~8.3 W into the pack), and the vendor profile allows 3 A at 15-45 C. Pack was already 39.8 C at 2 A. Not yet done: any step above 2 A (needs temperature-limited FCC like the vendor jeita-fcc-ranges: 3.0 A at 15-45 C, 1.95 A at 45-60 C, 1.17 A at 5-15 C, 0.39 A at 0-5 C).
+
+## 2026-11-08 — temperature-limited fast-charge current, 2.5 A trial
+
+`violet-qg` no longer writes a fixed FCC: `violet_fcc_target()` = min(`fcc_max_ma` module param (default 2000, runtime-writable in `/sys/module/violet_qg/parameters/`, clamped 500-3000), vendor `qcom,jeita-fcc-ranges` from the LC_M6300 profile: 0-5 C 390 mA, 5-15 C 1170 mA, 15-45 C 3000 mA, 45-60 C 1950 mA). One limit is our own and NOT vendor: pack >= 43 C caps at 2000 mA, released below 41 C (hysteresis added after the first trial flapped 2500 <-> 2000 at 42.7/43.0 C). Reason: the pack thermistor is the only thermal input wired; skin/connector sensors and the vendor thermal mitigation are not ported. Hardware JEITA from SBL still applies.
+Trial (pack 52-54 %, Moto 68 W, 9 V/3 A, `0x1061` = 0x32): battery current steady **+2.50 A** (vbat 4.22 -> 4.30 V), but pack 40.3 -> 43.0 C in ~90 s (about +1.7 C/min), at which point the 43 C cap dropped it back to 2.0 A; temperature then eased to 40.9 C at 2 A. So 2.5 A is deliverable but is not thermally sustainable from a ~40 C start with this thermistor and no airflow/skin limit; a cool pack would last longer (not measured). Default left at 2000 mA. Installed for boot (`violet-qg.ko.zst`, previous kept as `.prev-fixedfcc`). Not done: sustained run from a cool pack, 3 A, vendor thermal mitigation tables, ICL above 1.8 A.

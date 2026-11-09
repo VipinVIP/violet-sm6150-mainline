@@ -1,0 +1,336 @@
+arm64: dts: violet: microphone (LPASS LPI, SoundWire v1.5, WCD937x capture), PDR, BOB mode
+
+LPI node at 0x62b52000 with vendor SoundWire/reset pin states; WCD937x reset on LPI gpio6 (vendor
+gpio24) with a default-only pinctrl state (a 'sleep' state that drives reset low is applied by ASoC
+when the component is idle and held the codec in reset); SWRM v1.5.1; TX port map <2 3 4 5>; mic bias
+2.6 V from BOB (vendor); BOB initial mode AUTO (vendor pass-through has no mainline mode); PDR on
+q6afe/q6asm/q6adm (needs CONFIG_QCOM_PD_MAPPER=y); TX_CODEC_DMA_TX_3 capture link with vendor AMIC routing.
+
+--- a/arch/arm64/boot/dts/qcom/violet-sm6150.dts
++++ b/arch/arm64/boot/dts/qcom/violet-sm6150.dts
+@@ -645,10 +645,11 @@
+ 			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+ 		};
+ 
++		/* vendor: 3.296-3.96 V, init-mode pass-through; mainline has no PASS for BOB, AUTO is the nearest */
+ 		vreg_bob: bob {
+ 			regulator-min-microvolt = <3296000>;
+ 			regulator-max-microvolt = <3960000>;
+-			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_AUTO>;
+ 		};
+ 	};
+ };
+@@ -1081,7 +1082,8 @@
+  *   tx_macro@62ec0000 -> swr2 @ 0x62ed0000, irq SPI 137 (wake 623), rx slave 0x01170223
+  *   rx_macro@62ee0000 -> swr1 @ 0x62ef0000, irq SPI 138,            rx slave 0x01170224
+  *   wsa_macro@62f00000 -> swr0: disabled on violet (no WSA speaker amp)
+- *   wcd9375 reset = TLMM gpio 24 (vendor msm_cdc_pinctrl@24)
++ *   wcd9375 reset = LPASS LPI vendor gpio24 (msm_cdc_pinctrl@24, qcom,lpi-gpios);
++ *   SoundWire pins are LPI vendor gpio18-23 - see lpass_tlmm for the numbering
+  * ==========================================================================*/
+ 
+ &glink_edge {
+@@ -1101,14 +1103,21 @@
+ 			compatible = "qcom,q6afe";
+ 			reg = <APR_SVC_AFE>;
+ 			/*
+-			 * Upstream (and every in-tree SoC) declares
+-			 *   qcom,protection-domain = "avs/audio", "msm/adsp/audio_pd";
+-			 * here.  Adding it on violet makes q6afe defer forever: the PD
+-			 * is never registered because there is no QRTR/servreg (see
+-			 * docs/PROGRESS.md 14:40 and 15:40).  Without the property the
+-			 * card and its PCMs come up; the AFE commands time out anyway.
+-			 * Restore the property the moment PDR resolves.
++			 * PDR: APR adds the AFE/ASM/ADM services only once the ADSP
++			 * audio PD reports UP (pd-mapper qcs615 table, instance 74).
++			 * Without it va_macro probed against a not-yet-ready AFE at
++			 * boot and failed its first clock set (DSP error 0x16).
++			 */
++			/*
++			 * PDR: APR adds the AFE/ASM/ADM services only once the ADSP
++			 * audio PD reports UP (pd-mapper qcs615 table, instance 74), so
++			 * va_macro's clock set and the LPI core vote no longer race the
++			 * DSP (error 0x16). Needs pd-mapper built in: as a module it
++			 * could load after the modem booted, and the modem then hit
++			 * "fatal error" every 40 s (upstream: "remoteproc: qcom_common:
++			 * load pd_mapper before booting the DSP").
+ 			 */
++			qcom,protection-domain = "avs/audio", "msm/adsp/audio_pd";
+ 
+ 			q6afedai: dais {
+ 				compatible = "qcom,q6afe-dais";
+@@ -1126,7 +1135,7 @@
+ 		q6asm: service@7 {
+ 			compatible = "qcom,q6asm";
+ 			reg = <APR_SVC_ASM>;
+-			/* qcom,protection-domain: see q6afe note — PDR unavailable. */
++			qcom,protection-domain = "avs/audio", "msm/adsp/audio_pd";
+ 
+ 			q6asmdai: dais {
+ 				compatible = "qcom,q6asm-dais";
+@@ -1161,6 +1170,7 @@
+ 		q6adm: service@8 {
+ 			compatible = "qcom,q6adm";
+ 			reg = <APR_SVC_ADM>;
++			qcom,protection-domain = "avs/audio", "msm/adsp/audio_pd";
+ 
+ 			q6routing: routing {
+ 				compatible = "qcom,q6adm-routing";
+@@ -1222,39 +1232,108 @@
+ 		clock-output-names = "lpass-tx-mclk";
+ 	};
+ 
++	/*
++	 * LPASS LPI TLMM, AP-owned half. Vendor pads 0-17 (0x62b40000 +
++	 * 0x12000) belong to the SSC and stall the AP if touched, so the node
++	 * starts at vendor pad 18: gpio0..13 here = vendor gpio18..31 (as the
++	 * sm7150-mainline port does). Reachable only while the ADSP holds the
++	 * LPASS core (MACRO, block 3) vote - DCODEC is refused by this firmware.
++	 */
++	lpass_tlmm: pinctrl@62b52000 {
++		compatible = "qcom,sm6150-lpass-lpi-pinctrl";
++		reg = <0x0 0x62b52000 0x0 0xe000>;
++		clocks = <&q6afecc LPASS_HW_MACRO_VOTE LPASS_CLK_ATTRIBUTE_COUPLE_NO>;
++		clock-names = "core";
++		gpio-controller;
++		#gpio-cells = <2>;
++		gpio-ranges = <&lpass_tlmm 0 0 14>;
++
++		tx_swr_active: tx-swr-active-state {
++			clk-pins {
++				pins = "gpio0";
++				function = "swr_tx_clk";
++				drive-strength = <8>;
++				bias-bus-hold;
++			};
++
++			data1-pins {
++				pins = "gpio1";
++				function = "swr_tx_data";
++				drive-strength = <8>;
++				bias-bus-hold;
++			};
++
++			data2-pins {
++				pins = "gpio2";
++				function = "swr_tx_data";
++				drive-strength = <8>;
++				bias-bus-hold;
++			};
++		};
++
++		rx_swr_active: rx-swr-active-state {
++			clk-pins {
++				pins = "gpio3";
++				function = "swr_rx_clk";
++				drive-strength = <8>;
++				bias-bus-hold;
++			};
++
++			data-pins {
++				pins = "gpio4", "gpio5";
++				function = "swr_rx_data";
++				drive-strength = <8>;
++				bias-bus-hold;
++			};
++		};
++
++		/* vendor msm_cdc_pinctrl@24 = LPI gpio24 = gpio6 here */
++		wcd937x_reset_active: wcd937x-reset-active-state {
++			pins = "gpio6";
++			function = "gpio";
++			drive-strength = <16>;
++			bias-disable;
++			output-high;
++		};
++	};
++
+ 	swr2: soundwire@62ed0000 {
+-		compatible = "qcom,soundwire-v1.3.0";
++		compatible = "qcom,soundwire-v1.5.1";
+ 		reg = <0x0 0x62ed0000 0x0 0x2000>;
+ 		interrupts = <GIC_SPI 137 IRQ_TYPE_LEVEL_HIGH 0>;
+ 		clocks = <&txmacro>;
+ 		clock-names = "iface";
+ 		label = "TX";
++		pinctrl-0 = <&tx_swr_active>;
++		pinctrl-names = "default";
+ 
+ 		#address-cells = <2>;
+ 		#size-cells = <0>;
+ 		#sound-dai-cells = <1>;
+ 
+-		qcom,din-ports = <6>;
+-		qcom,dout-ports = <1>;
+ 		/*
+-		 * Port timing from Android's tx_frame_params_wcd937x - the WCD937x
+-		 * TX table differs from the WCD938x one (si 3 instead of 31).
+-		 */
+-		qcom,ports-sinterval-low =	/bits/ 8 <0xff 0x03 0x03 0x03 0x03 0xff 0xff>;
+-		qcom,ports-offset1 =	/bits/ 8 <0xff 0x01 0x02 0x01 0x00 0xff 0xff>;
+-		qcom,ports-offset2 =	/bits/ 8 <0xff 0x00 0x00 0x00 0x00 0xff 0xff>;
+-		qcom,ports-lane-control =	/bits/ 8 <0xff 0x00 0x00 0x00 0x00 0xff 0xff>;
+-		qcom,ports-word-length =	/bits/ 8 <0xff 0xff 0xff 0xff 0xff 0xff 0xff>;
+-		qcom,ports-block-pack-mode =	/bits/ 8 <0xff 0xff 0xff 0xff 0xff 0xff 0xff>;
+-		qcom,ports-hstart =	/bits/ 8 <0xff 0xff 0xff 0xff 0xff 0xff 0xff>;
+-		qcom,ports-hstop =	/bits/ 8 <0xff 0xff 0xff 0xff 0xff 0xff 0xff>;
+-		qcom,ports-block-group-count =	/bits/ 8 <0xff 0xff 0xff 0xff 0xff 0xff 0xff>;
++		 * The controller reports version 0x01050000 (SWRM v1.5.0), not
++		 * v1.3.0. Ports and timing as the sm7150-mainline port (same
++		 * LPASS), from the downstream sm6150 tables: 5 TX ports.
++		 */
++		qcom,din-ports = <5>;
++		qcom,dout-ports = <0>;
++		qcom,ports-sinterval-low =	/bits/ 8 <0x01 0x03 0x03 0x03 0x03>;
++		qcom,ports-offset1 =		/bits/ 8 <0x00 0x00 0x00 0x00 0x00>;
++		qcom,ports-offset2 =		/bits/ 8 <0x00 0x00 0x00 0x00 0x00>;
++		qcom,ports-hstart =		/bits/ 8 <0xff 0xff 0xff 0xff 0xff>;
++		qcom,ports-hstop =		/bits/ 8 <0xff 0xff 0xff 0xff 0xff>;
++		qcom,ports-word-length =	/bits/ 8 <0xff 0xff 0xff 0xff 0xff>;
++		qcom,ports-block-pack-mode =	/bits/ 8 <0xff 0xff 0xff 0xff 0xff>;
++		qcom,ports-block-group-count =	/bits/ 8 <0xff 0xff 0xff 0xff 0xff>;
++		qcom,ports-lane-control =	/bits/ 8 <0x01 0x01 0x01 0x01 0x01>;
+ 
+ 		wcd937x_tx: codec@0,3 {
+ 			compatible = "sdw20217010a00";
+ 			reg = <0 3>;
+ 			#sound-dai-cells = <0>;
+-			qcom,tx-port-mapping = <1 1 2 3>;
++			/* vendor qcom,swr-port-mapping: WCD TX ports 1-4 on master ports 2-5 */
++			qcom,tx-port-mapping = <2 3 4 5>;
+ 			/* slave ports: adc1, adc2, adc3, mic0, dmic1, mbhc,
+ 			 * dmic2, dmic3, dmic4, dmic5, dmic6, dmic7
+ 			 */
+@@ -1284,35 +1363,31 @@
+ 	};
+ 
+ 	swr1: soundwire@62ef0000 {
+-		compatible = "qcom,soundwire-v1.3.0";
++		compatible = "qcom,soundwire-v1.5.1";
+ 		reg = <0x0 0x62ef0000 0x0 0x2000>;
+ 		interrupts = <GIC_SPI 138 IRQ_TYPE_LEVEL_HIGH 0>;
+ 		clocks = <&rxmacro>;
+ 		clock-names = "iface";
+ 		label = "RX";
++		pinctrl-0 = <&rx_swr_active>;
++		pinctrl-names = "default";
+ 
+ 		#address-cells = <2>;
+ 		#size-cells = <0>;
+ 		#sound-dai-cells = <1>;
+ 
+-		qcom,din-ports = <1>;
+-		qcom,dout-ports = <6>;
+-		/*
+-		 * Port timing from the Android kona tables (kona-port-config.h
+-		 * rx_frame_params_default) that the FP4 mainline bring-up used.
+-		 * nports = din + dout = 7 on this master, so each array needs 7
+-		 * entries - the driver indexes one byte per port and the two
+-		 * unconfigured ports made the bus clash (MASTER_CLASH_DET).
+-		 */
+-		qcom,ports-sinterval-low =	/bits/ 8 <0x03 0x1f 0x1f 0x07 0x00 0xff 0xff>;
+-		qcom,ports-offset1 =	/bits/ 8 <0x00 0x00 0x0b 0x01 0x00 0xff 0xff>;
+-		qcom,ports-offset2 =	/bits/ 8 <0x00 0x00 0x0b 0x00 0x00 0xff 0xff>;
+-		qcom,ports-hstart =	/bits/ 8 <0xff 0x03 0xff 0xff 0xff 0xff 0xff>;
+-		qcom,ports-hstop =	/bits/ 8 <0xff 0x06 0xff 0xff 0xff 0xff 0xff>;
+-		qcom,ports-word-length =	/bits/ 8 <0x01 0x07 0x04 0xff 0xff 0xff 0xff>;
+-		qcom,ports-block-pack-mode =	/bits/ 8 <0xff 0x00 0x01 0xff 0xff 0xff 0xff>;
+-		qcom,ports-lane-control =	/bits/ 8 <0x01 0x00 0x00 0x00 0x00 0xff 0xff>;
+-		qcom,ports-block-group-count =	/bits/ 8 <0xff 0xff 0xff 0xff 0x00 0xff 0xff>;
++		/* SWRM v1.5.0; 5 RX ports, tables as sm7150-mainline (same LPASS) */
++		qcom,din-ports = <0>;
++		qcom,dout-ports = <5>;
++		qcom,ports-sinterval-low =	/bits/ 8 <0x03 0x3f 0x1f 0x03 0x03>;
++		qcom,ports-offset1 =		/bits/ 8 <0x00 0x00 0x0b 0x01 0x01>;
++		qcom,ports-offset2 =		/bits/ 8 <0x00 0x00 0x0b 0x00 0x00>;
++		qcom,ports-hstart =		/bits/ 8 <0xff 0x03 0xff 0xff 0xff>;
++		qcom,ports-hstop =		/bits/ 8 <0xff 0x06 0xff 0xff 0xff>;
++		qcom,ports-word-length =	/bits/ 8 <0x01 0x07 0x04 0xff 0xff>;
++		qcom,ports-block-pack-mode =	/bits/ 8 <0xff 0x00 0x01 0xff 0xff>;
++		qcom,ports-block-group-count =	/bits/ 8 <0xff 0xff 0xff 0xff 0x00>;
++		qcom,ports-lane-control =	/bits/ 8 <0x01 0x00 0x00 0x00 0x00>;
+ 
+ 		wcd937x_rx: codec@0,4 {
+ 			compatible = "sdw20217010a00";
+@@ -1330,17 +1405,29 @@
+ &{/} {
+ 	wcd9370: audio-codec {
+ 		compatible = "qcom,wcd9370-codec";
+-		reset-gpios = <&tlmm 24 GPIO_ACTIVE_LOW>;
++		reset-gpios = <&lpass_tlmm 6 GPIO_ACTIVE_LOW>;
++		/*
++		 * Only a "default" state: ASoC selects a component's "sleep"
++		 * pinctrl state whenever it is inactive (end of card
++		 * instantiation, PCM close), and a sleep state that drives the
++		 * reset line low holds the codec in reset - both SoundWire
++		 * slaves dropped off the bus the instant the card registered.
++		 * Reset is the driver's job, through reset-gpios.
++		 */
++		pinctrl-0 = <&wcd937x_reset_active>;
++		pinctrl-names = "default";
+ 
+ 		vdd-buck-supply = <&vreg_l15a_1p8>;
+ 		vdd-rxtx-supply = <&vreg_l10a_1p8>;
+ 		vdd-px-supply = <&vreg_l10a_1p8>;
+-		vdd-mic-bias-supply = <&vreg_l10c_3p3>;
++		/* vendor: cdc-vdd-mic-bias-supply = BOB, cdc-micbias1..3-mv = 2600 */
++		vdd-mic-bias-supply = <&vreg_bob>;
+ 
+-		qcom,micbias1-microvolt = <1800000>;
+-		qcom,micbias2-microvolt = <1800000>;
+-		qcom,micbias3-microvolt = <1800000>;
+-		qcom,micbias4-microvolt = <1800000>;
++		qcom,micbias1-microvolt = <2600000>;
++		qcom,micbias2-microvolt = <2600000>;
++		qcom,micbias3-microvolt = <2600000>;
++		qcom,mbhc-buttons-vthreshold-microvolt = <75000 150000 237000 500000
++							  500000 500000 500000 500000>;
+ 
+ 		qcom,rx-device = <&wcd937x_rx>;
+ 		qcom,tx-device = <&wcd937x_tx>;
+@@ -1366,6 +1453,13 @@
+ 		pinctrl-names = "default";
+ 		pinctrl-0 = <&mi2s1_pins>;
+ 
++		/* vendor qcom,audio-routing for the analog mics */
++		audio-routing = "AMIC1", "MIC BIAS1",
++				"AMIC2", "MIC BIAS2",
++				"AMIC3", "MIC BIAS3",
++				"TX SWR_ADC0", "ADC1_OUTPUT",
++				"TX SWR_ADC2", "ADC2_OUTPUT";
++
+ 		#address-cells = <1>;
+ 		#size-cells = <0>;
+ 
+@@ -1404,6 +1498,19 @@
+ 		 * noise through the speaker amp, which is plain I2S off the
+ 		 * LPASS primary MI2S and needs none of that machinery.
+ 		 */
++		mic-capture-dai-link {
++			link-name = "WCD937x Capture";
++			cpu {
++				sound-dai = <&q6afedai TX_CODEC_DMA_TX_3>;
++			};
++			platform {
++				sound-dai = <&q6routing>;
++			};
++			codec {
++				sound-dai = <&wcd9370 1>, <&swr2 0>, <&txmacro 0>;
++			};
++		};
++
+ 		spk-playback-dai-link {
+ 			link-name = "Speaker Playback";
+ 			cpu {
+@@ -1544,6 +1651,10 @@
+ 		reg = <QUATERNARY_MI2S_RX>;
+ 		qcom,sd-lines = <0>;
+ 	};
++
++	dai@120 {
++		reg = <TX_CODEC_DMA_TX_3>;
++	};
+ };
+ 
+ 

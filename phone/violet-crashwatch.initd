@@ -1,0 +1,11 @@
+#!/sbin/openrc-run
+name="violet crashwatch"
+description="DEBUG: 1 Hz power/USB-C/thermal + kernel log synced to flash, to catch the reset/link-loss"
+
+command="/usr/local/sbin/violet-crashwatch"
+command_background="yes"
+pidfile="/run/${RC_SVCNAME}.pid"
+
+depend() {
+	need localmount
+}

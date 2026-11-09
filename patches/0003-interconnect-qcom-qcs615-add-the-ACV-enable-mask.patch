@@ -1,4 +1,4 @@
-From: VipinVIP <VipinVIP@users.noreply.github.com>
+From: VipinVIP <vipindotkp@gmail.com>
 Subject: [PATCH] interconnect: qcom: qcs615: add the missing ACV enable_mask
 
 The ACV BCM needs enable_mask = 0x8 (the vote downstream sends is 0x60000008); without it

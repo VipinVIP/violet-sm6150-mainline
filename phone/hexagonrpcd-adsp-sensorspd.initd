@@ -1,0 +1,32 @@
+#!/sbin/openrc-run
+
+supervisor=supervise-daemon
+name="Hexagonrpcd ADSP SensorPD"
+description="Daemon to support Qualcomm Hexagon ADSP virtual filesystem for SensorPD"
+
+command=/usr/bin/hexagonrpcd
+command_user=root:root   # violet: /dev/fastrpc-adsp-secure is 0600 root; fastrpc group is not enough
+
+# 2026-11-02: a hexagonrpcd that is inside a FastRPC call when the ADSP stops answering does
+# not leave on SIGTERM.  supervise-daemon's default schedule is SIGTERM/5, so `rc-service stop`
+# (and therefore OpenRC at shutdown, and the elogind pre-sleep hook) waits on it forever.
+# Escalate explicitly.  `rc-service stop` itself waits for the *supervisor* with no timeout of
+# its own (supervise-daemon.c, --stop branch), so this schedule is the only bound there is.
+retry="SIGTERM/3/SIGKILL/2"
+
+# Implement some conf loading heirarchy where the fw path is loaded from these
+# locations in order of precedence:
+# 1) /etc/conf.d/$RC_SVCNAME
+# 2) /usr/share/hexagonrpcd/$RC_SVCNAME".conf
+# If neither sets hexagonrpcd_fw_dir, leave it unset and let hexagonrpcd guess
+# the firmware directory path.
+if [ -z "$hexagonrpcd_fw_dir" ]; then
+	# note: /etc/conf.d is sourced automatically by openrc, so if the var is empty
+	# here then that conf doesn't exist
+	[ -f "/usr/share/hexagonrpcd/$RC_SVCNAME".conf ] && . "/usr/share/hexagonrpcd/$RC_SVCNAME".conf
+fi
+
+command_args="-f ${hexagonrpcd_dev:-/dev/fastrpc-adsp-secure} -d adsp -s"
+if [ -n "$hexagonrpcd_fw_dir" ]; then
+    command_args="$command_args -R ${hexagonrpcd_fw_dir}"
+fi

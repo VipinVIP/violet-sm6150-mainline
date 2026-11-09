@@ -1,4 +1,4 @@
-From: VipinVIP <VipinVIP@users.noreply.github.com>
+From: Vipin <vipindotkp@gmail.com>
 Subject: [PATCH] clk: qcom: dispcc-qcs615: fix GDSC mode and keep XO clock on
 
 Wire up the DISP_CC GDSC (drop HW_CTRL, which makes the domain collapse when MDSS idles) and keep DISP_CC_XO_CLK always on, so the MDSS/DSI registers stay accessible during probe.

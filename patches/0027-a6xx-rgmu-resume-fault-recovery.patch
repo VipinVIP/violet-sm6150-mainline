@@ -1,0 +1,76 @@
+drm/msm/a6xx: recover an RGMU fault on resume like downstream; return -EAGAIN
+
+If GX still does not come up: halt the PCC, fence to allow, force GX off, power-cycle CX with
+the clocks and cold-boot the RGMU once more (downstream rgmu_start() in the RESET state).
+On a second failure return -EAGAIN, so the runtime-PM core does not latch power.runtime_error
+(which fails every later resume until reboot).
+
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
+@@ -2423,6 +2423,25 @@
+ 	return 0;
+ }
+ 
++/*
++ * RGMU fault reset, downstream's a6xx_rgmu_halt_execution() + GMU_SUSPEND:
++ * halt the PCC, put the AHB fence back in allow mode, and take the GX GDSC
++ * over from the CPU so it really ends up off. Clocks must still be on.
++ */
++static void a6xx_rgmu_fault_reset(struct a6xx_gpu *a6xx_gpu)
++{
++	struct a6xx_gmu *gmu = &a6xx_gpu->gmu;
++
++	gmu_write(gmu, RGMU_GMU2HOST_INTR_MASK, 0xffffffff);
++	gmu_write(gmu, RGMU_AO_HOST_INTR_MASK, 0xffffffff);
++	gmu_write(gmu, RGMU_PCC_CTRL, 0);
++	gmu_write(gmu, RGMU_AO_AHB_FENCE_CTRL, 0);
++	wmb();
++
++	pm_runtime_resume_and_get(gmu->gxpd);
++	pm_runtime_put_sync(gmu->gxpd);
++}
++
+ /* Called with the GBIF still running (GX collapse needs it), before the clocks go away */
+ static void a6xx_rgmu_stop(struct a6xx_gpu *a6xx_gpu)
+ {
+@@ -2522,9 +2541,40 @@
+ 
+ 	if (adreno_has_rgmu(adreno_gpu)) {
+ 		ret = a6xx_rgmu_start(a6xx_gpu);
++		if (ret == -ETIMEDOUT) {
++			/*
++			 * GX did not come up. Recover the way downstream does after a
++			 * GMU fault (rgmu_start() in the RESET state): halt the RGMU,
++			 * force GX off, power-cycle CX with the clocks, cold-boot again.
++			 */
++			DRM_DEV_ERROR(gmu->dev, "RGMU fault on resume, power-cycling and retrying\n");
++			a6xx_rgmu_fault_reset(a6xx_gpu);
++			clk_bulk_disable_unprepare(gmu->nr_clocks, gmu->clocks);
++			clk_bulk_disable_unprepare(gpu->nr_clocks, gpu->grp_clks);
++			pm_runtime_put_sync(gmu->dev);
++
++			pm_runtime_resume_and_get(gmu->dev);
++			ret = clk_bulk_prepare_enable(gpu->nr_clocks, gpu->grp_clks);
++			if (ret)
++				goto err_bulk_clk;
++			ret = clk_bulk_prepare_enable(gmu->nr_clocks, gmu->clocks);
++			if (ret) {
++				clk_bulk_disable_unprepare(gpu->nr_clocks, gpu->grp_clks);
++				goto err_bulk_clk;
++			}
++			ret = a6xx_rgmu_start(a6xx_gpu);
++		}
+ 		if (ret) {
++			a6xx_rgmu_fault_reset(a6xx_gpu);
+ 			clk_bulk_disable_unprepare(gmu->nr_clocks, gmu->clocks);
+ 			clk_bulk_disable_unprepare(gpu->nr_clocks, gpu->grp_clks);
++			/*
++			 * -EAGAIN keeps the runtime PM core from latching
++			 * power.runtime_error, which would fail every later resume
++			 * until reboot; the next user retries a clean cold boot.
++			 */
++			if (ret == -ETIMEDOUT)
++				ret = -EAGAIN;
+ 		}
+ 	}
+ 

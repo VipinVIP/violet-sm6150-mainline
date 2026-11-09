@@ -1,0 +1,125 @@
+#!/bin/sh
+# violet-hph - MANUAL DEBUG TOOL.  Normal use is automatic: the UCM profile (phone/ucm2/Xiaomi/violet) + the "Headphone Jack" jack control make PulseAudio switch.
+# Routes playback to the 3.5 mm jack (WCD9375 HPHL/HPHR) or back to the speaker by hand.
+#
+# Audio path: MultiMedia3 -> RX_CODEC_DMA_RX_0 -> rx_macro -> SoundWire RX (swr1)
+#             -> WCD9375 HPHL/HPHR.  The desktop's PulseAudio sink (violet_speaker,
+#             module-alsa-sink on hw:0,2) feeds MultiMedia3, so switching this route
+#             switches every application, live, without restarting anything.
+#
+# THE COMPANDERS MUST STAY OFF.  With HPHL_COMP/HPHR_COMP on, the compander expects
+# its control stream on SoundWire data port 3, which a 2-channel stream does not
+# carry, so the DAC output is gated: the jack only clicks.  Turning them off is the
+# single difference between silence and sound on this device.
+#
+# Usage:
+#   violet-hph            -> route to the jack (codec at full scale)
+#   violet-hph jack [N]   -> same; N = 0..100 sets the PulseAudio sink volume (optional)
+#   violet-hph speaker    -> route back to the speaker
+#   violet-hph status     -> show the relevant controls
+set -u
+CARD=${CARD:-0}
+ACT=${1:-jack}
+PVOL=${2:-}
+
+# These routing controls are rejected by `cset name=`, so resolve name -> numid.
+sink_name() { pactl list sinks short 2>/dev/null | awk 'NR==1{print $2}'; }
+
+# One sink serves both routes, but the speaker and the jack need very different
+# levels (the jack is ~14 dB hotter for the same setting).  Remember one volume per
+# route in the runtime dir, so switching does not blast the earphones or whisper on
+# the speaker.
+VOLSTORE=${VOLSTORE:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/violet-audio-vol}
+CONF=${CONF:-/etc/violet-audio.conf}
+
+# Defaults, overridden by CONF.
+jack_volume=100
+speaker_volume=100
+jack_hph_gain=12
+jack_digital_volume=94
+[ -r "$CONF" ] && . "$CONF"
+route_volume() { # $1 = route now being left, $2 = route being entered
+	s=$(sink_name); [ -n "${s:-}" ] || return 0
+	cur=$(pactl get-sink-volume "$s" 2>/dev/null | sed -n 's/.*\/ *\([0-9]*\)%.*/\1/p' | head -1)
+	[ -n "${cur:-}" ] && echo "$1=$cur" >> "$VOLSTORE" 2>/dev/null
+	want=$(sed -n "s/^$2=//p" "$VOLSTORE" 2>/dev/null | tail -1)
+	case "$2" in
+	jack)    want=${want:-$jack_volume} ;;
+	speaker) want=${want:-$speaker_volume} ;;
+	esac
+	pactl set-sink-volume "$s" "${want}%" 2>/dev/null && \
+		printf '%s: sink volume -> %s%% (%s)\n' "$(date +%H:%M:%S)" "$want" "$2"
+}
+
+setctl() {
+	n=$(amixer -D "hw:$CARD" controls 2>/dev/null \
+		| sed -n "s/^numid=\([0-9]*\),.*name='$1'\$/\1/p" | head -1)
+	[ -n "${n:-}" ] || { echo "violet-hph: no control '$1'" >&2; return 1; }
+	amixer -D "hw:$CARD" -q cset "numid=$n" "$2" >/dev/null
+}
+vol() { # $1 = control name, $2 = value
+	amixer -D "hw:$CARD" -q cset name="$1" "$2" >/dev/null 2>&1 || echo "violet-hph: volume '$1' failed" >&2
+}
+
+route_jack() {
+	setctl 'PRI_MI2S_RX Audio Mixer MultiMedia4' 0		# speaker data path off
+	setctl 'RX_CODEC_DMA_RX_0 Audio Mixer MultiMedia4' 1	# jack data path on
+	setctl 'RX_MACRO RX0 MUX' AIF1_PB
+	setctl 'RX_MACRO RX1 MUX' AIF1_PB
+	setctl 'RX INT0_1 MIX1 INP0' RX0
+	setctl 'RX INT1_1 MIX1 INP0' RX1
+	setctl 'RX INT0 DEM MUX' CLSH_DSM_OUT
+	setctl 'RX INT1 DEM MUX' CLSH_DSM_OUT
+	setctl 'RX_HPH PWR Mode' LOHIFI
+	setctl 'RX HPH Mode' CLS_H_LOHIFI
+	setctl 'RX_COMP1 Switch' 0
+	setctl 'RX_COMP2 Switch' 0
+	setctl 'HPHL_COMP Switch' 0
+	setctl 'HPHR_COMP Switch' 0
+	setctl 'HPHL_RDAC Switch' 1
+	setctl 'HPHR_RDAC Switch' 1
+	setctl 'HPHL Switch' 1
+	setctl 'HPHR Switch' 1
+	# full scale: HPH 20/20, RX digital 84 = 0 dB (range -84..+40 dB, raw 0..124; 124 is +40 dB and clips).  Verified by ear and by
+	# recording the earbud with the phone's own mic (see docs/PROGRESS.md 2026-11-05).
+	# Headphone maximum, from /etc/violet-audio.conf.  The slider stays at 100 %
+	# and the codec sets the ceiling, so "full bar" is the loudest you want.
+	vol 'HPHL Volume' "$jack_hph_gain"
+	vol 'HPHR Volume' "$jack_hph_gain"
+	vol 'RX_RX0 Digital Volume' "$jack_digital_volume"
+	vol 'RX_RX1 Digital Volume' "$jack_digital_volume"
+}
+
+route_speaker() {
+	setctl 'RX_CODEC_DMA_RX_0 Audio Mixer MultiMedia4' 0
+	setctl 'PRI_MI2S_RX Audio Mixer MultiMedia4' 1
+}
+
+sink_volume() { # $1 = percent
+	uid=$(id -u)
+	XDG_RUNTIME_DIR=/run/user/"$uid" pactl set-sink-volume violet_speaker "$1%" 2>/dev/null &&
+		echo "violet-hph: pulseaudio sink -> $1%"
+}
+
+getv() { amixer -D "hw:$CARD" cget name="$1" 2>/dev/null | sed -n 's/^ *: values=//p' | head -1; }
+
+status() {
+	for c in 'PRI_MI2S_RX Audio Mixer MultiMedia4' 'RX_CODEC_DMA_RX_0 Audio Mixer MultiMedia4' \
+		 'HPHL Switch' 'HPHL_COMP Switch' 'Headphone Jack' 'MBHC Switch' \
+		 'HPHL Volume' 'RX_RX0 Digital Volume'; do
+		printf '%-42s %s\n' "$c" "$(getv "$c")"
+	done
+}
+
+case "$ACT" in
+jack)
+	route_volume speaker jack
+	route_jack || exit 1
+	[ -n "$PVOL" ] && sink_volume "$PVOL"
+	echo "violet-hph: 3.5 mm jack (speaker muted)";;
+speaker)
+	route_volume jack speaker
+	route_speaker && echo "violet-hph: speaker";;
+status)	status;;
+*)	echo "usage: violet-hph [jack [N]|speaker|status]" >&2; exit 2;;
+esac

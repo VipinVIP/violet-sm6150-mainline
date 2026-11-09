@@ -1,0 +1,127 @@
+net: qrtr: smd: do not drop packets received before probe completes
+
+The rpmsg core installs the endpoint callback before ->probe(), and glink completes (RX_DONE) a packet whatever the callback returns, so a packet that arrives before probe has set drvdata (callback returned -EAGAIN) is lost. The sm6150 modem sends exactly one QRTR HELLO right after opening IPCRTR and then waits; losing it means the modem never registers and asserts "fatal error without message" 40 s later (~1 boot in 3). Queue early packets and replay them in order, under the same lock the callback uses, once the endpoint is registered.
+
+Verified on #184: trace showed the single 52 B HELLO delivered by glink but no "hello from 0" in the name service and no reply; with this patch the early path fired ("queued 52 B received before probe" at 27.94 s), the modem registered 55 services by 40 s, wlan0 was up 5 s later, no fatal.
+
+--- a/net/qrtr/smd.c
++++ b/net/qrtr/smd.c
+@@ -7,6 +7,8 @@
+ #include <linux/module.h>
+ #include <linux/skbuff.h>
+ #include <linux/rpmsg.h>
++#include <linux/slab.h>
++#include <linux/spinlock.h>
+ 
+ #include "qrtr.h"
+ 
+@@ -16,15 +18,64 @@
+ 	struct device *dev;
+ };
+ 
++/*
++ * The rpmsg core installs the endpoint callback before ->probe() runs, and the
++ * transport (glink) completes a packet as soon as the callback returns, whatever
++ * it returns.  A remote that sends right after opening the channel therefore
++ * loses that packet if it lands before probe has set drvdata.  The sm6150 modem
++ * sends exactly one QRTR HELLO and then waits for the answer, so losing it means
++ * it never registers and asserts 40 s later ("fatal error without message").
++ * Keep such early packets and replay them, in order, once the endpoint exists.
++ */
++struct qrtr_smd_early {
++	struct list_head node;
++	struct rpmsg_device *rpdev;
++	size_t len;
++	u8 data[];
++};
++
++static LIST_HEAD(qrtr_smd_early_list);
++static DEFINE_SPINLOCK(qrtr_smd_early_lock);
++
++static void qrtr_smd_early_free(struct rpmsg_device *rpdev)
++{
++	struct qrtr_smd_early *e, *tmp;
++	unsigned long flags;
++
++	spin_lock_irqsave(&qrtr_smd_early_lock, flags);
++	list_for_each_entry_safe(e, tmp, &qrtr_smd_early_list, node) {
++		if (e->rpdev == rpdev) {
++			list_del(&e->node);
++			kfree(e);
++		}
++	}
++	spin_unlock_irqrestore(&qrtr_smd_early_lock, flags);
++}
++
+ /* from smd to qrtr */
+ static int qcom_smd_qrtr_callback(struct rpmsg_device *rpdev,
+ 				  void *data, int len, void *priv, u32 addr)
+ {
+-	struct qrtr_smd_dev *qdev = dev_get_drvdata(&rpdev->dev);
++	struct qrtr_smd_dev *qdev;
++	struct qrtr_smd_early *e;
++	unsigned long flags;
+ 	int rc;
+ 
+-	if (!qdev)
+-		return -EAGAIN;
++	spin_lock_irqsave(&qrtr_smd_early_lock, flags);
++	qdev = dev_get_drvdata(&rpdev->dev);
++	if (!qdev) {
++		e = kmalloc(struct_size(e, data, len), GFP_ATOMIC);
++		if (e) {
++			e->rpdev = rpdev;
++			e->len = len;
++			memcpy(e->data, data, len);
++			list_add_tail(&e->node, &qrtr_smd_early_list);
++			dev_info(&rpdev->dev, "queued %d B received before probe\n", len);
++		}
++		spin_unlock_irqrestore(&qrtr_smd_early_lock, flags);
++		return e ? 0 : -ENOMEM;
++	}
++	spin_unlock_irqrestore(&qrtr_smd_early_lock, flags);
+ 
+ 	rc = qrtr_endpoint_post(&qdev->ep, data, len);
+ 	if (rc == -EINVAL) {
+@@ -58,7 +109,9 @@
+ 
+ static int qcom_smd_qrtr_probe(struct rpmsg_device *rpdev)
+ {
++	struct qrtr_smd_early *e, *tmp;
+ 	struct qrtr_smd_dev *qdev;
++	unsigned long flags;
+ 	int rc;
+ 
+ 	qdev = devm_kzalloc(&rpdev->dev, sizeof(*qdev), GFP_KERNEL);
+@@ -70,10 +123,22 @@
+ 	qdev->ep.xmit = qcom_smd_qrtr_send;
+ 
+ 	rc = qrtr_endpoint_register(&qdev->ep, QRTR_EP_NID_AUTO);
+-	if (rc)
++	if (rc) {
++		qrtr_smd_early_free(rpdev);
+ 		return rc;
++	}
+ 
++	/* replay what arrived before the endpoint existed, then go live (same lock as the callback) */
++	spin_lock_irqsave(&qrtr_smd_early_lock, flags);
++	list_for_each_entry_safe(e, tmp, &qrtr_smd_early_list, node) {
++		if (e->rpdev != rpdev)
++			continue;
++		qrtr_endpoint_post(&qdev->ep, e->data, e->len);
++		list_del(&e->node);
++		kfree(e);
++	}
+ 	dev_set_drvdata(&rpdev->dev, qdev);
++	spin_unlock_irqrestore(&qrtr_smd_early_lock, flags);
+ 
+ 	dev_dbg(&rpdev->dev, "Qualcomm SMD QRTR driver probed\n");
+ 
+@@ -87,6 +152,7 @@
+ 	qrtr_endpoint_unregister(&qdev->ep);
+ 
+ 	dev_set_drvdata(&rpdev->dev, NULL);
++	qrtr_smd_early_free(rpdev);
+ }
+ 
+ static const struct rpmsg_device_id qcom_smd_qrtr_smd_match[] = {

@@ -1,0 +1,442 @@
+--- a/drivers/net/wireless/ath/ath10k/mac.c
++++ b/drivers/net/wireless/ath/ath10k/mac.c
+@@ -12,6 +12,7 @@
+ #include <net/cfg80211.h>
+ #include <net/mac80211.h>
+ #include <linux/etherdevice.h>
++#include <linux/hex.h>
+ #include <linux/acpi.h>
+ #include <linux/of.h>
+ #include <linux/bitfield.h>
+@@ -732,6 +733,77 @@
+ 	}
+ }
+ 
++/*
++ * violet: create a self peer (peer type DEFAULT, the vdev's own MAC) for station
++ * vdevs too.  The WCN3990 HL3.x firmware rejects the station vdev start
++ * ("vdev-start-response reports status error: -1") without it; Qualcomm's own
++ * host driver creates one for every vdev.
++ */
++static unsigned int violet_sta_self_peer = 3;
++module_param(violet_sta_self_peer, uint, 0644);
++
++static char *violet_peer_mac;
++module_param(violet_peer_mac, charp, 0644);
++
++static const u8 *violet_peer_addr(struct ieee80211_vif *vif)
++{
++	static u8 a[ETH_ALEN];
++
++	if (violet_peer_mac && mac_pton(violet_peer_mac, a))
++		return a;
++	return vif->addr;
++}
++
++static bool violet_blind_peer(struct ath10k_vif *arvif)
++{
++	return violet_sta_self_peer == 2 && arvif->vdev_type == WMI_VDEV_TYPE_STA &&
++	       arvif->vdev_subtype == WMI_VDEV_SUBTYPE_NONE;
++}
++
++static bool violet_self_peer(struct ath10k_vif *arvif)
++{
++	if (arvif->vdev_type == WMI_VDEV_TYPE_AP ||
++	    arvif->vdev_type == WMI_VDEV_TYPE_IBSS)
++		return true;
++
++	return violet_sta_self_peer == 1 && arvif->vdev_type == WMI_VDEV_TYPE_STA &&
++	       arvif->vdev_subtype == WMI_VDEV_SUBTYPE_NONE;
++}
++
++static bool violet_early_peer_on(struct ieee80211_vif *vif)
++{
++	return violet_sta_self_peer == 3 && vif->type == NL80211_IFTYPE_STATION;
++}
++
++static int ath10k_peer_delete(struct ath10k *ar, u32 vdev_id, const u8 *addr);
++
++/* WCN3990 HL3.x refuses a station vdev start (status -1) unless the BSS peer
++ * already exists, so create it before the vdev is started; the sta_state
++ * handler later adopts it instead of creating a second one.
++ */
++static void violet_drop_early_peer(struct ath10k *ar, struct ieee80211_vif *vif)
++{
++	struct ath10k_vif *arvif = (void *)vif->drv_priv;
++	struct ath10k_peer *peer;
++	u8 addr[ETH_ALEN];
++	bool found = false;
++
++	spin_lock_bh(&ar->data_lock);
++	list_for_each_entry(peer, &ar->peers, list) {
++		if (peer->vdev_id == arvif->vdev_id && !peer->sta) {
++			ether_addr_copy(addr, peer->addr);
++			found = true;
++			break;
++		}
++	}
++	spin_unlock_bh(&ar->data_lock);
++
++	if (found) {
++		ath10k_warn(ar, "violet: dropping early peer %pM on vdev %d\n", addr, arvif->vdev_id);
++		ath10k_peer_delete(ar, arvif->vdev_id, addr);
++	}
++}
++
+ static int ath10k_peer_create(struct ath10k *ar,
+ 			      struct ieee80211_vif *vif,
+ 			      struct ieee80211_sta *sta,
+@@ -1504,6 +1576,18 @@
+ 	return ret;
+ }
+ 
++/* violet: retry a rejected vdev start (temporary runtime knobs) */
++static unsigned int violet_skip_sta_cfg;
++module_param(violet_skip_sta_cfg, uint, 0644);
++static int violet_vs_retries;
++module_param(violet_vs_retries, int, 0644);
++static int violet_vs_retry_ms = 500;
++module_param(violet_vs_retry_ms, int, 0644);
++static int violet_vdev_min;
++module_param(violet_vdev_min, int, 0644);
++static char *violet_vs_ssid;
++module_param(violet_vs_ssid, charp, 0644);
++
+ static int ath10k_vdev_start_restart(struct ath10k_vif *arvif,
+ 				     const struct cfg80211_chan_def *chandef,
+ 				     bool restart)
+@@ -1511,6 +1595,7 @@
+ 	struct ath10k *ar = arvif->ar;
+ 	struct wmi_vdev_start_request_arg arg = {};
+ 	int ret = 0;
++	int violet_vs_tries = 0;
+ 
+ 	lockdep_assert_held(&ar->conf_mutex);
+ 
+@@ -1518,8 +1603,15 @@
+ 	reinit_completion(&ar->vdev_delete_done);
+ 
+ 	arg.vdev_id = arvif->vdev_id;
+-	arg.dtim_period = arvif->dtim_period;
+-	arg.bcn_intval = arvif->beacon_interval;
++	/*
++	 * violet: a station does not know the AP's beacon interval / DTIM period
++	 * yet when mac80211 assigns the channel context (before association), so
++	 * ath10k sends 0/0.  The WCN3990 HL3.x firmware answers such a vdev start
++	 * with status -1 ("vdev-start-response reports status error"), so no
++	 * station can ever associate.  The monitor path already uses 1/1.
++	 */
++	arg.dtim_period = arvif->dtim_period ?: 1;
++	arg.bcn_intval = arvif->beacon_interval ?: 100;
+ 
+ 	arg.channel.freq = chandef->chan->center_freq;
+ 	arg.channel.band_center_freq1 = chandef->center_freq1;
+@@ -1542,6 +1634,15 @@
+ 	} else if (arvif->vdev_type == WMI_VDEV_TYPE_IBSS) {
+ 		arg.ssid = arvif->vif->cfg.ssid;
+ 		arg.ssid_len = arvif->vif->cfg.ssid_len;
++	} else if (arvif->vdev_type == WMI_VDEV_TYPE_STA && violet_vs_ssid &&
++		   violet_vs_ssid[0]) {
++		/*
++		 * violet: the WCN3990 HL3.x firmware rejects a station vdev start with an empty SSID
++		 * (an IBSS vdev start, which carries one, works).  mac80211 only learns the SSID at
++		 * association, so pass a placeholder.
++		 */
++		arg.ssid = violet_vs_ssid;
++		arg.ssid_len = strnlen(violet_vs_ssid, IEEE80211_MAX_SSID_LEN);
+ 	}
+ 
+ 	ath10k_dbg(ar, ATH10K_DBG_MAC,
+@@ -1549,6 +1650,7 @@
+ 		   arg.vdev_id, arg.channel.freq,
+ 		   ath10k_wmi_phymode_str(arg.channel.mode));
+ 
++resend:
+ 	if (restart)
+ 		ret = ath10k_wmi_vdev_restart(ar, &arg);
+ 	else
+@@ -1561,6 +1663,12 @@
+ 	}
+ 
+ 	ret = ath10k_vdev_setup_sync(ar);
++	if (ret == -EINVAL && violet_vs_tries++ < violet_vs_retries) {
++		/* violet: the HL3.x firmware may reject the start while a scheduling window is open */
++		msleep(violet_vs_retry_ms);
++		reinit_completion(&ar->vdev_setup_done);
++		goto resend;
++	}
+ 	if (ret) {
+ 		ath10k_warn(ar,
+ 			    "failed to synchronize setup for vdev %i restart %d: %d\n",
+@@ -1957,7 +2065,7 @@
+ 
+ 	lockdep_assert_held(&arvif->ar->conf_mutex);
+ 
+-	if (arvif->vif->type != NL80211_IFTYPE_STATION)
++	if (arvif->vif->type != NL80211_IFTYPE_STATION || (violet_skip_sta_cfg & 4))
+ 		return 0;
+ 
+ 	enable_ps = arvif->ps;
+@@ -2023,7 +2131,8 @@
+ 	if (arvif->vdev_type != WMI_VDEV_TYPE_STA)
+ 		return 0;
+ 
+-	if (!test_bit(WMI_SERVICE_STA_KEEP_ALIVE, ar->wmi.svc_map))
++	if (!test_bit(WMI_SERVICE_STA_KEEP_ALIVE, ar->wmi.svc_map) ||
++	    (violet_skip_sta_cfg & 1))
+ 		return 0;
+ 
+ 	/* Some firmware revisions have a bug and ignore the `enabled` field.
+@@ -5601,6 +5710,9 @@
+ 		goto err;
+ 	}
+ 	bit = __ffs64(ar->free_vdev_map);
++	/* violet: temporary knob - first vdev id to use (is id 0 special for this firmware?) */
++	if (violet_vdev_min > 0 && (ar->free_vdev_map >> violet_vdev_min))
++		bit = violet_vdev_min + __ffs64(ar->free_vdev_map >> violet_vdev_min);
+ 
+ 	ath10k_dbg(ar, ATH10K_DBG_MAC, "mac create vdev %i map %llx\n",
+ 		   bit, ar->free_vdev_map);
+@@ -5774,8 +5886,14 @@
+ 		}
+ 	}
+ 
+-	if (arvif->vdev_type == WMI_VDEV_TYPE_AP ||
+-	    arvif->vdev_type == WMI_VDEV_TYPE_IBSS) {
++	if (violet_blind_peer(arvif)) {
++		ret = ath10k_wmi_peer_create(ar, arvif->vdev_id, violet_peer_addr(vif),
++					     WMI_PEER_TYPE_DEFAULT);
++		ath10k_warn(ar, "violet: blind self peer create on vdev %d: %d\n",
++			    arvif->vdev_id, ret);
++		msleep(300);
++		arvif->peer_id = HTT_INVALID_PEERID;
++	} else if (violet_self_peer(arvif)) {
+ 		ret = ath10k_peer_create(ar, vif, NULL, arvif->vdev_id,
+ 					 vif->addr, WMI_PEER_TYPE_DEFAULT);
+ 		if (ret) {
+@@ -5812,7 +5930,7 @@
+ 		}
+ 	}
+ 
+-	if (arvif->vdev_type == WMI_VDEV_TYPE_STA) {
++	if (arvif->vdev_type == WMI_VDEV_TYPE_STA && !(violet_skip_sta_cfg & 2)) {
+ 		param = WMI_STA_PS_PARAM_RX_WAKE_POLICY;
+ 		value = WMI_STA_PS_RX_WAKE_POLICY_WAKE;
+ 		ret = ath10k_wmi_set_sta_ps_param(ar, arvif->vdev_id,
+@@ -5888,8 +6006,7 @@
+ 	return 0;
+ 
+ err_peer_delete:
+-	if (arvif->vdev_type == WMI_VDEV_TYPE_AP ||
+-	    arvif->vdev_type == WMI_VDEV_TYPE_IBSS) {
++	if (violet_self_peer(arvif)) {
+ 		ath10k_wmi_peer_delete(ar, arvif->vdev_id, vif->addr);
+ 		ath10k_wait_for_peer_delete_done(ar, arvif->vdev_id,
+ 						 vif->addr);
+@@ -5950,8 +6067,10 @@
+ 	list_del(&arvif->list);
+ 	spin_unlock_bh(&ar->data_lock);
+ 
+-	if (arvif->vdev_type == WMI_VDEV_TYPE_AP ||
+-	    arvif->vdev_type == WMI_VDEV_TYPE_IBSS) {
++	if (violet_blind_peer(arvif)) {
++		ath10k_wmi_peer_delete(arvif->ar, arvif->vdev_id, violet_peer_addr(vif));
++		msleep(300);
++	} else if (violet_self_peer(arvif)) {
+ 		ret = ath10k_wmi_peer_delete(arvif->ar, arvif->vdev_id,
+ 					     vif->addr);
+ 		if (ret)
+@@ -5980,8 +6099,7 @@
+ 	/* Some firmware revisions don't notify host about self-peer removal
+ 	 * until after associated vdev is deleted.
+ 	 */
+-	if (arvif->vdev_type == WMI_VDEV_TYPE_AP ||
+-	    arvif->vdev_type == WMI_VDEV_TYPE_IBSS) {
++	if (violet_self_peer(arvif)) {
+ 		ret = ath10k_wait_for_peer_deleted(ar, arvif->vdev_id,
+ 						   vif->addr);
+ 		if (ret)
+@@ -7567,8 +7685,17 @@
+ 			}
+ 		}
+ 
+-		ret = ath10k_peer_create(ar, vif, sta, arvif->vdev_id,
+-					 sta->addr, peer_type);
++		spin_lock_bh(&ar->data_lock);
++		peer = ath10k_peer_find(ar, arvif->vdev_id, sta->addr);
++		if (peer && violet_early_peer_on(vif) && !peer->sta) {
++			peer->sta = sta;
++			spin_unlock_bh(&ar->data_lock);
++			ret = 0;
++		} else {
++			spin_unlock_bh(&ar->data_lock);
++			ret = ath10k_peer_create(ar, vif, sta, arvif->vdev_id,
++						 sta->addr, peer_type);
++		}
+ 		if (ret) {
+ 			ath10k_warn(ar, "failed to add peer %pM for vdev %d when adding a new sta: %i\n",
+ 				    sta->addr, arvif->vdev_id, ret);
+@@ -8988,6 +9115,7 @@
+ {
+ 	struct ath10k *ar = hw->priv;
+ 	struct ath10k_vif *arvif = (void *)vif->drv_priv;
++	struct ath10k_peer *peer;
+ 	int ret;
+ 
+ 	mutex_lock(&ar->conf_mutex);
+@@ -9001,11 +9129,28 @@
+ 		return -EBUSY;
+ 	}
+ 
++	if (violet_early_peer_on(vif) && !is_zero_ether_addr(link_conf->bssid)) {
++		spin_lock_bh(&ar->data_lock);
++		peer = ath10k_peer_find(ar, arvif->vdev_id, link_conf->bssid);
++		spin_unlock_bh(&ar->data_lock);
++		if (!peer) {
++			ret = ath10k_peer_create(ar, vif, NULL, arvif->vdev_id,
++						 link_conf->bssid,
++						 WMI_PEER_TYPE_DEFAULT);
++			ath10k_warn(ar, "violet: early peer %pM on vdev %d: %d\n",
++				    link_conf->bssid, arvif->vdev_id, ret);
++		}
++	} else if (violet_early_peer_on(vif)) {
++		ath10k_warn(ar, "violet: no bssid at chanctx assign\n");
++	}
++
+ 	ret = ath10k_vdev_start(arvif, &ctx->def);
+ 	if (ret) {
+ 		ath10k_warn(ar, "failed to start vdev %i addr %pM on freq %d: %d\n",
+ 			    arvif->vdev_id, vif->addr,
+ 			    ctx->def.chan->center_freq, ret);
++		if (violet_early_peer_on(vif))
++			violet_drop_early_peer(ar, vif);
+ 		goto err;
+ 	}
+ 
+@@ -9089,6 +9234,9 @@
+ 		arvif->is_up = false;
+ 	}
+ 
++	if (violet_early_peer_on(vif))
++		violet_drop_early_peer(ar, vif);
++
+ 	ret = ath10k_vdev_stop(arvif);
+ 	if (ret)
+ 		ath10k_warn(ar, "failed to stop vdev %i: %d\n",
+--- a/drivers/net/wireless/ath/ath10k/wmi.c
++++ b/drivers/net/wireless/ath/ath10k/wmi.c
+@@ -1696,6 +1696,15 @@
+ 	.bw160 = WMI_10_2_PEER_160MHZ,
+ };
+ 
++/* violet: temporary runtime knobs for the vdev-start channel power fields */
++static unsigned int violet_ch_flags;
++module_param(violet_ch_flags, uint, 0644);
++static int violet_ch_min = -1, violet_ch_max = -1, violet_ch_reg = -1, violet_ch_ant = -1;
++module_param(violet_ch_min, int, 0644);
++module_param(violet_ch_max, int, 0644);
++module_param(violet_ch_reg, int, 0644);
++module_param(violet_ch_ant, int, 0644);
++
+ void ath10k_wmi_put_wmi_channel(struct ath10k *ar, struct wmi_channel *ch,
+ 				const struct wmi_channel_arg *arg)
+ {
+@@ -1750,15 +1759,15 @@
+ 	if (chan && chan->flags & IEEE80211_CHAN_RADAR)
+ 		flags |= WMI_CHAN_FLAG_DFS_CFREQ2;
+ 
+-	ch->min_power = arg->min_power;
+-	ch->max_power = arg->max_power;
+-	ch->reg_power = arg->max_reg_power;
+-	ch->antenna_max = arg->max_antenna_gain;
+-	ch->max_tx_power = arg->max_power;
++	ch->min_power = violet_ch_min >= 0 ? violet_ch_min : arg->min_power;
++	ch->max_power = violet_ch_max >= 0 ? violet_ch_max : arg->max_power;
++	ch->reg_power = violet_ch_reg >= 0 ? violet_ch_reg : arg->max_reg_power;
++	ch->antenna_max = violet_ch_ant >= 0 ? violet_ch_ant : arg->max_antenna_gain;
++	ch->max_tx_power = violet_ch_max >= 0 ? violet_ch_max : arg->max_power;
+ 
+ 	/* mode & flags share storage */
+ 	ch->mode = arg->mode;
+-	ch->flags |= __cpu_to_le32(flags);
++	ch->flags |= __cpu_to_le32(flags | violet_ch_flags);
+ }
+ 
+ int ath10k_wmi_wait_for_service_ready(struct ath10k *ar)
+@@ -1845,6 +1854,8 @@
+ 
+ 	memset(skb_cb, 0, sizeof(*skb_cb));
+ 	trace_ath10k_wmi_cmd(ar, cmd_id, skb->data, skb->len);
++	if (ath10k_debug_mask & ATH10K_DBG_WMI_PRINT)
++		print_hex_dump(KERN_INFO, "wmicmd: ", DUMP_PREFIX_NONE, 32, 4, skb->data, min_t(u32, skb->len, 160), false);
+ 	ret = ath10k_htc_send(&ar->htc, ar->wmi.eid, skb);
+ 
+ 	if (ret)
+--- a/drivers/net/wireless/ath/ath10k/wmi-tlv.c
++++ b/drivers/net/wireless/ath/ath10k/wmi-tlv.c
+@@ -12,6 +12,19 @@
+ #include "wmi.h"
+ #include "wmi-ops.h"
+ #include "wmi-tlv.h"
++
++/* violet: runtime knobs for the WCN3990 HL3.x vdev-start rejection (temporary) */
++static unsigned int violet_vs_req;
++module_param(violet_vs_req, uint, 0644);
++MODULE_PARM_DESC(violet_vs_req, "vdev start requestor_id");
++static unsigned int violet_vs_ext[10];
++static int violet_vs_ext_n;
++module_param_array(violet_vs_ext, uint, &violet_vs_ext_n, 0644);
++MODULE_PARM_DESC(violet_vs_ext, "extra u32 words appended to the vdev start fixed param");
++static unsigned int violet_vs_flags;
++module_param(violet_vs_flags, uint, 0644);
++MODULE_PARM_DESC(violet_vs_flags, "extra vdev start flags");
++
+ #include "p2p.h"
+ #include "testmode.h"
+ #include "txrx.h"
+@@ -2194,13 +2207,15 @@
+ 	size_t len;
+ 	void *ptr;
+ 	u32 flags = 0;
++	int ext, k;
+ 
+ 	if (WARN_ON(arg->hidden_ssid && !arg->ssid))
+ 		return ERR_PTR(-EINVAL);
+ 	if (WARN_ON(arg->ssid_len > sizeof(cmd->ssid.ssid)))
+ 		return ERR_PTR(-EINVAL);
+ 
+-	len = (sizeof(*tlv) + sizeof(*cmd)) +
++	ext = violet_vs_ext_n > 0 ? violet_vs_ext_n * 4 : 0;
++	len = (sizeof(*tlv) + sizeof(*cmd) + ext) +
+ 	      (sizeof(*tlv) + sizeof(*ch)) +
+ 	      (sizeof(*tlv) + 0);
+ 	skb = ath10k_wmi_alloc_skb(ar, len);
+@@ -2216,12 +2231,13 @@
+ 
+ 	tlv = ptr;
+ 	tlv->tag = __cpu_to_le16(WMI_TLV_TAG_STRUCT_VDEV_START_REQUEST_CMD);
+-	tlv->len = __cpu_to_le16(sizeof(*cmd));
++	tlv->len = __cpu_to_le16(sizeof(*cmd) + ext);
+ 	cmd = (void *)tlv->value;
+ 	cmd->vdev_id = __cpu_to_le32(arg->vdev_id);
++	cmd->requestor_id = __cpu_to_le32(violet_vs_req);
+ 	cmd->bcn_intval = __cpu_to_le32(arg->bcn_intval);
+ 	cmd->dtim_period = __cpu_to_le32(arg->dtim_period);
+-	cmd->flags = __cpu_to_le32(flags);
++	cmd->flags = __cpu_to_le32(flags | violet_vs_flags);
+ 	cmd->bcn_tx_rate = __cpu_to_le32(arg->bcn_tx_rate);
+ 	cmd->bcn_tx_power = __cpu_to_le32(arg->bcn_tx_power);
+ 	cmd->disable_hw_ack = __cpu_to_le32(arg->disable_hw_ack);
+@@ -2231,8 +2247,11 @@
+ 		memcpy(cmd->ssid.ssid, arg->ssid, arg->ssid_len);
+ 	}
+ 
++	for (k = 0; k < ext / 4; k++)
++		((__le32 *)((u8 *)cmd + sizeof(*cmd)))[k] = __cpu_to_le32(violet_vs_ext[k]);
++
+ 	ptr += sizeof(*tlv);
+-	ptr += sizeof(*cmd);
++	ptr += sizeof(*cmd) + ext;
+ 
+ 	tlv = ptr;
+ 	tlv->tag = __cpu_to_le16(WMI_TLV_TAG_STRUCT_CHANNEL);

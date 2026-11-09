@@ -1,0 +1,156 @@
+#!/bin/sh
+# violet-jack-watch - follow the 3.5 mm jack, switch the PulseAudio card profile, and keep
+# the RX SoundWire bus attached so headphone playback can actually start.
+#
+# Two separate jobs, both measured on 2026-11-06:
+#  1. PulseAudio's module-switch-on-port-available does NOT follow this card's
+#     "Headphone Jack" control (with the jack shorted to on, the profile stayed on
+#     Speaker), so we set the UCM profile ourselves.
+#  2. The RX codec slave (sdw:2:...:4) drops to UNATTACHED when idle.  A stream that
+#     starts in that state dies at prepare ("DPN_PortCtrl register write failed for
+#     port 1", ASoC error -5) and the player stalls.  Toggling the slave's runtime-PM
+#     control forces a resume that re-attaches it; doing it as soon as the jack is in
+#     use keeps the window closed.
+#
+# Runs as the session user via /usr/local/sbin/violet-jack-watch-run (OpenRC service
+# violet-jack-watch), so it survives ssh sessions and starts at boot.
+set -u
+export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+CARD=${CARD:-0}
+SLAVE=${SLAVE:-/sys/bus/soundwire/devices/sdw:2:0:0217:010a:00:4}
+JNAME="Headphone Jack"
+CONF=${CONF:-/etc/violet-audio.conf}
+GB=${GB:-/usr/local/sbin/violet-bus-guard}
+
+jack_volume=100; speaker_volume=100; jack_hph_gain=12; jack_digital_volume=94
+[ -r "$CONF" ] && . "$CONF"
+
+# Each route has its own PCM, because this DSP only carries one BE per front end:
+#   MultiMedia3 (hw:0,2) -> PRI_MI2S_RX  -> TAS amp -> speaker
+#   MultiMedia4 (hw:0,3) -> codec DMA    -> WCD9375 -> 3.5 mm jack
+# So both sinks exist permanently and audio is *moved* between them on plug/unplug.
+# Nothing is torn down, which is what used to wedge the player.
+JACK_SINK=${JACK_SINK:-violet_hph}
+JACK_PCM=${JACK_PCM:-hw:0,3}
+
+ctl() {
+	n=$(amixer -D "hw:$CARD" controls 2>/dev/null | sed -n "s/^numid=\([0-9]*\),.*name='$1'\$/\1/p" | head -1)
+	[ -n "${n:-}" ] || return 1
+	amixer -D "hw:$CARD" cget "numid=$n" 2>/dev/null | sed -n 's/^ *: values=//p' | head -1
+}
+setctl() {
+	n=$(amixer -D "hw:$CARD" controls 2>/dev/null | sed -n "s/^numid=\([0-9]*\),.*name='$1'\$/\1/p" | head -1)
+	[ -n "${n:-}" ] && amixer -D "hw:$CARD" -q cset "numid=$n" "$2" >/dev/null 2>&1
+	true
+}
+guard() { sudo -n "$GB" "$1" >/dev/null 2>&1; }
+log() { printf '%s: %s\n' "$(date +%H:%M:%S)" "$*"; }
+
+speaker_sink() { pactl list sinks short 2>/dev/null | awk '$2 ~ /HiFi__Speaker__/ {print $2; exit}' ; }
+
+# gnome-settings-daemon's volume OSD only shows a label when the sink's form factor is not "internal"
+# (or its port is not a speaker port).  This sink has no port, so form_factor=headphone is what makes
+# the OSD say "Headphones" (measured on the session bus 2026-11-07).  The quotes are needed: the
+# value contains spaces and PulseAudio splits module arguments on them.
+ensure_jack_sink() {
+	pactl list sinks short 2>/dev/null | awk '{print $2}' | grep -qx "$JACK_SINK" && return 0
+	pactl load-module module-alsa-sink sink_name="$JACK_SINK" device="$JACK_PCM" \
+		rate=48000 channels=2 format=s16le tsched=0 fragments=4 fragment_size=16384 \
+		"sink_properties='device.description=Headphones device.form_factor=headphone device.icon_name=audio-headphones'" >/dev/null 2>&1 && \
+		log "loaded sink $JACK_SINK on $JACK_PCM"
+	pactl set-sink-volume "$JACK_SINK" "$jack_volume%" >/dev/null 2>&1
+}
+
+ensure_mixers() {
+	# Both physical paths stay wired; only the sink (hence the PCM) decides where audio goes.
+	setctl 'RX_CODEC_DMA_RX_0 Audio Mixer MultiMedia4' 1
+	setctl 'PRI_MI2S_RX Audio Mixer MultiMedia4' 0
+	setctl 'PRI_MI2S_RX Audio Mixer MultiMedia3' 1
+	setctl 'RX_CODEC_DMA_RX_0 Audio Mixer MultiMedia3' 0
+	setctl 'RX_MACRO RX0 MUX' AIF1_PB
+	setctl 'RX_MACRO RX1 MUX' AIF1_PB
+	setctl 'RX INT0_1 MIX1 INP0' RX0
+	setctl 'RX INT1_1 MIX1 INP0' RX1
+	setctl 'RX INT0 DEM MUX' CLSH_DSM_OUT
+	setctl 'RX INT1 DEM MUX' CLSH_DSM_OUT
+	# Boot default is ULP + CLS_H_NORMAL: feeble and chopped speech.  LOHIFI + CLS_H_LOHIFI
+	# (what violet-hph sets) is clear and loud, confirmed by ear 2026-11-07.
+	setctl 'RX_HPH PWR Mode' LOHIFI
+	setctl 'RX HPH Mode' CLS_H_LOHIFI
+	setctl 'RX_COMP1 Switch' 0
+	setctl 'RX_COMP2 Switch' 0
+	setctl 'HPHL_COMP Switch' 0
+	setctl 'HPHR_COMP Switch' 0
+	setctl 'HPHL_RDAC Switch' 1
+	setctl 'HPHR_RDAC Switch' 1
+	setctl 'HPHL Switch' 1
+	setctl 'HPHR Switch' 1
+	setctl 'HPHL Volume' "$jack_hph_gain"
+	setctl 'HPHR Volume' "$jack_hph_gain"
+	setctl 'RX_RX0 Digital Volume' "$jack_digital_volume"
+	setctl 'RX_RX1 Digital Volume' "$jack_digital_volume"
+}
+
+mbhc_up() {
+	[ "$(ctl 'MBHC Switch')" = on ] && return 0
+	setctl 'MBHC Switch' on
+}
+
+# Only the default sink is switched.  Both PCMs must never be active at the same
+# time (the DSP logs an SWR CMD error and PulseAudio died on it), live streams are
+# never moved (the GStreamer player died on that too), so the player simply starts
+# its next stream on the sink that matches the jack.
+use_sink() { # $1 = sink name
+	[ -n "${1:-}" ] || return 1
+	[ "$(pactl get-default-sink 2>/dev/null)" = "$1" ] && return 0
+	pactl set-default-sink "$1" >/dev/null 2>&1 && log "default sink -> $1"
+}
+
+# The codec-DMA path and the apps-side SoundWire driver share the RX master, so it must
+# never clock-stop: a suspend/resume cycle there wedges the bus (SWR CMD error) and the
+# DSP's stream dies.  Hold it awake permanently; the power cost is negligible.
+hold_bus() { guard hold; }
+
+bus_guard() {
+	[ -e "$SLAVE/status" ] || return 0
+	if [ "$(cat "$SLAVE/status")" != "Attached" ]; then
+		guard ensure
+		log "slave was detached -> forced resume -> $(cat "$SLAVE/status")"
+	fi
+}
+
+hold_bus
+ensure_jack_sink
+ensure_mixers
+mbhc_up
+prev=""
+tick=0
+while :; do
+	j=$(ctl "$JNAME")
+	if [ -z "${j:-}" ]; then prev=""; sleep 2; continue; fi
+	if [ "$j" != "$prev" ]; then
+		prev="$j"; mbhc_up; ensure_jack_sink; ensure_mixers
+		case "$j" in
+		on)  use_sink "$JACK_SINK" ;;
+		off) use_sink "$(speaker_sink)" ;;
+		esac
+		log "jack=$j -> default sink $(pactl get-default-sink 2>/dev/null)"
+	else
+		hold_bus
+		bus_guard
+	fi
+	# Re-assert every 10 s: PulseAudio restarts drop the module sink and reset the
+	# default sink, and the card can come and go independently of the jack.
+	tick=$((tick+1))
+	if [ $((tick % 30)) -eq 0 ]; then
+		ensure_jack_sink
+		# Re-applying DAPM switches while audio is playing can click the analog
+		# path, so only do it when idle.
+		[ "$(pactl list short sink-inputs 2>/dev/null | wc -l)" -eq 0 ] && ensure_mixers
+		case "$j" in
+		on)  use_sink "$JACK_SINK" ;;
+		off) use_sink "$(speaker_sink)" ;;
+		esac
+	fi
+	sleep 1
+done

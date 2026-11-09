@@ -1,0 +1,26 @@
+--- a/sound/soc/codecs/wcd-mbhc-v2.c	2026-11-05 21:32:50.175812059 +0530
++++ b/sound/soc/codecs/wcd-mbhc-v2.c	2026-11-05 21:32:50.186851516 +0530
+@@ -292,7 +292,13 @@
+ static void wcd_mbhc_report_plug_removal(struct wcd_mbhc *mbhc,
+ 					 enum snd_jack_types jack_type)
+ {
+-	mbhc->hph_status &= ~jack_type;
++	/*
++	 * A plug is reported as exactly one type, but the detection work can
++	 * re-classify it (headphone -> line out) and accumulate several bits
++	 * in hph_status.  Clearing only the type the caller saw would leave
++	 * the other one set and the jack stuck "inserted" after unplug.
++	 */
++	mbhc->hph_status &= ~(SND_JACK_HEADSET | SND_JACK_LINEOUT);
+ 	/*
+ 	 * cancel possibly scheduled btn work and
+ 	 * report release if we reported button press
+@@ -393,6 +399,8 @@
+ 		}
+ 	}
+ 
++	/* Only the newly detected type stays reported (see plug removal) */
++	mbhc->hph_status &= ~(SND_JACK_HEADSET | SND_JACK_LINEOUT);
+ 	mbhc->hph_status |= jack_type;
+ 
+ 	if (jack_type == SND_JACK_HEADPHONE && mbhc->mbhc_cb->mbhc_micb_ramp_control)

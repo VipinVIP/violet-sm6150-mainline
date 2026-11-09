@@ -1,0 +1,51 @@
+clk: qcom: dispcc-qcs615: add MDSS_CORE reset, enable pclk0 parent on switch
+
+Fixes the D1 "black panel with backlight on until a DPMS off/on" fault on violet.
+
+- Since v6.17 the MDSS GDSC is no longer cut during boot before sync_state(), so the
+  display state ABL leaves behind for its splash survives into drm/msm. Every sister
+  SoC fixed this the same way: msm8916/8939, sdm630/660, sm6115/sm6125, sm7150 all
+  gained an MDSS core reset that msm_mdss.c asserts at probe. QCS615 was missed: the
+  binding defines DISP_CC_MDSS_CORE_BCR but the driver had no reset map.
+  BCR at 0x2000 as on sm6115/sm6125/sm7150 (identical layout: GDSC 0x3000, first
+  branch 0x2004).
+- dispcc_mdss_pclk0_clk_src: CLK_OPS_PARENT_ENABLE, as upstream sm7150
+  (Jens Reidel, applied by Bjorn Andersson 2025-10-27) and sdm845. Without it the RCG
+  is switched to the DSI PHY PLL output while that parent is off and logs
+  "disp_cc_mdss_pclk0_clk_src: rcg didn't update its configuration" (seen at 5.370 s
+  on every failing boot); CCF swallows the -EBUSY and the link runs on a stale clock.
+
+Verified on #169: no RCG warning, dsi_err=0, no "video done timed out", lockscreen
+on first power-on.
+
+--- a/drivers/clk/qcom/dispcc-qcs615.c
++++ b/drivers/clk/qcom/dispcc-qcs615.c
+@@ -294,7 +294,7 @@
+ 		.name = "disp_cc_mdss_pclk0_clk_src",
+ 		.parent_data = disp_cc_parent_data_5,
+ 		.num_parents = ARRAY_SIZE(disp_cc_parent_data_5),
+-		.flags = CLK_SET_RATE_PARENT,
++		.flags = CLK_SET_RATE_PARENT | CLK_OPS_PARENT_ENABLE,
+ 		.ops = &clk_pixel_ops,
+ 	},
+ };
+@@ -738,6 +738,10 @@
+ 	[MDSS_CORE_GDSC] = &mdss_core_gdsc,
+ };
+ 
++static const struct qcom_reset_map disp_cc_qcs615_resets[] = {
++	[DISP_CC_MDSS_CORE_BCR] = { 0x2000 },
++};
++
+ static struct clk_alpha_pll *disp_cc_qcs615_plls[] = {
+ 	&disp_cc_pll0,
+ };
+@@ -767,6 +771,8 @@
+ 	.num_clks = ARRAY_SIZE(disp_cc_qcs615_clocks),
+ 	.gdscs = disp_cc_qcs615_gdscs,
+ 	.num_gdscs = ARRAY_SIZE(disp_cc_qcs615_gdscs),
++	.resets = disp_cc_qcs615_resets,
++	.num_resets = ARRAY_SIZE(disp_cc_qcs615_resets),
+ 	.driver_data = &disp_cc_qcs615_driver_data,
+ };
+ 

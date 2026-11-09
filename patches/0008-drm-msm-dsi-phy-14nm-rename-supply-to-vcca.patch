@@ -1,4 +1,4 @@
-From: VipinVIP <VipinVIP@users.noreply.github.com>
+From: Vipin <vipindotkp@gmail.com>
 Subject: [PATCH] drm/msm/dsi/phy: 14nm: use vcca as the supply name
 
 The 14nm DSI PHY regulator supply is the 'vcca' rail on SM6150; the old 'vdda' name does not match the binding.

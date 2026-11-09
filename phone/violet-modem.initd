@@ -12,6 +12,8 @@
 
 description="Start the modem (MPSS) so WiFi can come up"
 LOG=/var/log/violet-modem.log
+PIDFILE=/run/violet-modem.pid
+STOPFLAG=/run/violet-modem.stopping
 
 depend() {
 	need localmount rmtfs tqftpserv
@@ -25,15 +27,20 @@ _rproc() {
 	return 1
 }
 
+# 2026-11-02: the retry loop used to keep running after `stop` was requested, so during
+# shutdown it could write "start" back into the remoteproc while OpenRC was tearing the
+# system down (rmtfs already stopped).  Every wait now also checks $STOPFLAG.
 _run() {
 	rp=$(_rproc) || { echo "no modem remoteproc" >> "$LOG"; return 1; }
 	n=0
 	while [ $n -lt 4 ]; do
+		[ -e "$STOPFLAG" ] && { echo "$(date +%T) stop requested, not restarting" >> "$LOG"; return 0; }
 		[ "$(cat "$rp/state")" = "running" ] || echo start > "$rp/state"
 		echo "$(date +%T) attempt $n: modem state $(cat "$rp/state")" >> "$LOG"
 		w=0
 		while [ $w -lt 120 ]; do
 			sleep 1; w=$((w + 1))
+			[ -e "$STOPFLAG" ] && { echo "$(date +%T) stop requested during wait" >> "$LOG"; return 0; }
 			[ -d /sys/class/net/wlan0 ] && { echo "$(date +%T) wlan0 up after ${w}s (attempt $n)" >> "$LOG"; return 0; }
 		done
 		echo "$(date +%T) no wlan0 after 120s, restarting the modem" >> "$LOG"
@@ -46,6 +53,7 @@ _run() {
 start() {
 	case "$(uname -r)" in *sm6150*) ;; *) return 0 ;; esac
 	: > "$LOG"
+	rm -f "$STOPFLAG"
 	# OpenRC's deptree cache is dated Oct 12 and the phone's clock is near 1970 after boot,
 	# so services added later are never picked up by the runlevel: start the helpers ourselves.
 	for s in tqftpserv rmtfs; do
@@ -53,11 +61,36 @@ start() {
 	done
 	ebegin "Starting modem in the background (see $LOG)"
 	( _run ) >/dev/null 2>&1 &
+	echo $! > "$PIDFILE"
 	eend 0
 }
 
+# 2026-11-02: this used to write "stop" and return immediately.  OpenRC stops rmtfs right
+# after this service (depend -> need rmtfs), and mainline's q6v5 stop path only completes
+# when the firmware acks the shutdown; so the modem could still be writing EFS while rmtfs
+# was already gone.  Wait, bounded, for the remoteproc to report "offline".
 stop() {
 	case "$(uname -r)" in *sm6150*) ;; *) return 0 ;; esac
-	rp=$(_rproc) && echo stop > "$rp/state"
+	: > "$STOPFLAG"
+	if [ -s "$PIDFILE" ]; then
+		kill "$(cat "$PIDFILE")" 2>/dev/null
+		rm -f "$PIDFILE"
+	fi
+	rp=$(_rproc) || return 0
+	[ "$(cat "$rp/state" 2>/dev/null)" = "running" ] || return 0
+	echo stop > "$rp/state"
+	i=0
+	while [ $i -lt 15 ]; do
+		if [ "$(cat "$rp/state" 2>/dev/null)" = "offline" ]; then
+			echo "$(date +%T) modem offline ${i}s after stop" >> "$LOG"
+			return 0
+		fi
+		sleep 1; i=$((i + 1))
+	done
+	echo "$(date +%T) modem still $(cat "$rp/state" 2>/dev/null) 15s after stop" >> "$LOG"
 	return 0
+}
+
+stop_post() {
+	rm -f "$STOPFLAG"
 }

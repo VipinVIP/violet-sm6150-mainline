@@ -1,0 +1,142 @@
+--- a/src/ipa/simple/algorithms/awb.cpp
++++ b/src/ipa/simple/algorithms/awb.cpp
+@@ -7,6 +7,7 @@
+ 
+ #include "awb.h"
+ 
++#include <cmath>
+ #include <numeric>
+ #include <stdint.h>
+ 
+@@ -77,12 +78,30 @@
+ 	 * Calculate red and blue gains for AWB.
+ 	 * Clamp max gain at 4.0, this also avoids 0 division.
+ 	 */
++	/*
++	 * violet: temporal smoothing. The raw grey-world estimate jumps with
++	 * every frame (and with every object entering the frame), which showed up
++	 * as the preview/shot flipping between neutral and green. Converge
++	 * towards the target instead of adopting it, and ignore sub-1% wobble.
++	 */
++	const float targetR = sum.r() <= sum.g() / 4 ? 4.0f : static_cast<float>(sum.g()) / sum.r();
++	const float targetB = sum.b() <= sum.g() / 4 ? 4.0f : static_cast<float>(sum.g()) / sum.b();
++	constexpr float kAwbSmoothing = 0.15f;
++	constexpr float kAwbFast = 0.60f;
++	constexpr float kAwbFar = 0.30f;
++	constexpr float kAwbDeadband = 0.01f;
++
+ 	auto &gains = context.activeState.awb.gains;
+-	gains = { {
+-		sum.r() <= sum.g() / 4 ? 4.0f : static_cast<float>(sum.g()) / sum.r(),
+-		1.0,
+-		sum.b() <= sum.g() / 4 ? 4.0f : static_cast<float>(sum.g()) / sum.b(),
+-	} };
++	const bool far = std::abs(targetR - gains.r()) > kAwbFar * gains.r() ||
++			 std::abs(targetB - gains.b()) > kAwbFar * gains.b();
++	const float alpha = far ? kAwbFast : kAwbSmoothing;
++	float nextR = gains.r() + alpha * (targetR - gains.r());
++	float nextB = gains.b() + alpha * (targetB - gains.b());
++	if (std::abs(targetR - gains.r()) < kAwbDeadband * gains.r())
++		nextR = gains.r();
++	if (std::abs(targetB - gains.b()) < kAwbDeadband * gains.b())
++		nextB = gains.b();
++	gains = { { nextR, 1.0f, nextB } };
+ 
+ 	RGB<double> rgbGains{ { 1 / gains.r(), 1 / gains.g(), 1 / gains.b() } };
+ 	context.activeState.awb.temperatureK = estimateCCT(rgbGains);
+--- a/src/ipa/simple/algorithms/agc.cpp
++++ b/src/ipa/simple/algorithms/agc.cpp
+@@ -189,6 +189,36 @@
+ 	}
+ 
+ 	float exposureMSV = (denom == 0 ? 0 : static_cast<float>(num) / denom);
++
++	/*
++	 * violet: highlight-weighted metering. The mid-range MSV target happily
++	 * lets a bright object clip (a white shirt filled 10% of a shot with
++	 * 255,255,255). Bias the target darker as the population of the top
++	 * histogram bins grows, so highlights roll off instead.
++	 */
++	if (denom > 0) {
++		unsigned int totalPixels = 0;
++		unsigned int hiPixels = 0;
++		const unsigned int hiStart = SwIspStats::kYHistogramSize * 9 / 10;
++
++		for (unsigned int i = 0; i < SwIspStats::kYHistogramSize; i++)
++			totalPixels += histogram[i];
++		for (unsigned int i = hiStart; i < SwIspStats::kYHistogramSize; i++)
++			hiPixels += histogram[i];
++
++		if (totalPixels) {
++			const float hiRatio = static_cast<float>(hiPixels) / totalPixels;
++			constexpr float kHiLimit = 0.02f;
++			constexpr float kHiWeight = 8.0f;
++			if (hiRatio > kHiLimit) {
++				const float pull = std::min(kHiWeight * (hiRatio - kHiLimit),
++							    static_cast<float>(kExposureBinsCount));
++				exposureMSV += pull;
++				LOG(IPASoftExposure, Debug) << "highlights " << hiRatio * 100 << "% -> MSV -" << pull;
++			}
++		}
++	}
++
+ 	updateExposure(context, frameContext, exposureMSV);
+ }
+ 
+--- a/src/libcamera/software_isp/debayer_cpu.cpp
++++ b/src/libcamera/software_isp/debayer_cpu.cpp
+@@ -991,7 +991,15 @@
+ 			normalized = 0.5 * std::pow(normalized / 0.5, contrastExp);
+ 		else
+ 			normalized = 1.0 - 0.5 * std::pow((1.0 - normalized) / 0.5, contrastExp);
+-		value = UINT8_MAX * std::pow(normalized, gamma);
++		/* violet: highlight shoulder, same curve as the GPU shader. */
++		float valueF = std::pow(normalized, gamma);
++		constexpr float knee = 0.85f;
++		if (valueF > knee) {
++			constexpr float kneeRange = 1.0f - knee;
++			const float over = valueF - knee;
++			valueF = knee + kneeRange * over / (over + kneeRange);
++		}
++		value = UINT8_MAX * valueF;
+ 	}
+ }
+ 
+--- a/src/libcamera/shaders/bayer_1x_packed.frag
++++ b/src/libcamera/shaders/bayer_1x_packed.frag
+@@ -250,6 +250,16 @@
+ 	/* Apply gamma after colour correction */
+ 	rgb = pow(rgb, vec3(gamma));
+ 
++	/*
++	 * violet: highlight shoulder. Values above the knee are compressed
++	 * smoothly towards 1.0 instead of clipping, so specular/bright objects
++	 * keep their structure instead of turning into a flat white blob.
++	 */
++	const float knee = 0.85;
++	const float kneeRange = 1.0 - knee;
++	vec3 over = max(rgb - vec3(knee), vec3(0.0));
++	rgb = min(rgb, vec3(knee)) + vec3(kneeRange) * over / (over + vec3(kneeRange));
++
+ #if defined (SWAP_BLUE)
+ 	gl_FragColor = vec4(rgb.bgr, 1.0);
+ #else
+--- a/src/libcamera/shaders/bayer_unpacked.frag
++++ b/src/libcamera/shaders/bayer_unpacked.frag
+@@ -152,6 +152,16 @@
+     /* Apply gamma after colour correction */
+     rgb = pow(rgb, vec3(gamma));
+ 
++    /*
++     * violet: highlight shoulder. Values above the knee are compressed
++     * smoothly towards 1.0 instead of clipping, so specular/bright objects
++     * keep their structure instead of turning into a flat white blob.
++     */
++    const float knee = 0.85;
++    const float kneeRange = 1.0 - knee;
++    vec3 over = max(rgb - vec3(knee), vec3(0.0));
++    rgb = min(rgb, vec3(knee)) + vec3(kneeRange) * over / (over + vec3(kneeRange));
++
+ #if defined (SWAP_BLUE)
+     gl_FragColor = vec4(rgb.bgr, 1.0);
+ #else

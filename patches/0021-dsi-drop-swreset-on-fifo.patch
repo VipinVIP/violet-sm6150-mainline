@@ -1,0 +1,22 @@
+--- a/drivers/gpu/drm/msm/dsi/dsi_host.c
++++ b/drivers/gpu/drm/msm/dsi/dsi_host.c
+@@ -1645,10 +1645,15 @@
+ 	pr_err_ratelimited("%s: status=%x\n", __func__, status);
+ 	if (status & DSI_ERR_STATE_MDP_FIFO_UNDERFLOW)
+ 		dsi_sw_reset(msm_host);
+-	else if ((status & DSI_ERR_STATE_FIFO) && dsidbg_count < 50) {	/* DSIDBG test */
+-		pr_info("DSIDBG sw reset after FIFO error\n");
+-		dsi_sw_reset(msm_host);
+-	}
++	/*
++	 * D1 (2026-10-30): the "sw reset on every FIFO error" DSIDBG experiment is
++	 * removed. A software reset while the controller is running in video mode
++	 * tears down the FIFO that is being refilled, so the boot-time error burst
++	 * (first power-on, fifo_status=0xdddd1019) turned a transient into a panel
++	 * that never scanned - the known "black screen with backlight" state that
++	 * only a full power-on cycle recovers. Video-mode FIFO overflow must be
++	 * counted, not reset: the DPU is the producer and re-syncs on its own.
++	 */
+ 
+ 	/* It is safe to clear here because error irq is disabled. */
+ 	msm_host->err_work_state = 0;

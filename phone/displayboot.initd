@@ -1,0 +1,33 @@
+#!/sbin/openrc-run
+# Starts the display boot-window sampler as a supervised background process.
+#
+# Not installed by install-sensors.sh or anything automatic: install with
+#   install -m 0755 displayboot-loop /usr/local/bin/displayboot-loop
+#   install -m 0755 displayboot.initd /etc/init.d/displayboot
+#   rm -f /etc/local.d/displayboot.start        # superseded, and it got killed
+#   rc-update add displayboot boot
+#
+# start-stop-daemon --background is what keeps it alive: a `( ... ) &` inside a
+# local.d script dies when the `local` service exits.
+
+description="Display boot probe (D1/D2 black-screen window capture)"
+depend() {
+	need devfs
+	after localmount
+	before greetd
+}
+
+start() {
+	mkdir -p /var/log/displayboot
+	ebegin "Starting display boot probe"
+	start-stop-daemon --start --background --make-pidfile \
+		--pidfile /run/displayboot.pid \
+		--exec /usr/local/bin/displayboot-loop
+	eend $? "failed to start displayboot-loop"
+}
+
+stop() {
+	ebegin "Stopping display boot probe"
+	start-stop-daemon --stop --pidfile /run/displayboot.pid
+	eend $?
+}

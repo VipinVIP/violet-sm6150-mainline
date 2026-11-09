@@ -1,0 +1,9 @@
+#!/bin/sh
+# WORKAROUND (root cause open, see docs/PROGRESS.md 2026-11-06): the session's PulseAudio daemon does not
+# end up with module-switch-on-port-available although /etc/pulse/default.pa loads it, so the card profile
+# (Speaker <-> Headphones) never follows the 3.5 mm jack.  Loaded by hand it stays loaded, so load it here
+# once the daemon is up.  Remove this and violet-pulse-policy.desktop when the real cause is fixed.
+export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+for i in $(seq 1 30); do pactl info >/dev/null 2>&1 && break; sleep 1; done
+pactl list short modules | grep -q module-switch-on-port-available ||
+	pactl load-module module-switch-on-port-available >/dev/null

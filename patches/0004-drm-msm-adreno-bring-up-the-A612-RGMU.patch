@@ -1,4 +1,4 @@
-From: VipinVIP <VipinVIP@users.noreply.github.com>
+From: VipinVIP <vipindotkp@gmail.com>
 Subject: [PATCH] drm/msm/adreno: bring up the A612 RGMU
 
 The A612 has an RGMU which has to be started with its PCC table (a612_rgmu.bin) and a

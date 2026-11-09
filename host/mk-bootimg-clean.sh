@@ -14,9 +14,9 @@
 # the kernel's own boot log into the ramoops region, and quiet would suppress it.
 set -euo pipefail
 
-K=${K:-$HOME/violet-sm6150-mainline/linux-7.2.10}
-B=${B:-$HOME/violet-sm6150-mainline/bootimg-r9}
-O=${O:-$HOME/violet-sm6150-mainline/boot-mainline.img}
+K=${K:-$HOME/violet-mainline/kernel/linux-7.2.10}
+B=${B:-$HOME/violet-mainline/bootimg-r9}
+O=${O:-$HOME/violet-mainline/boot-mainline.img}
 
 IMG="$K/arch/arm64/boot/Image"
 DTB="$K/arch/arm64/boot/dts/qcom/violet-sm6150.dtb"
@@ -27,10 +27,7 @@ DTB="$K/arch/arm64/boot/dts/qcom/violet-sm6150.dtb"
 
 # r9's cmdline, minus quiet/splash, plus an explicit console so the UART console
 # is registered and pstore captures everything the kernel prints.
-# UUIDs are per-install: export them from your own phone (`blkid` on pmOS_boot / root).
-: "${PMOS_BOOT_UUID:?set PMOS_BOOT_UUID to your pmOS_boot partition UUID}"
-: "${PMOS_ROOT_UUID:?set PMOS_ROOT_UUID to your root filesystem UUID}"
-CMDLINE="${CMDLINE:-plymouth.ignore-serial-consoles androidboot.hardware=qcom swiotlb=1 loop.max_part=7 kpti=off pmos_boot_uuid=${PMOS_BOOT_UUID} pmos_root_uuid=${PMOS_ROOT_UUID} pmos_rootfsopts=defaults}"
+CMDLINE="${CMDLINE:-plymouth.ignore-serial-consoles androidboot.hardware=qcom swiotlb=1 loop.max_part=7 kpti=off pmos_boot_uuid=24d6dade-23b3-4b77-9ec0-ef87830e7c4f pmos_root_uuid=f3fc5ebc-6673-4b01-b575-91006f5c88de pmos_rootfsopts=defaults}"
 
 # ---------------------------------------------------------------------------
 # Two things ABL needs that mainline's DTB does not provide:

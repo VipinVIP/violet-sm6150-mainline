@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: CC0-1.0
+# violet s5k5e8: CCMs from the vendor Chromatix tuning (com.qti.tuned.ofilm_s5k5e8.bin, cc13 table, first AEC set), one per CCT trigger range.
+%YAML 1.1
+---
+version: 1
+algorithms:
+  - BlackLevel:
+      blackLevel: 4096
+  - Awb:
+  - Ccm:
+      ccms:
+        - ct: 2250
+          ccm: [ 1.5534, -0.6261, 0.0726,
+                 -0.0564, 1.0705, -0.0141,
+                 0.1854, -0.8148, 1.6294 ]
+        - ct: 3100
+          ccm: [ 1.0339, 0.1344, -0.1683,
+                 -0.3254, 1.2786, 0.0468,
+                 -0.3042, -1.3537, 2.6579 ]
+        - ct: 4500
+          ccm: [ 1.0180, 0.0402, -0.0582,
+                 -0.3828, 1.4965, -0.1138,
+                 -0.1100, -0.9793, 2.0893 ]
+        - ct: 6250
+          ccm: [ 1.1776, -0.1042, -0.0734,
+                 -0.3751, 1.6088, -0.2337,
+                 -0.0504, -0.5223, 1.5728 ]
+  - Adjust:
+  - Agc:
+...

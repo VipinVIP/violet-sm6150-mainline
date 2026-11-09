@@ -1,0 +1,92 @@
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
+@@ -931,7 +931,17 @@
+ 	OUT_RING(ring, 0x00000000);
+ 
+ 	a6xx_flush(gpu, ring);
+-	return a6xx_idle(gpu, ring) ? 0 : -EINVAL;
++	if (!a6xx_idle(gpu, ring)) {
++		/* G1: identify what the CP was doing when CP_ME_INIT wasn't fetched */
++		DRM_DEV_ERROR(gpu->dev->dev,
++			      "cp_init: CP_ME_INIT not consumed (rptr=%u wptr=%u rbbm_status=%08x cp_sqe_cntl=%08x)\n",
++			      gpu_read(gpu, REG_A6XX_CP_RB_RPTR),
++			      gpu_read(gpu, REG_A6XX_CP_RB_WPTR),
++			      gpu_read(gpu, REG_A6XX_RBBM_STATUS),
++			      gpu_read(gpu, REG_A6XX_CP_SQE_CNTL));
++		return -EINVAL;
++	}
++	return 0;
+ }
+ 
+ static int a7xx_cp_init(struct msm_gpu *gpu)
+@@ -1485,6 +1495,19 @@
+ 	/* Enable the SQE_to start the CP engine */
+ 	gpu_write(gpu, REG_A6XX_CP_SQE_CNTL, 1);
+ 
++	/*
++	 * G1 instrumentation: the hang signature we captured (2026-10-30) is
++	 * `adreno_idle: timeout waiting to drain ringbuffer 0 rptr/wptr = 0/C`
++	 * raised from a6xx_cp_init(), i.e. the CP never fetched CP_ME_INIT.  Log
++	 * what the GPU looks like at that exact moment, once per hw_init.
++	 */
++	if (adreno_has_rgmu(adreno_gpu))
++		DRM_DEV_INFO(gpu->dev->dev,
++			     "RGMU hw_init: suspend_count=%u rbbm_status=%08x cp_sqe_cntl=%08x\n",
++			     gpu->suspend_count,
++			     gpu_read(gpu, REG_A6XX_RBBM_STATUS),
++			     gpu_read(gpu, REG_A6XX_CP_SQE_CNTL));
++
+ 	if (adreno_is_a7xx(adreno_gpu) && !a6xx_gpu->pwrup_reglist_emitted) {
+ 		a7xx_patch_pwrup_reglist(gpu);
+ 		a6xx_gpu->pwrup_reglist_emitted = true;
+@@ -2307,6 +2330,27 @@
+ 		return ret;
+ 	}
+ 
++	/*
++	 * G1 instrumentation (2026-10-30): the GPUSTART ack only says the RGMU
++	 * accepted the request.  Confirm that GX actually came out of power
++	 * collapse before the CPU starts writing GPU registers - if it has not,
++	 * those writes are lost and CP_ME_INIT is never fetched, which is exactly
++	 * the `adreno_idle: timeout waiting to drain ringbuffer 0 rptr/wptr = 0/C`
++	 * signature we captured.
++	 */
++	{
++		u32 gx = 0;
++		int gx_ret;
++
++		gx_ret = readl_poll_timeout(gmu->mmio +
++					    GMU_BYTE_OFFSET(gmu, RGMU_SPTPRAC_PWR_CLK_STATUS),
++					    gx, !(gx & RGMU_GX_GDSC_POWER_OFF),
++					    100, 20000);
++		DRM_DEV_INFO(gmu->dev,
++			     "RGMU GX after GPUSTART: status=%08x gx_on=%d poll_ret=%d\n",
++			     gx, !(gx & RGMU_GX_GDSC_POWER_OFF), gx_ret);
++	}
++
+ 	/* Remaining power-up programming done by downstream after GPUSTART */
+ 	gmu_write(gmu, RGMU_AO_PWR_SEQ_0, 0x22);
+ 	gmu_write(gmu, RGMU_AO_PWR_SEQ_1, 0x11);
+--- a/drivers/remoteproc/qcom_q6v5.c
++++ b/drivers/remoteproc/qcom_q6v5.c
+@@ -165,7 +165,19 @@
+ 	struct qcom_q6v5 *q6v5 = data;
+ 
+ 	if (q6v5->handover_issued) {
+-		dev_err(q6v5->dev, "Handover signaled, but it already happened\n");
++		/*
++		 * S6 (violet): this firmware keeps re-asserting the handover
++		 * interrupt (~once a second on the sm6150 ADSP), which used to
++		 * fill ~94% of the kernel log ring and rotate every boot-time
++		 * line away before it could be read.  Report the first one and
++		 * then only every 6000th.
++		 */
++		static atomic_t repeats = ATOMIC_INIT(0);
++		unsigned int n = atomic_inc_return(&repeats);
++
++		if (n == 1 || !(n % 6000))
++			dev_err(q6v5->dev,
++				"Handover signaled again (%u repeats, rest silent)\n", n);
+ 		return IRQ_HANDLED;
+ 	}
+ 

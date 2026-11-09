@@ -1,0 +1,16 @@
+arm64: dts: qcom: talos: add MDSS core reset
+
+Pair of 0024. msm_mdss.c asserts/deasserts this reset at probe so drm/msm starts
+from clean hardware instead of ABL's splash state (needed since v6.17 - see 0024).
+
+--- a/arch/arm64/boot/dts/qcom/talos.dtsi
++++ b/arch/arm64/boot/dts/qcom/talos.dtsi
+@@ -4358,6 +4358,8 @@
+ 
+ 			power-domains = <&dispcc MDSS_CORE_GDSC>;
+ 
++			resets = <&dispcc DISP_CC_MDSS_CORE_BCR>;
++
+ 			clocks = <&dispcc DISP_CC_MDSS_AHB_CLK>,
+ 				 <&gcc GCC_DISP_HF_AXI_CLK>,
+ 				 <&dispcc DISP_CC_MDSS_MDP_CLK>;

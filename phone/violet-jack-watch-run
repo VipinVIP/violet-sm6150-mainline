@@ -1,0 +1,7 @@
+#!/bin/sh
+# Run the jack watcher as the desktop user, restarting it if it ever exits.
+# PulseAudio lives in that user's session; the sysfs power writes need the root
+# helper, which the watcher calls through sudo -n.
+uid=$(id -u user 2>/dev/null || echo 10000)
+exec su -s /bin/sh user -c "export XDG_RUNTIME_DIR=/run/user/$uid
+while :; do /usr/local/bin/violet-jack-watch; echo \"watcher exited, restarting\"; sleep 2; done"

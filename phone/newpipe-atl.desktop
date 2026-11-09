@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=NewPipe (ATL)
+Comment=YouTube frontend via Android Translation Layer
+Exec=/usr/local/bin/atl-run-master /home/user/atl/NewPipe.apk org/schabi/newpipe/MainActivity
+Icon=org.gnome.Decibels
+Terminal=false
+Categories=AudioVideo;Video;Network;
+StartupNotify=false
+X-Purism-FormFactor=Workstation;Mobile;

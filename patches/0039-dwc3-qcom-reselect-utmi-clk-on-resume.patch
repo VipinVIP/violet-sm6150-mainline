@@ -1,0 +1,49 @@
+usb: dwc3: qcom: reselect the UTMI clock on resume (system and runtime)
+
+QSCRATCH_GENERAL_CFG is programmed only at probe (dwc3_qcom_select_utmi_clk(), for "qcom,select-utmi-as-pipe-clk" HS-only controllers). On QCS615 (Redmi Note 7 Pro) the register does not survive system suspend: read via /dev/mem, 0x0d before suspend and 0x04 after resume (PIPE_UTMI_CLK_SEL and PIPE3_PHYSTATUS_SW lost). Without the UTMI clock the controller answers Start New Configuration but times out on the following Set Endpoint Configuration ("failed to enable ep0out"), so the gadget stays dead until the glue is rebound. Select it again in dwc3_qcom_resume(), which both the system and the runtime resume paths use.
+
+--- a/drivers/usb/dwc3/dwc3-qcom.c
++++ b/drivers/usb/dwc3/dwc3-qcom.c
+@@ -75,6 +75,7 @@
+ 	struct clk_bulk_data	*clks;
+ 	int			num_clocks;
+ 	struct reset_control	*resets;
++	bool			select_utmi_as_pipe_clk;
+ 	struct dwc3_qcom_port	ports[DWC3_QCOM_MAX_PORTS];
+ 	u8			num_ports;
+ 
+@@ -369,6 +370,8 @@
+ 	return 0;
+ }
+ 
++static void dwc3_qcom_select_utmi_clk(struct dwc3_qcom *qcom);
++
+ static int dwc3_qcom_resume(struct dwc3_qcom *qcom, bool wakeup)
+ {
+ 	int ret;
+@@ -388,6 +391,17 @@
+ 	if (ret)
+ 		dev_warn(qcom->dev, "failed to enable interconnect: %d\n", ret);
+ 
++	/*
++	 * QSCRATCH_GENERAL_CFG does not survive suspend on some SoCs (measured on QCS615
++	 * after system suspend: 0x0d before, 0x04 after, i.e. PIPE_UTMI_CLK_SEL and
++	 * PIPE3_PHYSTATUS_SW lost).  Without the UTMI clock selected the controller answers
++	 * the first endpoint command but times out on the next ("failed to enable ep0out")
++	 * and the gadget stays dead.  Select it again before the core is re-initialised;
++	 * doing it here covers both system and runtime resume.
++	 */
++	if (qcom->select_utmi_as_pipe_clk)
++		dwc3_qcom_select_utmi_clk(qcom);
++
+ 	/* Clear existing events from PHY related to L2 in/out */
+ 	for (i = 0; i < qcom->num_ports; i++) {
+ 		dwc3_qcom_setbits(qcom->qscratch_base,
+@@ -680,6 +694,7 @@
+ 	 */
+ 	ignore_pipe_clk = device_property_read_bool(dev,
+ 				"qcom,select-utmi-as-pipe-clk");
++	qcom->select_utmi_as_pipe_clk = ignore_pipe_clk;
+ 	if (ignore_pipe_clk)
+ 		dwc3_qcom_select_utmi_clk(qcom);
+ 

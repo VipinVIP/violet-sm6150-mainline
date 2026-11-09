@@ -1,0 +1,52 @@
+drm/msm: don't touch the GPU in msm_gpu_submit() when runtime resume fails
+
+pm_runtime_get_sync() was unchecked; after a failed resume msm_gpu_hw_init() and the ring kick
+wrote GPU registers with the clocks off, stalling the bus until the watchdog reset the SoC (the
+7 s silent window after "RGMU GX failed to power up"). Fail the job with -EIO through the
+normal retire path instead. Same class as the msm/dp dp_wait_hpd_asserted() fix; no upstream
+fix for msm_gpu_submit found (2026-10-31).
+
+--- a/drivers/gpu/drm/msm/msm_gpu.c
++++ b/drivers/gpu/drm/msm/msm_gpu.c
+@@ -797,11 +797,38 @@
+ 
+ 	WARN_ON(!mutex_is_locked(&gpu->lock));
+ 
+-	pm_runtime_get_sync(&gpu->pdev->dev);
++	submit->seqno = submit->hw_fence->seqno;
+ 
+-	msm_gpu_hw_init(gpu);
++	/*
++	 * If the GPU cannot be powered up, do not touch it: hw_init and the
++	 * ring kick write GPU registers, and with the clocks off that access
++	 * stalls the bus until the watchdog resets the SoC. Complete the job
++	 * with an error instead, through the normal retire path so the
++	 * active_submits/runtime-PM accounting stays balanced.
++	 */
++	if (pm_runtime_resume_and_get(&gpu->pdev->dev) < 0) {
++		DRM_DEV_ERROR_RATELIMITED(&gpu->pdev->dev,
++					  "GPU resume failed, failing submit %u\n",
++					  submit->seqno);
++		dma_fence_set_error(submit->hw_fence, -EIO);
+ 
+-	submit->seqno = submit->hw_fence->seqno;
++		msm_gem_submit_get(submit);
++		spin_lock_irqsave(&ring->submit_lock, flags);
++		list_add_tail(&submit->node, &ring->submits);
++		spin_unlock_irqrestore(&ring->submit_lock, flags);
++
++		mutex_lock(&gpu->active_lock);
++		if (!gpu->active_submits)
++			pm_runtime_get_noresume(&gpu->pdev->dev);
++		gpu->active_submits++;
++		mutex_unlock(&gpu->active_lock);
++
++		ring->memptrs->fence = submit->seqno;
++		msm_gpu_retire(gpu);
++		return;
++	}
++
++	msm_gpu_hw_init(gpu);
+ 
+ 	/*
+ 	 * ring->submits holds a ref to the submit, to deal with the case

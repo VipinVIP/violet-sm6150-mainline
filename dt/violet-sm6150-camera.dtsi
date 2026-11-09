@@ -1,0 +1,174 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/*
+ * violet (Redmi Note 7 Pro) camera.
+ *
+ * M0: CAMSS + CCI controllers.
+ * M0.5: IMX586 node on CCI bus 0. It is given compatible "sony,imx577" on purpose:
+ *       the in-tree imx412 driver then powers the rails, enables MCLK and reads the
+ *       chip ID, and its "chip id mismatch" error tells us the real ID. Replace with
+ *       the imx586 compatible once the dedicated driver exists (M1).
+ *
+ * Rails from the vendor DTB (unpacked from ~/violet-pmos/images-r9/boot-r10.img):
+ *   cam_csiphy0..2: csi-vdd-voltage <0x124f80>, mipi-csi-vdd-supply = pm6150l_l3
+ *     -> vreg_l3e_1p2 (PM6150L L3, 1.232 V)
+ *   camera_ldo       = PM6150L gpio 3, 1.2 V   (dvdd)
+ *   camera_vana0_ldo = PM6150L gpio 9, 2.8 V   (avdd, rear main)
+ *   camera_vana1_2_ldo = PM6150L gpio 4, 2.8 V (avdd, aux/front)
+ *   cam_vio = pm6150_l13 (1.8 V, dovdd)
+ * Reset of the rear main sensor = TLMM gpio 47, MCLK0 on TLMM gpio 28.
+ */
+
+#include <dt-bindings/clock/qcom,qcs615-camcc.h>
+#include <dt-bindings/gpio/gpio.h>
+
+/ {
+	camera_ldo: regulator-camera-vdig {
+		compatible = "regulator-fixed";
+		regulator-name = "camera_ldo";
+		regulator-min-microvolt = <1200000>;
+		regulator-max-microvolt = <1200000>;
+		regulator-enable-ramp-delay = <135>;
+		enable-active-high;
+		gpio = <&pm6150l_gpios 3 GPIO_ACTIVE_HIGH>;
+	};
+
+	camera_vana0_ldo: regulator-camera-vana0 {
+		compatible = "regulator-fixed";
+		regulator-name = "camera_vana0_ldo";
+		regulator-min-microvolt = <2800000>;
+		regulator-max-microvolt = <2800000>;
+		regulator-enable-ramp-delay = <233>;
+		enable-active-high;
+		gpio = <&pm6150l_gpios 9 GPIO_ACTIVE_HIGH>;
+	};
+
+	camera_vana1_2_ldo: regulator-camera-vana1-2 {
+		compatible = "regulator-fixed";
+		regulator-name = "camera_vana1_2_ldo";
+		regulator-min-microvolt = <2800000>;
+		regulator-max-microvolt = <2800000>;
+		regulator-enable-ramp-delay = <233>;
+		enable-active-high;
+		gpio = <&pm6150l_gpios 4 GPIO_ACTIVE_HIGH>;
+		regulator-always-on;
+	};
+};
+
+&camss {
+	vdd-csiphy-1p2-supply = <&vreg_l3e_1p2>;
+	vdd-csiphy-1p8-supply = <&vreg_l13a_1p8>;
+	status = "okay";
+
+	ports {
+		port@0 {
+			csiphy0_ep: endpoint {
+				data-lanes = <0 1 2 3>;
+				remote-endpoint = <&rear_main_ep>;
+			};
+		};
+
+		port@1 {
+			csiphy1_ep: endpoint {
+				data-lanes = <0 1>;
+				remote-endpoint = <&rear_aux_ep>;
+			};
+		};
+
+		port@2 {
+			csiphy2_ep: endpoint {
+				data-lanes = <0 1 2 3>;
+				remote-endpoint = <&front_ep>;
+			};
+		};
+	};
+};
+
+&cci {
+	status = "okay";
+};
+
+&cci_i2c1 {
+	status = "okay";
+
+	rear_main: camera@1a {
+		compatible = "sony,imx586";
+		reg = <0x1a>;
+
+		orientation = <1>;
+		rotation = <270>;
+		reset-gpios = <&tlmm 47 GPIO_ACTIVE_LOW>;
+		camtest-gpios = <&tlmm 94 GPIO_ACTIVE_HIGH>, <&tlmm 98 GPIO_ACTIVE_HIGH>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&cam_mclk0_default>;
+
+		clocks = <&camcc CAM_CC_MCLK0_CLK>;
+		assigned-clocks = <&camcc CAM_CC_MCLK0_CLK>;
+		assigned-clock-rates = <24000000>;
+
+		avdd-supply = <&camera_vana0_ldo>;
+		dovdd-supply = <&vreg_l13a_1p8>;
+		dvdd-supply = <&camera_ldo>;
+
+		port {
+			rear_main_ep: endpoint {
+				data-lanes = <1 2 3 4>;
+				link-frequencies = /bits/ 64 <574000000>;
+				remote-endpoint = <&csiphy0_ep>;
+			};
+		};
+	};
+};
+
+&cci_i2c0 {
+	status = "okay";
+
+	/* rear aux: Samsung S5K5E8 (chip id 0x5e80 read at 0x18 on CCI master 0, measured 2026-11-03) */
+	rear_aux: camera@18 {
+		compatible = "samsung,s5k5e8";
+		reg = <0x18>;
+		reset-gpios = <&tlmm 45 GPIO_ACTIVE_LOW>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&cam_mclk1_default>;
+		clocks = <&camcc CAM_CC_MCLK1_CLK>;
+		assigned-clocks = <&camcc CAM_CC_MCLK1_CLK>;
+		assigned-clock-rates = <24000000>;
+		avdd-supply = <&camera_vana1_2_ldo>;
+		dovdd-supply = <&vreg_l13a_1p8>;
+		dvdd-supply = <&camera_ldo>;
+		orientation = <1>;
+		rotation = <270>;
+		port {
+			rear_aux_ep: endpoint {
+				data-lanes = <1 2>;
+				link-frequencies = /bits/ 64 <336000000>;
+				remote-endpoint = <&csiphy1_ep>;
+			};
+		};
+	};
+};
+
+&cci_i2c1 {
+	/* front: OmniVision OV13855 (chip id 0xd855 read at 0x36 on CCI master 1, measured 2026-11-03) */
+	front_cam: camera@36 {
+		compatible = "ovti,ov13855";
+		reg = <0x36>;
+		reset-gpios = <&tlmm 37 GPIO_ACTIVE_LOW>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&cam_mclk2_default>;
+		clocks = <&camcc CAM_CC_MCLK2_CLK>;
+		assigned-clocks = <&camcc CAM_CC_MCLK2_CLK>;
+		assigned-clock-rates = <24000000>;
+		avdd-supply = <&camera_vana1_2_ldo>;
+		dovdd-supply = <&vreg_l13a_1p8>;
+		dvdd-supply = <&camera_ldo>;
+		orientation = <0>;
+		rotation = <90>;
+		port {
+			front_ep: endpoint {
+				data-lanes = <1 2 3 4>;
+				link-frequencies = /bits/ 64 <360000000>;
+				remote-endpoint = <&csiphy2_ep>;
+			};
+		};
+	};
+};

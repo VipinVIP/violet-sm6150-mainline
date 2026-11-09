@@ -1,0 +1,53 @@
+#!/sbin/openrc-run
+# Plymouth boot splash for the violet (SM6150) port.
+#
+# NOT INSTALLED by default - see the enable/rollback block at the bottom.
+#
+# Why this file exists: this image has plymouth + plymouth-drm + the openrc
+# plugin installed and the `pmos-spin` theme, but NO init script, so `plymouthd`
+# never runs. With the kernel console on the serial port
+# (`console=ttyMSM0,115200n8`) and the msm fbdev unable to draw
+# ("fb0: sys_fillrect: framebuffer is not in virtual address space"), the panel
+# therefore shows nothing at all between the kernel's first modeset (~t=5 s) and
+# phoc/phosh painting the lock screen (~t=33 s). That ~30 s of "black screen with
+# the backlight on" is expected, not a fault - which is why it must be told apart
+# from the D1 link stall that leaves the panel dark even after the session is up.
+#
+# RISK, deliberately called out: plymouthd holds the DRM device while it runs. If
+# it does not quit, phoc cannot take the card and the session never starts (no
+# UI; ssh still works, so `rc-service plymouth stop` recovers). Enable this while
+# someone can look at the screen.
+
+description="Plymouth graphical boot splash"
+depend() {
+	need devfs
+	after udev-settle localmount
+	before greetd
+}
+
+start() {
+	mkdir -p /run/plymouth
+	ebegin "Starting Plymouth"
+	plymouthd --mode=boot --pid-file=/run/plymouth/pid --attach-to-session
+	eend $? "plymouthd failed to start"
+	sleep 0.2
+	plymouth --show-splash 2>/dev/null
+	eend 0
+}
+
+stop() {
+	ebegin "Stopping Plymouth"
+	plymouth quit --wait 2>/dev/null
+	eend 0
+}
+
+# --- enable / rollback (run on the device, as root) -------------------------
+#
+#   install -m 0755 plymouth.initd      /etc/init.d/plymouth
+#   install -m 0755 plymouth-quit.initd /etc/init.d/plymouth-quit
+#   rc-update add plymouth boot
+#   rc-update add plymouth-quit default
+#
+# Rollback if the session does not come up (ssh still works):
+#   rc-service plymouth stop; plymouth quit
+#   rc-update del plymouth boot; rc-update del plymouth-quit default

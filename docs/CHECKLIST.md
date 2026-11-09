@@ -176,7 +176,7 @@ Two facts that change the picture, from `research-audio.md`:
 ## 3. WiFi (WCN3990 / ath10k) — needs MPSS (the modem)
 
 > **STATUS 2026-10-28: WORKS — W1–W6 are done and W7 is optional polish, not a blocker.** Live evidence
-> from the device: `wlan0 UP <phone-ip>/24`, associated to `<home-ap-ssid>`, `-82 dBm`, 18 Mbit/s rx, and this
+> from the device: `wlan0 UP <lan-ip>/24`, associated to `<home-ssid>`, `-82 dBm`, 18 Mbit/s rx, and this
 > whole session has been driven over that link (SSH/SCP). AP mode works too. Fix = `patches/0015`
 > (create the BSS peer before station vdev start). `STATUS.md` row "WiFi (WCN3990 / ath10k)" = Works.
 > W7 (packing `bdwlan.*` with `ath10k-bdencoder` + `qcom,calibration-variant`) would only improve
@@ -265,16 +265,20 @@ associate/DHCP/AP (`patches/0015`, W1–W6) · ATL installed and running real ap
 
 | # | Item | Where | Cable? |
 |---|---|---|---|
-| G1 | **GPU lockups** — 9 `hangcheck detected gpu lockup rb 0` in 35 min (2026-10-29) killing `phoc`, `gnome-control-center`, ATL; follows long GPU suspend (active 1.8 h vs suspended 7.5 h). Fix = a6xx power-up/resume path | kernel (`drivers/gpu/drm/msm/adreno`) | **yes** (flash per iteration) |
-| D1 | **Boot-time DSI init race** — first panel power-on can fail the 6 GHz link rate (`clk-rcg2.c:136 update_config` + DSI FIFO errors) → black panel with a live compositor. Same `clk-rcg2` failure class as G1; treat the RCG `update_config` path as one shared root cause until disproven | kernel | **yes** |
-| S6 | dmesg flooded by `qcom_q6v5_pas … Handover signaled` (~94% of the ring), which is why crash evidence keeps rotating away | kernel | **yes** |
-| M1 | Microphone — WCD937x/SoundWire parked on `MASTER_CLASH_DET`; codec reset is LPI gpio24, not TLMM 24 | DT | **yes** |
-| A0 | `ramoops` record-size — pstore is empty after crashes, so there is no cross-reboot evidence | DT | **yes** |
+| G1 | **GPU lockups — FIXED 2026-10-31** (`patches/0026`-`0028`): RGMU suspend order as downstream; RGMU fault recovery; msm_gpu_submit no longer touches an unpowered GPU. ~1,870 resumes clean. NewPipe video itself still to re-test with the phone unlocked | 2026-10-31 | no |
+| D1 | **Boot-time DSI black panel — FIXED 2026-10-31** (`patches/0024`/`0025`, MDSS_CORE reset + pclk0 parent enable); 7/7 boots clean | 2026-10-31 | no |
+| S6 | dmesg flooding **FIXED AND VERIFIED 2026-10-30** | `qcom_q6v5_pas … Handover signaled` used to be ~94 % of the ring (1131 of 1451 lines). The rebuilt module (`qcom_q6v5.ko`, log first repeat then every 6000th) is installed and `depmod`-ed; after the 06:03 flash the same-size ring held **1** such line. See S7 for the second flood that was hiding behind it | module | no |
+| S7 | **`ath10k` debug flood — fixed at runtime, flag removed from the image builder** | `ath10k_core.debug_mask=0x7fffffff` in `mk-bootimg.sh` made ath10k dump every RX buffer pop as a 16-byte hex block, evicting the ring within ~6 min (first surviving line was at t=382 s). `echo 0 > /sys/module/ath10k_core/parameters/debug_mask` works at runtime (0644, no reboot); the flag is now removed from `mk-bootimg.sh` with a comment. Re-enable at runtime only, and reset it after | host cmdline | no |
+| U1 | **USB networking — DONE 2026-10-30**: `enp0s20f0u4` + `172.16.42.2/16` → phone `172.16.42.1/16`, 4 ms RTT, no loss, ssh works; `host/flash-g1.sh` re-adds the address and discovers the renamed interface each run | host | no |
+| M1 | **Microphone — WORKS 2026-10-31** (`patches/0029`-`0032`): LPI SSC pads, SWRM v1.5, WCD937x default-only reset pinctrl, PDR + built-in pd-mapper; PulseAudio `violet_mic` | DT+driver | no |
+| A0 | **ramoops — DONE 2026-10-31**: readable dmesg panic record (`pstore.compress=none`), verified with SysRq-c | DT+cmdline | no |
 | P1 | Suspend/resume — only `s2idle` exists and the phone does not come back; currently masked three ways | kernel/DT | **yes** |
-| X1 | Sensors — behind the Snapdragon Sensor Core; QRTR service 400 is alive but no registry; mainline has no SSC/CHRE driver (see §6) | kernel/DT (+ maybe userspace) | **yes** |
+| X1 | **Sensors — WORK (2026-10-30)** via SSC/hexagonrpcd, see STATUS | userspace | no |
 | W7 | `bdwlan.*` packing + `qcom,calibration-variant` — sensitivity polish only, WiFi already works | DT | yes |
-| C1 | **No SMB5 charger driver** — charging works only on the boot-time hardware defaults (no AICL, no PD/QC, no thermal throttle, no termination control). Downstream `qpnp-smb5.c`/`smb5-lib.c` is the reference; can be developed as a module, so no flash per iteration | kernel | no (module) |
-| T1 | Two UI checks the user can do without me: tap a text field (keyboard on focus), lock the phone (lock screen shows glissando, password prompt) | — | no |
+| C1 | **Charger: mostly done** — `violet-qg` re-runs the documented input-path init per plug-in with an APSD-based ICL, exposes a `usb` supply, and the Type-C port negotiates PD 9 V/3 A (sink-only). Fast-charge current is now temperature-limited (default 2.0 A; 2.5 A measured, warms the pack). Left: sustained 2.5-3 A from a cool pack, ICL above 1.8 A / 15-20 V / PPS, SDP path test, vendor switcher frequency, thermal mitigation (needs skin/connector ADC channels), boot-time charge pause. Reference: downstream `qpnp-smb5.c`/`smb5-lib.c` | kernel | no (module) |
+| B1 | Rest measurement for SoC accuracy — **armed**: `/tmp/rest-anchor.sh` (setsid, ~3 h) logs any abs(I) < 150 mA sample to `/tmp/rest-anchors.txt`; needs the phone unplugged and idle for a few minutes | — | waiting on user |
+| T1 | UI checks the user can do without me: ~~tap a text field (keyboard on focus)~~ **DONE 2026-11-07** - user confirmed the keyboard opens on touch after the phoc 0.58 upgrade (PROGRESS 2026-11-07 12:35); still open: lock the phone (lock screen shows glissando, password prompt) | — | partly |
+| K1 | ~~Confirm the OSK launcher fix on a real session start~~ **DONE 2026-10-30** — user unlocked with glissando; `sm.puri.OSK0` served by `bin/glissando --allow-replacement` (pid 12350), `phosh-osk-stevia` count 0 | — | done |
 
 **Cheap WiFi-only follow-ups:** finish the ATL app trial (only the GPU lockup blocks video), and try the GPU pin
 (`power/control=on` on `card0`/`5000000.gpu`/`506d000.gmu`, done manually 07:30 on 2026-10-29) as a holding
@@ -354,35 +358,100 @@ daemon and `rm -rf /run/user/10000/keyring` = `discover_other_daemon: 0` + `uint
 
 ---
 
-## 6. Sensors (accelerometer / orientation) — scoped 2026-10-28, not started
+## 6. Sensors — feasibility answered 2026-10-30 (implementation not started)
 
-**Where the hardware is:** not on the AP I2C/SPI buses. The stock DTB
-(`device-backup/boot-partition-before-native-2026-10-27.img`) has no accelerometer compatible at all — only
-`qcom,ssc-frequency-hz`, `qcom,ssc-ppm`, `qcom,ssctl-instance-id`, `sns_master`, `sns_slave`,
-`sns_mode_control`, `sensor_core`. So the sensors hang off the **Snapdragon Sensor Core**, and the AP side
-only describes that link.
+**The hardware, from the vendor's own sensor configs.** `vendor.img:/etc/sensors/config/talos_*.json`
+(extracted to `fw/sensors/`, codename "talos" = SM6150):
 
-**What works today on mainline:** nothing for motion. The only IIO devices are the two PMIC ADCs
-(`c440000.spmi:pmic@0/4 adc@3100`). `iio-sensor-proxy` is installed but has no IIO accelerometer to read, so
-Phosh cannot rotate.
+| Sensor | Part (SNS module) | SSC bus | addr | DRI irq |
+|---|---|---|---|---|
+| Accelerometer + gyroscope | ST **LSM6DS3-C** (`sns_lsm6ds3c`) | SPI, instance 2 | n/a | 81 |
+| Magnetometer | AKM **AK0991x** (`sns_ak0991x`) | I2C, instance 1 | **0x0C** | 83 |
+| Ambient light + proximity | Sensortek **STK3x3x** (`sns_stk3x3x`) | I2C, instance 1 | **0x47** | 92 |
 
-**Measured 2026-10-28 over WiFi (no cable, read-only):**
-- QRTR shows the sensor service **alive**: `400 1 0 5 14 Snapdragon Sensor Core service` (node 5 = ADSP).
-- `libssc 0.4.4` (installed, ships `ssccli`) finds it: `[qrtr] added server on 5:14 -> service 400` — then
-  loops `'registry' sensor unavailable, retrying... (1/100)` forever: the service is up but **no sensor
-  registry** is loaded, so no sensor is registered.
-- The vendor ships the registry: `vendor.img` → `/etc/sensors/{config, hals.conf, sns_reg_config}` (registry
-  = 4036 B), and the dsp partition carries CHRE apps (`chre_app_sensor_cfg.so`, `chre_app_oem.so`,
-  `libchre_slpi_skel.so`). On Android the **sensors HAL** reads `sns_reg_config` and pushes it to the SSC —
-  `libssc`/`ssccli` have **no registry write support** (checked binary strings + the Python bindings).
-- Mainline has **no** driver for the SSC/CHRE/sns link: nothing in `drivers/spi`, `drivers/soc/qcom`,
-  `drivers/iio`, no `drivers/misc/chre`, and no `ssc`/`sns` nodes in `qcs615.dtsi` or `violet-sm6150.dts`.
+Orientation for the IMU is `x=-x, y=-y, z=+z`; rails are `/pmic/client/sensor_vdd` and `sensor_vddio`.
+The STK3x3x config carries both `.als` and `.ps` groups, so **auto-brightness and proximity are viable
+targets**, not just rotation.
 
-**Verdict:** a real port, not a config flip. Cheapest possible first attempt is userspace-only (implement/obtain
-a registry push for the SSC and see whether sensors enumerate), which would be WiFi-only; anything that needs
-the SSC/SPI link or a CHRE probe is kernel/DT work and therefore **needs USB** to test. There is no
-`KillUserProcesses`-style single knob here, and no evidence yet that the SSC hardware path even exists on the
-mainline side.
+**Why no AP-side driver can reach them:** `bus_instance` is an index into the **SSC's own** I²C/SPI
+controllers, and the vendor DTB has no accelerometer/ALS node on any AP bus. So mainline's `st_lsm6dsx`
+or `stk3310` cannot be pointed at these chips — the values have to come through the SSC protocol
+(QRTR service 400, protobuf inside QMI).
+
+**CORRECTION to the 2026-10-28 note: the registry is generated, not shipped.** `sns_reg_config` (553 B) is
+not a registry blob — it maps sysfs attributes (`hw_platform`, `soc_id`, `revision`, …) and names the output
+path `/mnt/vendor/persist/sensors/registry/registry`. The ADSP builds the registry itself from the JSON
+configs plus `soc_id`. Therefore **no registry push is needed**; what the SSC lacks is *runtime file access*
+to those JSON configs.
+
+**STATUS 2026-10-30 06:31 — WORKING.** All five sensors read live values and `iio-sensor-proxy` exposes them:
+
+```
+$ ssccli --sensor accelerometer     → X=-0.63 Y=0.10 Z=9.90 m/s²   (phone flat: gravity on Z)
+$ ssccli --sensor light             → 5 lux / 7 lux / 0 lux
+$ ssccli --sensor gyroscope         → 0.000 / 0.000 / 0.000 m/s    (stationary)
+$ ssccli --sensor proximity         → FAR
+$ ssccli --sensor magnetometer      → 188.3 / 281.1 / 21.0 µT
+$ monitor-sensor --accel            → "Has accelerometer", "Tilt changed: face-up"
+$ monitor-sensor --light            → "Has ambient light sensor", "Light changed: 5.000000 (lux)"
+```
+
+Phosh's auto-rotate and auto-brightness consume exactly those `iio-sensor-proxy` properties, so the
+desktop side needs no further work — confirmed on the system bus:
+
+```
+net.hadess.SensorProxy.HasAccelerometer   → true
+net.hadess.SensorProxy.HasAmbientLight    → true
+```
+
+**What it took** (full recipe: `phone/install-sensors.sh`, staged files: `fw/sensors/violet-sensors.tar.gz`):
+1. `hexagonrpcd` + `-openrc` + `-udev` were already installed (0.4.0-r3); the packaged init script's
+   `command_args` were not usable as shipped, see 4.
+2. The SNS framework asks its config daemon for files that do not exist on mainline, and every miss is
+   logged verbatim (`Could not open /sys/devices/soc0/soc_id: No such file or directory`, …). Serving them
+   from the `-R` root is enough: `sensors/{config,registry,sns_reg.conf}` from the vendor configs, plus a
+   **faked Android socinfo** (`sys/devices/soc0/{hw_platform=MTP, soc_id=355, platform_*, revision=0}`) and
+   persist stubs (`mnt/vendor/persist/sensors/registry/{sns_reg_version,file1,file2}`).
+3. The device node is **`/dev/fastrpc-adsp-secure`** — there is no plain `/dev/fastrpc-adsp` on this port.
+   `hexagonrpcd -f /dev/fastrpc-adsp-secure -d adsp -s -R <root>` attaches to the sensor PD and the DSP
+   immediately starts asking for its files.
+4. So `/etc/init.d/hexagonrpcd-adsp-sensorspd` was patched to honour `hexagonrpcd_dev`
+   (default `/dev/fastrpc-adsp-secure`), `/etc/conf.d/hexagonrpcd-adsp-sensorspd` points
+   `hexagonrpcd_fw_dir` at the staged root, and the service is in the `default` runlevel.
+5. `iio-sensor-proxy` needed only a restart. (Alpine builds it with `-Dssc-support=enabled`, so no patching.)
+
+**Dead ends, recorded so they are not retried:** no `sdsp` DT node and no kernel change are needed
+(`patches/proposed/0020-…` is superseded — the daemon attaches to the ADSP device with `-s`); no registry
+push is needed (the DSP *generates* the registry, `sns_reg_config` only says where from/to).
+
+**Orientation — RETRACTED 2026-10-30 21:55: there was no orientation defect, and the "fix" caused one.**
+The panel's early `Bottom up` reading was a stale value from a freshly restarted proxy, not an axis
+inversion. A udev rule `ACCEL_MOUNT_MATRIX="-1,0,0;0,-1,0;0,0,1"` was installed on the theory that the vendor
+`.orient` (`x=-x, y=-y, z=+z`) had to be applied by hand; that rule is what then made the **UI render upside
+down** (reported by the user the same evening). Measured back to back in one pose, raw accel identical
+(`X=0.40, Y=-9.93`):
+
+| udev matrix | `AccelerometerOrientation` |
+|---|---|
+| `-1,0,0;0,-1,0;0,0,1` | `bottom-up`  (wrong) |
+| none / identity | `normal`  (correct, UI upright) |
+
+So the SSC data already arrives in the **device frame** — do not apply a mount matrix. The rule is removed from
+the phone and from this repo (`phone/90-violet-accel-mount-matrix.rules` deleted; step 4 of
+`phone/install-sensors.sh` is now a retraction note). The earlier "Z-inverting matrix flipped face-up to
+face-down" observation only proved the udev property *is* honoured on the SSC backend — it never justified
+applying one.
+
+**How to verify orientation properly next time:** read raw accel with `ssccli --sensor accelerometer` *and*
+`monitor-sensor --accel` (or the D-Bus `AccelerometerOrientation` property) in the same pose, and never trust the
+Sensors panel right after an `iio-sensor-proxy` restart.
+
+**Verification technique worth remembering:** the Sensors panel does **not** refresh when
+`iio-sensor-proxy` restarts (it sits on "No Sensors found"); restart `phosh-mobile-settings` and screenshot
+instead of asking a human to tap.
+
+**Camera is still untouched.** Only the sensor subsystem is done; the camera stack (CAMSS/CCI on sm6150)
+is a separate port.
 
 ---
 

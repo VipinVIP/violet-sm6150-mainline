@@ -1,4 +1,4 @@
-From: VipinVIP <VipinVIP@users.noreply.github.com>
+From: VipinVIP <vipindotkp@gmail.com>
 Subject: [PATCH] arm64: dts: qcom: add Xiaomi Redmi Note 7 Pro (violet)
 
 Board description for violet (SM6150/talos): memory map incl. ramoops, console, eMMC,

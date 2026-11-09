@@ -1,0 +1,26 @@
+#!/bin/sh
+# violet-bus-guard - keep (or release) the RX SoundWire codec slave attached.
+# Root-only helper for violet-jack-watch; the sysfs power controls are root-writable only.
+#   ensure  : if the slave is not Attached, force a master resume; then hold the bus awake
+#   hold    : hold the bus awake
+#   release : let it suspend again
+#   status  : print slave state
+set -u
+SLAVE=${SLAVE:-/sys/bus/soundwire/devices/sdw:2:0:0217:010a:00:4}
+MASTER=${MASTER:-/sys/devices/platform/soc@0/62ef0000.soundwire}
+
+setctl() { [ -e "$2/power/control" ] && echo "$1" > "$2/power/control" 2>/dev/null; }
+state() { cat "$SLAVE/status" 2>/dev/null; }
+
+case "${1:-ensure}" in
+ensure)
+	if [ "$(state)" != "Attached" ]; then
+		setctl on "$MASTER"; setctl on "$SLAVE"
+		sleep 1
+	fi
+	setctl on "$MASTER"; setctl on "$SLAVE";;
+hold)	setctl on "$MASTER"; setctl on "$SLAVE";;
+release) setctl auto "$MASTER"; setctl auto "$SLAVE";;
+status)	state;;
+*)	echo "usage: violet-bus-guard [ensure|hold|release|status]" >&2; exit 2;;
+esac

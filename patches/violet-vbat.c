@@ -31,16 +31,24 @@
 
 #define QG_BASE			0x4800
 #define QG_SUBTYPE		(QG_BASE + 0x05)
+/* PM6150 SMB5 (see asidko/pm6150-charger-mainline docs/REGISTER_SEQUENCE.md) */
+#define SMB5_APSD_RESULT	0x1308
+#define SMB5_USBIN_ICL_OPTIONS	0x1366
+#define SMB5_USBIN_ICL		0x1370
+#define SMB5_CHGR_STATUS5	0x100B
 #define QG_STATUS1		(QG_BASE + 0x08)
 #define QG_DATA_CTL2		(QG_BASE + 0x42)
 #define  BURST_AVG_HOLD	BIT(0)
 #define QG_LAST_ADC_V		(QG_BASE + 0xc0)
 #define QG_LAST_BURST_AVG_I	(QG_BASE + 0xc6)
+#define QG_S2_NORMAL_AVG_I	(QG_BASE + 0x82)
 #define QG_ADC_IBAT_5A		0x3
+#define QG_SOC_MONOTONIC	(QG_BASE + 0xbf)	/* qg-reg.h: QG_SOC_MONOTONIC_REG */
 
 #define SDAM_BASE		0xb600
 #define SDAM_VALID		(SDAM_BASE + 0x46)
 #define SDAM_SOC		(SDAM_BASE + 0x47)
+#define SDAM_MAGIC		0xA5	/* our marker in SDAM_VALID: SoC below is ours */
 #define SDAM_RBAT		(SDAM_BASE + 0x4a)	/* u16 mOhm */
 
 #define SMB5_CHGR_STATUS1	0x1006	/* [2:0] charge state, 5 = terminate */
@@ -50,6 +58,40 @@
 #define POLL_MS			5000
 #define REST_UA			80000	/* |I| below this counts as resting */
 #define REST_SECS		120
+/*
+ * Rbatt is a *dynamic* resistance: a 540 mA load step on 2026-10-29 gave
+ * dV/dI = 121.9 mOhm (least squares, 50 samples), which already contains the fast
+ * polarisation term. So OCV = V - I*Rbatt and no separate overpotential constant is
+ * applied - adding one would count the polarisation twice and bias SoC low.
+ */
+#define RBATT_MEASURED_MOHM	122
+
+static bool violet_debug;
+module_param_named(debug_state, violet_debug, bool, 0644);
+/*
+ * PM6150 SMB5 input-path init, following the sequence documented in
+ * asidko/pm6150-charger-mainline (docs/REGISTER_SEQUENCE.md), lifted there from
+ * downstream qpnp-smb5's smblib_icl_override(SW_OVERRIDE_HC_MODE):
+ *
+ *   0x1680 MISC_AICL_CMD          clear BIT(0)|BIT(1)  cancel pending AICL
+ *   0x1380 USBIN_AICL_OPTIONS_CFG 0x00                 disable hardware AICL
+ *   0x1370 USBIN_CURRENT_LIMIT    icl/50               static ICL
+ *   0x1061 FAST_CHARGE_CURRENT    fcc/50               battery-side target
+ *   0x1366 USBIN_ICL_OPTIONS      BIT(0)=1 BIT(1)=0    USBIN_MODE_CHG (high current)
+ *   0x1342 CMD_ICL_OVERRIDE       BIT(0)=1             SW ICL beats APSD
+ *   0x1365 USBIN_LOAD_CFG         BIT(4)=1             ICL_OVERRIDE_AFTER_APSD
+ *   0x1340 USBIN_CMD_IL           BIT(0)=0             unsuspend USBIN
+ *   0x1042 CHARGING_ENABLE_CMD    BIT(0)=1             master enable
+ *
+ * The 0x1366 mode bit is the one that silently caps VBUS at the SDP ~500 mA
+ * fallback while every other register reads back correctly. AICL goes off
+ * before the ICL, and the overrides go in before USBIN is unsuspended.
+ * JEITA, float voltage, safety timer, OTG and watchdog are left untouched.
+ */
+static int smb5_init;
+module_param_named(smb5_init, smb5_init, int, 0644);
+MODULE_PARM_DESC(smb5_init, "0 = snapshot SMB5 input path only, 1 = apply the documented init sequence");
+MODULE_PARM_DESC(debug_state, "log gauge internals once a minute");
 
 /* mV*10 -> percent, vendor Alium 3600 mAh profile, 25C, descending */
 static const struct { u16 pct; u16 v; } ocv[] = {
@@ -70,6 +112,9 @@ struct violet_batt {
 	struct power_supply *psy;
 	struct delayed_work work;
 	bool five_amp;
+	int raw_burst, raw_normal, subtype_raw;
+	bool sdam_marked;
+	unsigned int hw_soc_raw;
 	int rbat_mohm;
 	int vbat_uv, ibat_ua;		/* ibat: >0 discharging */
 	s64 charge_uah;			/* remaining charge */
@@ -116,6 +161,14 @@ static int violet_batt_sample(struct violet_batt *b)
 	if (ret)
 		return ret;
 	raw = buf[0] | (buf[1] << 8);
+	b->raw_burst = (s16)raw;
+
+	regmap_update_bits(b->map, QG_DATA_CTL2, BURST_AVG_HOLD, BURST_AVG_HOLD);
+	ret = regmap_bulk_read(b->map, QG_S2_NORMAL_AVG_I, buf, 2);
+	regmap_update_bits(b->map, QG_DATA_CTL2, BURST_AVG_HOLD, 0);
+	if (!ret)
+		b->raw_normal = (s16)(buf[0] | (buf[1] << 8));
+
 	/*
 	 * Sign, measured 2026-10-29 against the charger registers: with CHGR_STATUS1
 	 * in an active state, CHARGER_INHIBIT clear, CMD_IL not suspended and ICL ~3 A,
@@ -128,7 +181,43 @@ static int violet_batt_sample(struct violet_batt *b)
 	b->plugged = hi & BIT(4);
 	regmap_read(b->map, SMB5_CHGR_STATUS1, &lo);
 	b->term = (lo & 7) == 5;
+	regmap_read(b->map, QG_SOC_MONOTONIC, &hi);
+	b->hw_soc_raw = hi;
 	return 0;
+}
+
+
+static void violet_smb5_init(struct violet_batt *b, int apply)
+{
+	unsigned int apsd = 0, opts = 0, icl = 0, st5 = 0;
+
+	regmap_read(b->map, SMB5_APSD_RESULT, &apsd);
+	regmap_read(b->map, SMB5_USBIN_ICL_OPTIONS, &opts);
+	regmap_read(b->map, SMB5_USBIN_ICL, &icl);
+	regmap_read(b->map, SMB5_CHGR_STATUS5, &st5);
+	dev_info(b->dev, "SMB5 before: apsd=0x%02x icl_options=0x%02x (mode_chg=%d) icl=%d mA status5=0x%02x\n",
+		 apsd, opts, !!(opts & BIT(0)), (icl & 0xff) * 50, st5);
+
+	if (!apply) {
+		dev_info(b->dev, "SMB5: snapshot only (smb5_init=0), nothing written\n");
+		return;
+	}
+
+	regmap_update_bits(b->map, 0x1680, BIT(0) | BIT(1), 0);
+	regmap_write(b->map, 0x1380, 0x00);
+	regmap_write(b->map, 0x1370, 1800 / 50);	/* 1.8 A input limit */
+	regmap_write(b->map, 0x1061, 2000 / 50);	/* 2 A battery target */
+	regmap_update_bits(b->map, 0x1366, BIT(0) | BIT(1), BIT(0));
+	regmap_update_bits(b->map, 0x1342, BIT(0), BIT(0));
+	regmap_update_bits(b->map, 0x1365, BIT(4), BIT(4));
+	regmap_update_bits(b->map, 0x1340, BIT(0), 0);
+	regmap_update_bits(b->map, 0x1042, BIT(0), BIT(0));
+
+	regmap_read(b->map, SMB5_USBIN_ICL_OPTIONS, &opts);
+	regmap_read(b->map, SMB5_USBIN_ICL, &icl);
+	regmap_read(b->map, SMB5_CHGR_STATUS5, &st5);
+	dev_info(b->dev, "SMB5 after: icl_options=0x%02x (mode_chg=%d) icl=%d mA status5=0x%02x\n",
+		 opts, !!(opts & BIT(0)), (icl & 0xff) * 50, st5);
 }
 
 static void violet_batt_poll(struct work_struct *w)
@@ -146,7 +235,7 @@ static void violet_batt_poll(struct work_struct *w)
 	if (dt_ms > 0 && dt_ms < 60000)
 		b->charge_uah += (s64)b->ibat_ua * dt_ms / 3600000;
 
-	/* IR-compensated open circuit voltage */
+	/* IR-compensated open circuit voltage (Rbatt already includes polarisation) */
 	ocv_uv = b->vbat_uv - (s64)b->ibat_ua * b->rbat_mohm / 1000;
 	soc_ocv_x100 = ocv_to_soc_x100(ocv_uv);
 
@@ -155,7 +244,7 @@ static void violet_batt_poll(struct work_struct *w)
 			b->resting = true;
 			b->rest_since = now;
 		}
-		/* after a quiet spell trust the OCV: nudge the counter to it */
+		/* after a quiet spell trust the OCV: pull the counter to it quickly */
 		if (ktime_ms_delta(now, b->rest_since) > REST_SECS * 1000) {
 			s64 target = (s64)soc_ocv_x100 * FCC_UAH / 10000;
 
@@ -163,6 +252,21 @@ static void violet_batt_poll(struct work_struct *w)
 		}
 	} else {
 		b->resting = false;
+		/*
+		 * Under load the OCV is good as a LEVEL but bad as a RATE: polarisation
+		 * is not a pure resistance, so V - I*Rbatt drifts faster or slower than
+		 * the pack really charges. Measured 2026-10-30 over 417 s at 1.68 A:
+		 * coulomb integration said +5.4 points while the OCV model said +9.2
+		 * (ratio 0.59); over an earlier 48 min window the same pair erred ~4x
+		 * the other way. So: no continuous correction under load. The counter
+		 * owns the rate (its discharge current was verified against physics),
+		 * and OCV is only used to rescue a genuinely wrong anchor.
+		 */
+		s64 target = (s64)soc_ocv_x100 * FCC_UAH / 10000;
+		s64 err = target - b->charge_uah;
+
+		if (err > FCC_UAH / 5 || err < -(FCC_UAH / 5))
+			b->charge_uah += err / 20;	/* 20+ points off: real drift, fix it */
 	}
 
 	/* the charger says the pack is full */
@@ -172,19 +276,52 @@ static void violet_batt_poll(struct work_struct *w)
 	b->charge_uah = clamp_t(s64, b->charge_uah, 0, FCC_UAH);
 	soc = DIV_ROUND_CLOSEST_ULL(b->charge_uah * 100, FCC_UAH);
 
-	/* only publish moves that agree with the current's direction */
-	if (soc != b->soc) {
-		if ((soc < b->soc && b->ibat_ua < 20000) ||
-		    (soc > b->soc && b->ibat_ua > -20000))
-			b->soc = soc;
+	/*
+	 * Monotonic clamp (what downstream qpnp-qg calls MSOC): while current flows the
+	 * percentage may only move in the direction that current implies. It is released
+	 * by a rest-based OCV recalibration (|I| below REST_UA for REST_SECS) or by
+	 * charger termination, which are the only two trustworthy anchors. Without this
+	 * the reported SoC twitches every time the OCV estimate and the counter disagree.
+	 */
+	{
+		/*
+		 * The clamp must not lock in a wrong anchor: when the model and the
+		 * published value disagree by 2+ points the OCV correction is allowed
+		 * through, otherwise a drift like the 35-point one above could never be
+		 * corrected while the phone stays plugged in.
+		 */
+		bool anchor = (abs(b->ibat_ua) < REST_UA) || b->term ||
+			      abs(soc - b->soc) >= 2;
+
+		if (soc != b->soc) {
+			if (anchor)
+				b->soc = soc;
+			else if (b->ibat_ua > 20000 && soc > b->soc)	/* charging: only up */
+				b->soc = soc;
+			else if (b->ibat_ua < -20000 && soc < b->soc)	/* discharging: only down */
+				b->soc = soc;
+		}
 	}
-	if (b->soc != b->sdam_soc) {
+	if (b->soc != b->sdam_soc || !b->sdam_marked) {
 		regmap_write(b->map, SDAM_SOC, b->soc);
+		regmap_write(b->map, SDAM_VALID, SDAM_MAGIC);
 		b->sdam_soc = b->soc;
+		b->sdam_marked = true;
 	}
 	dev_dbg(b->dev, "v=%d i=%d ocv=%d soc_ocv=%d.%02d q=%lld soc=%d plug=%d term=%d\n",
 		b->vbat_uv, b->ibat_ua, ocv_uv, soc_ocv_x100 / 100, soc_ocv_x100 % 100,
 		b->charge_uah, b->soc, b->plugged, b->term);
+	if (violet_debug) {
+		static unsigned int tick;
+
+		if (!(tick++ % 12))
+			dev_info(b->dev, "v=%d i=%d ocv=%d soc_ocv=%d.%02d q=%lld soc=%d plug=%d term=%d rest=%d\n",
+				 b->vbat_uv, b->ibat_ua, ocv_uv, soc_ocv_x100 / 100,
+				 soc_ocv_x100 % 100, (long long)b->charge_uah, b->soc,
+				 b->plugged, b->term, b->resting);
+			dev_info(b->dev, "hw_soc_raw=0x%02x (%u)  qg_soc_status=0x%02x\n",
+				 b->hw_soc_raw, b->hw_soc_raw & 0xff, (b->hw_soc_raw >> 8) & 0xff);
+	}
 	power_supply_changed(b->psy);
 out:
 	schedule_delayed_work(&b->work, msecs_to_jiffies(POLL_MS));
@@ -280,14 +417,16 @@ static int violet_batt_probe(struct platform_device *pdev)
 		return -ENODEV;
 
 	regmap_read(b->map, QG_SUBTYPE, &v);
+	b->subtype_raw = v;
 	b->five_amp = v == QG_ADC_IBAT_5A;
+	violet_smb5_init(b, smb5_init);
 	regmap_read(b->map, SDAM_VALID, &valid);
 	regmap_read(b->map, SDAM_SOC, &soc);
 	regmap_read(b->map, SDAM_RBAT, &rbat[0]);
 	regmap_read(b->map, SDAM_RBAT + 1, &rbat[1]);
 	b->rbat_mohm = rbat[0] | (rbat[1] << 8);
 	if (b->rbat_mohm < 20 || b->rbat_mohm > 400)
-		b->rbat_mohm = 120;
+		b->rbat_mohm = RBATT_MEASURED_MOHM;
 
 	if (violet_batt_sample(b))
 		return dev_err_probe(&pdev->dev, -EIO, "QG not answering\n");
@@ -296,15 +435,36 @@ static int violet_batt_probe(struct platform_device *pdev)
 	 * Start from the OCV estimate when the pack is resting; with a load on it
 	 * (or while charging) the downstream driver's saved value is better.
 	 */
-	if (abs(b->ibat_ua) < REST_UA || !valid || soc > 100 || !soc)
-		b->soc = DIV_ROUND_CLOSEST(soc_x100, 100);
-	else
+	/*
+	 * Prefer the SoC this driver persisted: it is coulomb-counted and therefore
+	 * valid under load, while the OCV estimate is only valid at rest (at 1-2 A the
+	 * I*Rbat term is worth ~0.15-0.25 V, i.e. 15-25 % of SoC, with the 120 mOhm
+	 * pack resistance read from SDAM). Re-deriving from OCV on every reload is what
+	 * made the percentage jump 59 -> 80 -> 74 -> 73.
+	 */
+	if (valid == SDAM_MAGIC && soc > 0 && soc <= 100)
 		b->soc = soc;
+	else
+		b->soc = DIV_ROUND_CLOSEST(soc_x100, 100);
 	b->sdam_soc = soc;
 	b->charge_uah = (s64)b->soc * FCC_UAH / 100;
 	b->last = ktime_get_boottime();
 	dev_info(&pdev->dev, "QG %s, rbat %d mOhm, sdam soc %u (valid %u), vbat %d uV ibat %d uA -> start %d%%\n",
 		 b->five_amp ? "5A" : "10A", b->rbat_mohm, soc, valid, b->vbat_uv, b->ibat_ua, b->soc);
+	dev_info(b->dev, "raw subtype=0x%02x burst_avg_i=%d normal_avg_i=%d (scale %s)\n",
+		 b->subtype_raw, b->raw_burst, b->raw_normal, b->five_amp ? "5A" : "10A");
+	{
+		unsigned int apsd, iclopt, icl, st5;
+
+		regmap_read(b->map, SMB5_APSD_RESULT, &apsd);
+		regmap_read(b->map, SMB5_USBIN_ICL_OPTIONS, &iclopt);
+		regmap_read(b->map, SMB5_USBIN_ICL, &icl);
+		regmap_read(b->map, SMB5_CHGR_STATUS5, &st5);
+		dev_info(b->dev, "SMB5 apsd=0x%02x (sdp=%d dcp=%d float=%d) icl_options=0x%02x mode_chg=%d usb51=%d icl=%d mA status5=0x%02x valid_vin=%d chg_en=%d\n",
+			 apsd, !!(apsd & BIT(0)), !!(apsd & BIT(3)), !!(apsd & BIT(4)),
+			 iclopt, !!(iclopt & BIT(0)), !!(iclopt & BIT(1)), (icl & 0xff) * 50,
+			 st5, !!(st5 & BIT(7)), !!(st5 & BIT(4)));
+	}
 
 	cfg.drv_data = b;
 	cfg.fwnode = dev_fwnode(&pdev->dev);

@@ -1,0 +1,18 @@
+ASoC: codecs: wcd937x: use gpiod_set_value_cansleep() for reset
+
+The reset line can sit on a sleeping gpiochip (LPASS LPI takes an ADSP vote via runtime PM).
+
+--- a/sound/soc/codecs/wcd937x.c
++++ b/sound/soc/codecs/wcd937x.c
+@@ -239,9 +239,9 @@
+ 
+ static void wcd937x_reset(struct wcd937x_priv *wcd937x)
+ {
+-	gpiod_set_value(wcd937x->reset_gpio, 1);
++	gpiod_set_value_cansleep(wcd937x->reset_gpio, 1);
+ 	usleep_range(20, 30);
+-	gpiod_set_value(wcd937x->reset_gpio, 0);
++	gpiod_set_value_cansleep(wcd937x->reset_gpio, 0);
+ 	usleep_range(20, 30);
+ }
+ 

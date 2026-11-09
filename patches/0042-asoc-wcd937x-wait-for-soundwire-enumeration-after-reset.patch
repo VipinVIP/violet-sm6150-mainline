@@ -1,0 +1,15 @@
+--- a/sound/soc/codecs/wcd937x.c	2026-11-06 01:09:57.855132283 +0530
++++ b/sound/soc/codecs/wcd937x.c	2026-11-06 01:09:57.882925171 +0530
+@@ -2951,6 +2951,12 @@
+ 		return ret;
+ 
+ 	wcd937x_reset(wcd937x);
++	/*
++	 * Give the codec time to come out of reset and auto-enumerate on the
++	 * SoundWire buses before the slaves are bound and initialised; the
++	 * downstream driver waits 5 ms here "as per HW requirement".
++	 */
++	usleep_range(5000, 5010);
+ 
+ 	ret = component_master_add_with_match(dev, &wcd937x_comp_ops, match);
+ 	if (ret)

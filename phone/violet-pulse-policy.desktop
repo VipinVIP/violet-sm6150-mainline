@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Violet PulseAudio jack policy (workaround)
+Exec=/usr/local/bin/violet-pulse-policy
+NoDisplay=true
+X-GNOME-Autostart-Phase=Applications

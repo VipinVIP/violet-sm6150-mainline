@@ -8,7 +8,7 @@ cat > /tmp/dummy.conf <<EOC
 ctrl_interface=/tmp/wpa_dummy
 p2p_disabled=1
 network={
-  ssid="<home-ap-ssid>"
+  ssid="<home-ssid>"
   psk="dummy-not-the-real-password"
   scan_ssid=1
 }

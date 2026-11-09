@@ -1,0 +1,51 @@
+ASoC: q6routing: disconnect the previous back end when a front end is re-routed
+
+A front-end session has exactly one ADM copp, tracked as session->port_id, but
+every "<BE> Audio Mixer MultiMediaN" switch owns its own DAPM path.  Enabling a
+second back end for the same front end only moved port_id and connected the new
+path; the previously selected path stayed connected and DAPM kept that back end
+powered.  Reading the old switch reported 0 (get compares against port_id), and
+turning the old switch off returned early because port_id no longer matched it,
+so userspace could not remove the stale path at all - only a reboot cleared it.
+
+Consequences observed on the Xiaomi Redmi Note 7 Pro (sm6150, WCD9375, mainline
+7.2.10, legacy q6asm/q6afe/q6routing): after re-routing MultiMedia3 from
+PRI_MI2S_RX to RX_CODEC_DMA_RX_0, the playback stream blocked forever with no
+kernel error (the ASM session was mapped to a copp on a port DPCM had not
+started), and the speaker amplifier still powered up (the stale path).
+
+Keep the selected mixer control in the session and disconnect it before
+connecting the new one, so get/put and DAPM agree again.
+
+Verified on the device after flashing: cross-routing MM3 no longer leaves the
+speaker path powered (TAS amp stays quiet, get reports the old BE as off), and
+speaker and jack both play in sequence with a clean kernel log.
+
+--- a/sound/soc/qcom/qdsp6/q6routing.c
++++ b/sound/soc/qcom/qdsp6/q6routing.c
+@@ struct session_data
+ 	int state;
+ 	int port_id;
++	/* BE mixer control currently selected for this front end */
++	struct snd_kcontrol *kctl;
+@@ msm_routing_put_audio_mixer
+ 	if (ucontrol->value.integer.value[0]) {
+ 		if (session->port_id == be_id)
+ 			return 0;
+ 
++		/* drop the old back end first, or DAPM keeps it powered */
++		if (session->kctl && session->kctl != kcontrol)
++			snd_soc_dapm_mixer_update_power(dapm, session->kctl, 0, update);
++
+ 		session->port_id = be_id;
++		session->kctl = kcontrol;
+ 		snd_soc_dapm_mixer_update_power(dapm, kcontrol, 1, update);
+ 	} else {
+ 		if (session->port_id == -1 || session->port_id != be_id)
+ 			return 0;
+ 
+ 		session->port_id = -1;
++		if (session->kctl == kcontrol)
++			session->kctl = NULL;
+ 		snd_soc_dapm_mixer_update_power(dapm, kcontrol, 0, update);
+ 	}

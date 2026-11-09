@@ -1,4 +1,4 @@
-From: VipinVIP <VipinVIP@users.noreply.github.com>
+From: VipinVIP <vipindotkp@gmail.com>
 Subject: [PATCH] drm/panel: novatek-nt36672e: add the NT36672A shenchao variant (Redmi Note 7 Pro)
 
 Init sequence transcribed from the vendor panel DTS (38 DCS writes). Wired in the board

@@ -1,0 +1,61 @@
+soundwire: qcom: re-initialise the controller when a slave cannot clock-stop
+
+A slave without clock-stop mode 1 support (clk_stop_mode1 == false, e.g. the
+WCD9375 on the Xiaomi Redmi Note 7 Pro: no DisCo properties at all) cannot keep
+its state across a stopped bus.  For such a bus the controller must be fully
+re-initialised on resume, because the clock-stop exit path does not re-init the
+controller: the link never comes back up and every stream then fails with
+
+  qcom-soundwire 62ef0000.soundwire: SWR CMD error, fifo status 0x3e00012e
+  wcd9370-codec sdw:2:0:0217:010a:00:4: DPN_PortCtrl register write failed for port 1
+  soundwire sdw-master-2-0: Program params failed: -5
+   WCD937x Playback: ASoC error (-5): at snd_soc_link_prepare()
+
+Two bugs, both fixed here:
+
+1. The condition was inverted relative to the intent stated in its own commit
+   (74e79da9fd46 "soundwire: qcom: set clk stop need reset flag at runtime":
+   "needs a full reset if clock stop support is not available in slave
+   devices").  It set the flag when a slave *did* support clock stop, so boards
+   with mode-0-only codecs took the graceful path and wedged.
+
+2. The decision was taken in qcom_swrm_enumerate(), racing with the slave
+   drivers' probe (the property is set there) and only honouring the last
+   enumerated slave.  Take it in swrm_runtime_suspend() instead, so the matching
+   resume uses the same value (upstream fix by Marek Szyprowski, 2026-10-28).
+
+Verified on violet: RX slave Attached through 120 s idle with no userspace
+guard, two consecutive playbacks rc=0, dmesg clean.
+
+--- a/drivers/soundwire/qcom.c
++++ b/drivers/soundwire/qcom.c
+@@ qcom_swrm_enumerate()
+-		ctrl->clock_stop_not_supported = false;
+ 		list_for_each_entry_safe(slave, _s, &bus->slaves, node) {
+ 			if (sdw_compare_devid(slave, id) == 0) {
+ 				qcom_swrm_set_slave_dev_num(bus, slave, i);
+-				if (slave->prop.clk_stop_mode1)
+-					ctrl->clock_stop_not_supported = true;
+-
+ 				found = true;
+++ qcom_swrm_clk_stop_needs_reset() + swrm_runtime_suspend()
++static bool qcom_swrm_clk_stop_needs_reset(struct qcom_swrm_ctrl *ctrl)
++{
++	struct sdw_slave *slave;
++
++	list_for_each_entry(slave, &ctrl->bus.slaves, node) {
++		if (!slave->prop.clk_stop_mode1)
++			return true;
++	}
++
++	return false;
++}
++
+ static int __maybe_unused swrm_runtime_suspend(struct device *dev)
+ {
+ 	struct qcom_swrm_ctrl *ctrl = dev_get_drvdata(dev);
+ 	int ret;
+ 
+ 	swrm_wait_for_wr_fifo_done(ctrl);
++	ctrl->clock_stop_not_supported = qcom_swrm_clk_stop_needs_reset(ctrl);
+ 	if (!ctrl->clock_stop_not_supported) {

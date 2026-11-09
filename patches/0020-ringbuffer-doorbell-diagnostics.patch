@@ -1,0 +1,52 @@
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
+@@ -191,8 +191,21 @@
+ 
+ 	/* Update HW if this is the current ring and we are not in preempt*/
+ 	if (!a6xx_in_preempt(a6xx_gpu)) {
+-		if (a6xx_gpu->cur_ring == ring)
+-			a6xx_fenced_write(a6xx_gpu, REG_A6XX_CP_RB_WPTR, wptr, BIT(0), false);
++		if (a6xx_gpu->cur_ring == ring) {
++			int ret = a6xx_fenced_write(a6xx_gpu, REG_A6XX_CP_RB_WPTR,
++						    wptr, BIT(0), false);
++
++			/*
++			 * G1: this return value used to be discarded, so a doorbell
++			 * write lost behind the AHB fence left the ring unread with no
++			 * trace at all (rptr stuck at the old value, wptr never seen).
++			 * Always report it.
++			 */
++			if (ret)
++				dev_err_ratelimited(&gpu->pdev->dev,
++						    "flush: CP_RB_WPTR=%u fenced write failed (%d)\n",
++						    wptr, ret);
++		}
+ 		else
+ 			ring->restore_wptr = true;
+ 	} else {
+@@ -932,6 +945,8 @@
+ 
+ 	a6xx_flush(gpu, ring);
+ 	if (!a6xx_idle(gpu, ring)) {
++		struct a6xx_gpu *a6xx_gpu = to_a6xx_gpu(to_adreno_gpu(gpu));
++
+ 		/* G1: identify what the CP was doing when CP_ME_INIT wasn't fetched */
+ 		DRM_DEV_ERROR(gpu->dev->dev,
+ 			      "cp_init: CP_ME_INIT not consumed (rptr=%u wptr=%u rbbm_status=%08x cp_sqe_cntl=%08x)\n",
+@@ -939,6 +954,16 @@
+ 			      gpu_read(gpu, REG_A6XX_CP_RB_WPTR),
+ 			      gpu_read(gpu, REG_A6XX_RBBM_STATUS),
+ 			      gpu_read(gpu, REG_A6XX_CP_SQE_CNTL));
++		/*
++		 * G1: a clear AHB_FENCE_STATUS writedropped bit counts as a successful
++		 * doorbell write, but a collapsed GMU reads back as 0 and would then
++		 * look healthy.  Log the raw fence and power state alongside it.
++		 */
++		DRM_DEV_ERROR(gpu->dev->dev,
++			      "cp_init: ahb_fence_status=%08x gmu_pwr_clk_status=%08x ring_wptr=%u\n",
++			      gmu_read(&a6xx_gpu->gmu, REG_A6XX_GMU_AHB_FENCE_STATUS),
++			      gmu_read(&a6xx_gpu->gmu, REG_A6XX_GMU_SPTPRAC_PWR_CLK_STATUS),
++			      get_wptr(ring));
+ 		return -EINVAL;
+ 	}
+ 	return 0;

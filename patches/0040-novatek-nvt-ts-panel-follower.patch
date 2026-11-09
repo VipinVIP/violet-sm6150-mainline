@@ -1,0 +1,216 @@
+Input: novatek-nvt-ts: initialise when the panel is prepared (drm_panel_follower) instead of polling for 30 s
+
+The NT36672A controller is powered from the panel bias rail and only answers once the panel is up. The local patch worked around that with a delayed work that polled the I2C bus every 200 ms for up to 30 s. Use the standard DRM panel-follower mechanism (as i2c-hid and goodix do): with a "panel" phandle in the touchscreen node the init runs from panel_prepared(); without one it initialises immediately. DT: touchscreen@1 gets panel = <&panel0>. #187: "Detected 1080x2340 touchscreen" at 5.96 s, immediately after the panel.
+
+--- a/drivers/input/touchscreen/novatek-nvt-ts.c
++++ b/drivers/input/touchscreen/novatek-nvt-ts.c
+@@ -7,6 +7,7 @@
+  */
+ 
+ #include <linux/delay.h>
++#include <drm/drm_panel.h>
+ #include <linux/gpio/consumer.h>
+ #include <linux/interrupt.h>
+ #include <linux/i2c.h>
+@@ -58,6 +59,9 @@
+ 	struct regulator_bulk_data regulators[2];
+ 	struct touchscreen_properties prop;
+ 	int max_touches;
++	struct delayed_work init_work;
++	struct drm_panel_follower follower;
++	int init_tries;
+ 	u8 buf[NVT_TS_TOUCH_SIZE * NVT_TS_MAX_TOUCHES];
+ };
+ 
+@@ -192,13 +196,41 @@
+ 
+ static DEFINE_SIMPLE_DEV_PM_OPS(nvt_ts_pm_ops, nvt_ts_suspend, nvt_ts_resume);
+ 
++static void nvt_ts_init_work(struct work_struct *work);
++
++static void nvt_ts_cancel_init(void *arg)
++{
++	struct nvt_ts_data *data = arg;
++
++	cancel_delayed_work_sync(&data->init_work);
++}
++
++static int nvt_ts_panel_prepared(struct drm_panel_follower *follower)
++{
++	struct nvt_ts_data *data = container_of(follower, struct nvt_ts_data, follower);
++
++	if (!data->input)
++		schedule_delayed_work(&data->init_work, 0);
++
++	return 0;
++}
++
++static int nvt_ts_panel_unpreparing(struct drm_panel_follower *follower)
++{
++	return 0;
++}
++
++static const struct drm_panel_follower_funcs nvt_ts_follower_funcs = {
++	.panel_prepared = nvt_ts_panel_prepared,
++	.panel_unpreparing = nvt_ts_panel_unpreparing,
++};
++
+ static int nvt_ts_probe(struct i2c_client *client)
+ {
+ 	struct device *dev = &client->dev;
+-	int error, width, height, irq_type;
++	int error;
+ 	struct nvt_ts_data *data;
+ 	const struct nvt_ts_i2c_chip_data *chip;
+-	struct input_dev *input;
+ 
+ 	if (!client->irq) {
+ 		dev_err(dev, "Error no irq specified\n");
+@@ -228,28 +260,69 @@
+ 		return error;
+ 	}
+ 
+-	error = regulator_bulk_enable(ARRAY_SIZE(data->regulators), data->regulators);
++	/*
++	 * The vendor kernel never drives this pin (NVT_TOUCH_SUPPORT_HW_RST 0 and
++	 * pin 88 is MUX+GPIO UNCLAIMED there), so take it AS-IS and leave it
++	 * untouched - driving it high holds an active-high RESET.
++	 */
++	data->reset_gpio = devm_gpiod_get(dev, "reset", GPIOD_ASIS);
++	error = PTR_ERR_OR_ZERO(data->reset_gpio);
+ 	if (error) {
+-		dev_err(dev, "failed to enable regulators: %d\n", error);
++		dev_err(dev, "failed to request reset GPIO: %d\n", error);
+ 		return error;
+ 	}
+ 
+-	data->reset_gpio = devm_gpiod_get(dev, "reset", GPIOD_OUT_LOW);
+-	error = PTR_ERR_OR_ZERO(data->reset_gpio);
+-	if (error) {
+-		regulator_bulk_disable(ARRAY_SIZE(data->regulators), data->regulators);
+-		dev_err(dev, "failed to request reset GPIO: %d\n", error);
++	/*
++	 * The controller hangs off the panel bias rail (LCDB) and only answers once the
++	 * panel is powered, so it must not be probed here (that would sit on the deferred
++	 * probe worker and delay the panel itself).  When the touchscreen node has a
++	 * "panel" phandle, follow the panel: initialise when it has been prepared.
++	 */
++	INIT_DELAYED_WORK(&data->init_work, nvt_ts_init_work);
++	error = devm_add_action_or_reset(dev, nvt_ts_cancel_init, data);
++	if (error)
+ 		return error;
++
++	if (drm_is_panel_follower(dev)) {
++		data->follower.funcs = &nvt_ts_follower_funcs;
++		return devm_drm_panel_add_follower(dev, &data->follower);
++	}
++
++	schedule_delayed_work(&data->init_work, 0);
++	return 0;
++}
++
++static void nvt_ts_init_work(struct work_struct *work)
++{
++	struct nvt_ts_data *data = container_of(to_delayed_work(work),
++						struct nvt_ts_data, init_work);
++	struct i2c_client *client = data->client;
++	struct device *dev = &client->dev;
++	const struct nvt_ts_i2c_chip_data *chip = device_get_match_data(dev);
++	int error, width, height, irq_type;
++	struct input_dev *input;
++
++	if (!chip)
++		return;
++
++	error = regulator_bulk_enable(ARRAY_SIZE(data->regulators), data->regulators);
++	if (error) {
++		dev_err(dev, "failed to enable regulators: %d\n", error);
++		return;
+ 	}
+ 
+-	/* Wait for controller to come out of reset before params read */
+-	msleep(100);
+-	error = nvt_ts_read_data(data->client, NVT_TS_PARAMETERS_START,
++	error = nvt_ts_read_data(client, NVT_TS_PARAMETERS_START,
+ 				 data->buf, NVT_TS_PARAMS_SIZE);
+-	gpiod_set_value_cansleep(data->reset_gpio, 1); /* Put back in reset */
+ 	regulator_bulk_disable(ARRAY_SIZE(data->regulators), data->regulators);
+-	if (error)
+-		return error;
++
++	if (error) {
++		if (++data->init_tries < 10) {          /* the panel is already up: 10 x 200ms */
++			schedule_delayed_work(&data->init_work, msecs_to_jiffies(200));
++			return;
++		}
++		dev_err(dev, "giving up - controller never answered (%d)\n", error);
++		return;
++	}
+ 
+ 	width  = get_unaligned_be16(&data->buf[NVT_TS_PARAMS_WIDTH]);
+ 	height = get_unaligned_be16(&data->buf[NVT_TS_PARAMS_HEIGHT]);
+@@ -262,18 +335,18 @@
+ 	    data->buf[NVT_TS_PARAMS_CHIP_ID] != chip->chip_id) {
+ 		dev_err(dev, "Unsupported touchscreen parameters: %*ph\n",
+ 			NVT_TS_PARAMS_SIZE, data->buf);
+-		return -EIO;
++		return;
+ 	}
+ 
+-	dev_dbg(dev, "Detected %dx%d touchscreen with %d max touches\n",
+-		width, height, data->max_touches);
++	dev_info(dev, "Detected %dx%d touchscreen with %d max touches\n",
++		 width, height, data->max_touches);
+ 
+ 	if (data->buf[NVT_TS_PARAMS_MAX_BUTTONS])
+ 		dev_warn(dev, "Touchscreen buttons are not supported\n");
+ 
+ 	input = devm_input_allocate_device(dev);
+ 	if (!input)
+-		return -ENOMEM;
++		return;
+ 
+ 	input->name = client->name;
+ 	input->id.bustype = BUS_I2C;
+@@ -287,27 +360,23 @@
+ 	error = input_mt_init_slots(input, data->max_touches,
+ 				    INPUT_MT_DIRECT | INPUT_MT_DROP_UNUSED);
+ 	if (error)
+-		return error;
++		return;
+ 
+ 	data->input = input;
+ 	input_set_drvdata(input, data);
+ 
+ 	error = devm_request_threaded_irq(dev, client->irq, NULL, nvt_ts_irq,
+ 					  IRQF_ONESHOT | IRQF_NO_AUTOEN |
+-						nvt_ts_irq_type[irq_type],
++					  nvt_ts_irq_type[irq_type],
+ 					  client->name, data);
+ 	if (error) {
+ 		dev_err(dev, "failed to request irq: %d\n", error);
+-		return error;
++		return;
+ 	}
+ 
+ 	error = input_register_device(input);
+-	if (error) {
++	if (error)
+ 		dev_err(dev, "failed to register input device: %d\n", error);
+-		return error;
+-	}
+-
+-	return 0;
+ }
+ 
+ static const struct nvt_ts_i2c_chip_data nvt_nt11205_ts_data = {
+--- a/drivers/input/touchscreen/Kconfig
++++ b/drivers/input/touchscreen/Kconfig
+@@ -694,6 +694,7 @@
+ config TOUCHSCREEN_NOVATEK_NVT_TS
+ 	tristate "Novatek NT11205 touchscreen support"
+ 	depends on I2C
++	depends on DRM || !DRM
+ 	help
+ 	  Say Y here if you have a Novatek NT11205 touchscreen.
+ 	  If unsure, say N.

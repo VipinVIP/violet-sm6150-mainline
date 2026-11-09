@@ -1,0 +1,4 @@
+# violet rear torch: minimum useful brightness for the Phosh torch tile.
+# Tied to this exact LED by its firmware node.  gmobile's own hwdb lookup keys on
+# [devicetree/base]compatible, which this udev (251) does not resolve, so it never matches here.
+SUBSYSTEM=="leds", KERNEL=="white:flash", ENV{OF_FULLNAME}=="/soc@0/spmi@c440000/pmic@5/led-controller@d300/led-0", ENV{GM_TORCH_MIN_BRIGHTNESS}="10"

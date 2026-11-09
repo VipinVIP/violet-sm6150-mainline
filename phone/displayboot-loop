@@ -1,0 +1,54 @@
+#!/bin/sh
+# Display boot-window sampler for the violet port (D1/D2). Started by
+# /etc/init.d/displayboot via start-stop-daemon --background, NOT from
+# /etc/local.d: a plain `( loop ) &` inside a local.d script is killed when the
+# `local` service exits, which silently produced no captures at all for several
+# boots.
+#
+# Records, every 2 s for ~3 minutes: panel/backlight state, DRM dpms, the DSI
+# connector, and which of greetd/phoc/phosh exist. Snapshots dmesg at fixed
+# uptimes (the early DSI lines rotate out of the 133 KB ring fast) and takes
+# screenshots once phoc's session bus is up - a good screenshot on a dark panel
+# means the fault is DSI/link, no session bus means the compositor never came up.
+
+D=/var/log/displayboot
+LOG=$D/state.log
+mkdir -p "$D/shots"
+chmod 1777 "$D/shots"          # phosh runs as `user` and writes the screenshots
+[ -f "$LOG" ] && [ "$(stat -c %s "$LOG")" -gt 262144 ] && mv -f "$LOG" "$LOG.1"
+
+echo "=== boot $(date -Iseconds) kernel=$(uname -r) ===" >> "$LOG"
+
+i=0
+while [ "$i" -lt 90 ]; do
+	T=$(cut -d. -f1 /proc/uptime)
+	BL=$(cat /sys/class/backlight/backlight/actual_brightness 2>/dev/null)
+	BLP=$(cat /sys/class/backlight/backlight/bl_power 2>/dev/null)
+	DPM=$(cat /sys/class/drm/card0-DSI-1/dpms 2>/dev/null)
+	ST=$(cat /sys/class/drm/card0-DSI-1/status 2>/dev/null)
+	PH=$(pgrep -x phoc | head -1)
+	PS=$(pgrep -x phosh | head -1)
+	GD=$(pgrep -x greetd | head -1)
+	echo "t=$T bl=$BL bl_power=$BLP dpms=$DPM dsi=$ST phoc=${PH:-none} phosh=${PS:-none} greetd=${GD:-none}" >> "$LOG"
+
+	case "$T" in
+	10|20|30|45|60|90|120|150|180) dmesg > "$D/dmesg-$T.txt" 2>/dev/null ;;
+	esac
+
+	if [ -n "$PH" ] && [ $((i % 5)) -eq 0 ] && [ -d /run/user/10000 ]; then
+		DB=$(tr '\0' '\n' < "/proc/$PH/environ" 2>/dev/null | grep ^DBUS_SESSION_BUS_ADDRESS= | cut -d= -f2-)
+		if [ -n "$DB" ]; then
+			sudo -u user env XDG_RUNTIME_DIR=/run/user/10000 DBUS_SESSION_BUS_ADDRESS="$DB" \
+				gdbus call --session --dest org.gnome.Shell.Screenshot \
+				--object-path /org/gnome/Shell/Screenshot \
+				--method org.gnome.Shell.Screenshot.Screenshot false false "$D/shots/t$T.png" \
+				>> "$D/shots.log" 2>&1
+		fi
+	fi
+
+	i=$((i + 1))
+	sleep 2
+done
+
+dmesg > "$D/dmesg-final.txt" 2>/dev/null
+echo "=== probe done t=$(cut -d. -f1 /proc/uptime) ===" >> "$LOG"

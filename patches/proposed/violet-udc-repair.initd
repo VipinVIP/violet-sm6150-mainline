@@ -1,0 +1,14 @@
+#!/sbin/openrc-run
+# violet-udc-repair - repair the USB gadget after a suspend resume on the violet port.
+# See /usr/local/bin/violet-udc-repair.sh for why (dwc3 "failed to enable ep0out").
+description="Repair the USB gadget UDC after suspend resume (violet)"
+
+supervisor="supervise-daemon"
+command="/usr/local/bin/violet-udc-repair.sh"
+respawn_delay=2
+respawn_max=0          # keep respawning: this must never stay dead
+
+depend() {
+	need devfs localmount
+	after usb-signaller
+}

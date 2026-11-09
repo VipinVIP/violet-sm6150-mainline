@@ -1,0 +1,35 @@
+ASoC: qcom: q6dsp-lpass-clocks: set drvdata before registering the clocks
+
+After an ADSP restart (crash recovery, or a failed resume) the audio macros still hold prepared clocks
+of the old provider. Registering the new provider re-parents those orphans and prepares them inside
+__clk_register(), i.e. clk_q6dsp_prepare() runs before q6dsp_clock_dev_probe() has called
+dev_set_drvdata(): dev_get_drvdata() is NULL and cc->desc (offset 0x348) faults.
+Seen on violet right after s2idle resume (pdr_notifier_wq -> of_register_apr_devices ->
+q6afe_clock_dev_probe), followed by a wedged root filesystem. Set the drvdata first.
+
+--- a/sound/soc/qcom/qdsp6/q6dsp-lpass-clocks.c
++++ b/sound/soc/qcom/qdsp6/q6dsp-lpass-clocks.c
+@@ -146,6 +146,14 @@
+ 	cc->dev = dev;
+ 	q6dsp_clks = desc->clks;
+ 
++	/*
++	 * Must be set before the clocks are registered: after a DSP restart the
++	 * old consumers' clocks are still prepared, and registering the new
++	 * provider re-parents them (__clk_register -> reparent orphans), which
++	 * prepares the new clock and calls clk_q6dsp_prepare() right away.
++	 */
++	dev_set_drvdata(dev, cc);
++
+ 	for (i = 0; i < desc->num_clks; i++) {
+ 		unsigned int id = q6dsp_clks[i].clk_id;
+ 		struct clk_init_data init = {
+@@ -178,8 +186,6 @@
+ 	if (ret)
+ 		return ret;
+ 
+-	dev_set_drvdata(dev, cc);
+-
+ 	return 0;
+ }
+ EXPORT_SYMBOL_GPL(q6dsp_clock_dev_probe);

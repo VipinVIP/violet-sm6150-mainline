@@ -22,9 +22,14 @@ if [ -z "${PHOC:-}" ]; then
 fi
 DBUS=$(tr '\0' '\n' < "/proc/$PHOC/environ" | grep ^DBUS_SESSION_BUS_ADDRESS= | cut -d= -f2-)
 
+# Edge swipe => Android back (see atl-swipe-back.c). Disable with ATL_SWIPE_BACK=0.
+PRELOAD=""
+if [ "${ATL_SWIPE_BACK:-1}" != 0 ] && [ -f /usr/local/lib/libatl-swipe-back.so ]; then PRELOAD=/usr/local/lib/libatl-swipe-back.so; fi
+
 exec sudo -n -u user env \
 	XDG_RUNTIME_DIR=/run/user/10000 \
 	WAYLAND_DISPLAY=wayland-0 \
 	DBUS_SESSION_BUS_ADDRESS="$DBUS" \
 	GSK_RENDERER="${ATL_GSK_RENDERER:-vulkan}" \
+	LD_PRELOAD="$PRELOAD" \
 	android-translation-layer "$APK" ${ACT:+-l "$ACT"}

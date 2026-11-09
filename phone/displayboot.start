@@ -1,0 +1,59 @@
+#!/bin/sh
+# Capture the first ~3 minutes of display state after boot.
+#
+# Why: D1 is a boot-time DSI init race that leaves the panel powered but not scanning
+# ("black screen with backlight", compositor healthy) until something re-modesets it.
+# The dmesg ring rotates within minutes on this device, so the only lines that matter
+# (t=5-11 s) are gone by the time anyone looks. This probe writes them to disk early and
+# records the panel/compositor state every 2 s, plus screenshots, so the black window can
+# be told apart from "compositor not rendering" after the fact.
+#
+# Installed as /etc/local.d/displayboot.start (local runlevel). Logs in /var/log/displayboot/.
+
+D=/var/log/displayboot
+# phosh (running as `user`) writes the screenshots, so the directory must be writable by it.
+mkdir -p "$D/shots"
+chmod 1777 "$D/shots"
+LOG=$D/state.log
+[ -f "$LOG" ] && [ "$(stat -c %s "$LOG")" -gt 262144 ] && mv -f "$LOG" "$LOG.1"
+
+echo "=== boot $(date -Iseconds) kernel=$(uname -r) ===" >> "$LOG"
+
+( i=0
+while [ "$i" -lt 90 ]; do
+	T=$(cut -d. -f1 /proc/uptime)
+	BL=$(cat /sys/class/backlight/backlight/actual_brightness 2>/dev/null)
+	BLP=$(cat /sys/class/backlight/backlight/bl_power 2>/dev/null)
+	DPM=$(cat /sys/class/drm/card0-DSI-1/dpms 2>/dev/null)
+	ST=$(cat /sys/class/drm/card0-DSI-1/status 2>/dev/null)
+	PH=$(pgrep -x phoc | head -1)
+	PS=$(pgrep -x phosh | head -1)
+	GD=$(pgrep -x greetd | head -1)
+	echo "t=$T bl=$BL bl_power=$BLP dpms=$DPM dsi=$ST phoc=${PH:-none} phosh=${PS:-none} greetd=${GD:-none}" >> "$LOG"
+
+	# Early dmesg snapshots: this is the part that the ring rotation destroys.
+	case "$T" in
+	10|20|30|45|60|90|120|150|180) dmesg > "$D/dmesg-$T.txt" 2>/dev/null ;;
+	esac
+
+	# Screenshot while the panel should be showing something: a good screenshot on a dark
+	# panel means the fault is DSI/link (D1); no session bus or a black screenshot means the
+	# compositor never came up (D2).
+	if [ -n "$PH" ] && [ $((i % 5)) -eq 0 ] && [ -d /run/user/10000 ]; then
+		DB=$(tr '\0' '\n' < "/proc/$PH/environ" 2>/dev/null | grep ^DBUS_SESSION_BUS_ADDRESS= | cut -d= -f2-)
+		if [ -n "$DB" ]; then
+			sudo -u user env XDG_RUNTIME_DIR=/run/user/10000 DBUS_SESSION_BUS_ADDRESS="$DB" \
+				gdbus call --session --dest org.gnome.Shell.Screenshot \
+				--object-path /org/gnome/Shell/Screenshot \
+				--method org.gnome.Shell.Screenshot.Screenshot false false "$D/shots/t$T.png" \
+				>> "$D/shots.log" 2>&1
+		fi
+	fi
+
+	i=$((i + 1))
+	sleep 2
+done
+
+dmesg > "$D/dmesg-final.txt" 2>/dev/null
+echo "=== probe done t=$(cut -d. -f1 /proc/uptime) ===" >> "$LOG"
+) &

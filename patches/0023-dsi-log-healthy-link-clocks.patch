@@ -1,0 +1,27 @@
+--- a/drivers/gpu/drm/msm/dsi/dsi_host.c
++++ b/drivers/gpu/drm/msm/dsi/dsi_host.c
+@@ -1608,6 +1608,7 @@
+ }
+ 
+ static int dsidbg_count, dsidbg_dumped;
++static int dsidbg_clk_logged;	/* one positive link-clock sample per boot */
+ 
+ static void dsidbg_dump(void)
+ {
+@@ -2693,6 +2694,16 @@
+ 			__func__, dsi_read(msm_host, DSI_6G_CLK_STATUS));
+ 	}
+ 
++	/*
++	 * Log the healthy value once per boot. Without this, "no stalled message"
++	 * is only the absence of evidence - it cannot distinguish a healthy link
++	 * from a check that read the wrong register. One positive sample per boot
++	 * makes the verification self-proving.
++	 */
++	if (!dsidbg_clk_logged++)
++		pr_info("%s: link clocks active (clk_status=%08x)\n",
++			__func__, dsi_read(msm_host, DSI_6G_CLK_STATUS));
++
+ 	ret = pinctrl_pm_select_default_state(&msm_host->pdev->dev);
+ 	if (ret) {
+ 		pr_err("%s: failed to set pinctrl default state, %d\n",

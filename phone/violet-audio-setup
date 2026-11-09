@@ -3,7 +3,26 @@ export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
 # Session autostart: route MultiMedia3 -> PRI_MI2S_RX (speaker) and make it the default PulseAudio sink.
 A=$(amixer -c 0 controls | grep "PRI_MI2S_RX Audio Mixer MultiMedia3'" | sed "s/numid=\([0-9]*\).*/\1/")
 [ -n "$A" ] && amixer -c 0 cset numid=$A on >/dev/null
+# Mic: main analog mic AMIC1 -> WCD937x ADC1 -> TX macro DEC0 (SWR mic) -> TX_CODEC_DMA_TX_3 -> MultiMedia2 (hw:0,1).
+amixer -c 0 -q cset name='MultiMedia2 Mixer TX_CODEC_DMA_TX_3' 1 2>/dev/null
+amixer -c 0 -q cset name='TX_AIF1_CAP Mixer DEC0' 1 2>/dev/null
+amixer -c 0 -q cset name='TX DEC0 MUX' SWR_MIC 2>/dev/null
+amixer -c 0 -q cset name='TX SMIC MUX0' ADC0 2>/dev/null
+amixer -c 0 -q cset name='ADC1_MIXER Switch' 1 2>/dev/null
+amixer -c 0 -q cset name='ADC1 Switch' 1 2>/dev/null
+amixer -c 0 -q cset name='ADC1 Volume' 20 2>/dev/null
+# Measured 2026-11-02 with a laptop-played sweep: at ADC1=12/DEC0=84 speech sits near -34 dBFS (quiet);
+# ADC1=20/DEC0=92 gives -15 dBFS and in-band SNR ~21 dB. Measured again same day from the user's own
+# Sound Recorder files (FLAC stereo 44.1k, `~/.local/share/org.gnome.SoundRecorder/Recording N`):
+# at ADC1=20/DEC0=88 normal speech at 30 cm sits at -28.2 dBFS and close-mic at -26.9 dBFS, i.e. ~14 dB
+# below a music file played at the same sink volume (-13.8 dBFS) - which is the "recording plays back
+# quiet" complaint. ADC1 is already at its hardware maximum (0..20), so DEC0 is the only useful knob;
+# its range is 0..124 (1 dB/step), 36 dB of headroom. 88 -> 100 is +12 dB and lands speech at the music
+# level, matching the value alsa-ucm-conf uses for the TX-macro path (`TX_DEC0 Volume` 100).
+amixer -c 0 -q cset name='TX_DEC0 Volume' 100 2>/dev/null
 for i in 1 2 3 4 5 6 7 8 9 10; do pactl info >/dev/null 2>&1 && break; sleep 1; done
 pactl list short sinks | grep -q violet_speaker || pactl load-module module-alsa-sink sink_name=violet_speaker device=hw:0,2 rate=48000 channels=2 format=s16le tsched=0 fragments=4 fragment_size=16384 >/dev/null
 pactl set-default-sink violet_speaker
 pactl set-sink-volume violet_speaker 50%
+pactl list short sources | grep -q violet_mic || pactl load-module module-alsa-source source_name=violet_mic device=hw:0,1 rate=48000 channels=1 format=s16le tsched=0 >/dev/null
+pactl set-default-source violet_mic 2>/dev/null

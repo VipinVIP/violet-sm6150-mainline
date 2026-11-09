@@ -1,0 +1,332 @@
+drm/msm: remove the D1/G1 diagnostics (DSIDBG); DPU core clock back to dynamic
+
+Removed: D1 clock-status probe, DSI/INTF register dump, error-IRQ masking after 2000 errors, link
+clock stall checks + logs, dsi_tpg test-pattern param, forced max DPU core clock, INTF timing print;
+per-resume RGMU info prints downgraded to debug. Kept and relabelled (downstream parity used by the
+working panel bring-up): DMA_FIFO_CTRL value, BLOCK_DMA_WITHIN_FRAME left clear, PHY_RESET bit 24,
+video-mode enable split, HS TX timeout, TPG DMA mode clear, byte-clock rounding (upstream 6cd33b6f4155).
+Verified #180: dsi_err 0, underruns 0, MDP clock 192 MHz dynamic, 40-round animation stress clean.
+
+--- a/drivers/gpu/drm/msm/dsi/dsi_host.c
++++ b/drivers/gpu/drm/msm/dsi/dsi_host.c
+@@ -93,18 +93,6 @@
+ #define DSI_ERR_STATE_INTERLEAVE_OP_CONTENTION	0x0010
+ #define DSI_ERR_STATE_PLL_UNLOCKED		0x0020
+ 
+-/*
+- * D1 (2026-10-30): 6G DSI CLK_STATUS is at 0x120, +4 from the legacy offset the
+- * generated dsi.xml.h names (0x11c). Confirmed by reading both registers on a
+- * stalled link: 0x120 = 0x343 - which is the documented "DYN BYTECLK and DYN
+- * PCLK missing" signature - while 0x11c = 0x23f carries only the CLK_CTRL core
+- * clock bits. Bit meanings from dsi.xml (DSI_CLK_STATUS_DSI_DYN_*).
+- */
+-#define DSI_6G_CLK_STATUS		0x120
+-#define DSI_6G_FIFO_STATUS		0x0c	/* likewise +4 from the xml's 0x08 */
+-#define DSI_CLK_STATUS_DYN_BYTECLK	0x80
+-#define DSI_CLK_STATUS_DYN_PCLK		0x400
+-
+ #define DSI_CLK_CTRL_ENABLE_CLKS	\
+ 		(DSI_CLK_CTRL_AHBS_HCLK_ON | DSI_CLK_CTRL_AHBM_SCLK_ON | \
+ 		DSI_CLK_CTRL_PCLK_ON | DSI_CLK_CTRL_DSICLK_ON | \
+@@ -436,26 +424,6 @@
+ 		}
+ 	}
+ 
+-	/*
+-	 * D1 ordering probe (2026-10-30). update_config() in clk-rcg2.c returns
+-	 * -EBUSY when the RCG will not take a new config, but CCF's
+-	 * clk_change_rate() discards that return, so nothing here can tell whether
+-	 * the rate took. Sample the hardware instead:
+-	 *   - CLK_STATUS bit16 is PLL_UNLOCKED (latched). Set here means the rate
+-	 *     was programmed while the DSI PHY PLL was not locked - i.e. the
+-	 *     enable ORDER is wrong and the fix belongs there, not in a retry.
+-	 *   - clk_get_rate() is CCF's own view (it can simply echo the request),
+-	 *     logged for contrast, never as proof.
+-	 */
+-	{
+-		u32 cs = dsi_read(msm_host, DSI_6G_CLK_STATUS);
+-
+-		pr_info("%s: req pclk=%lu byte=%lu | ccf_pclk=%lu | clk_status=%08x pll_unlocked=%u\n",
+-			__func__, msm_host->pixel_clk_rate, msm_host->byte_clk_rate,
+-			clk_get_rate(msm_host->pixel_clk), cs,
+-			!!(cs & DSI_CLK_STATUS_PLL_UNLOCKED));
+-	}
+-
+ 	return 0;
+ }
+ 
+@@ -905,7 +873,7 @@
+ 		 * that keeps the video engine from taking pixels from the INTF.
+ 		 */
+ 		dsi_write(msm_host, REG_DSI_TEST_PATTERN_GEN_CTRL, 0);
+-		dsi_write(msm_host, 0x4c, 0x00110000);	/* DSIDBG: DMA_FIFO_CTRL as downstream */
++		dsi_write(msm_host, 0x4c, 0x00110000);	/* DMA_FIFO_CTRL: downstream value */
+ 
+ 		/* Do not swap RGB colors */
+ 		data = DSI_VID_CFG1_RGB_SWAP(SWAP_RGB);
+@@ -946,10 +914,10 @@
+ 	data |= DSI_TRIG_CTRL_MDP_TRIGGER(TRIGGER_NONE);
+ 	data |= DSI_TRIG_CTRL_DMA_TRIGGER(TRIGGER_SW);
+ 	data |= DSI_TRIG_CTRL_STREAM(msm_host->channel);
+-	if ((cfg_hnd->major == MSM_DSI_VER_MAJOR_6G) &&
+-		(cfg_hnd->minor >= MSM_DSI_6G_VER_MINOR_V1_2))
+-		if (0)	/* DSIDBG: downstream leaves this clear */
+-		data |= DSI_TRIG_CTRL_BLOCK_DMA_WITHIN_FRAME;
++	/*
++	 * Upstream sets DSI_TRIG_CTRL_BLOCK_DMA_WITHIN_FRAME on 6G >= v1.2;
++	 * the downstream driver leaves it clear for this panel, and so do we.
++	 */
+ 	dsi_write(msm_host, REG_DSI_TRIG_CTRL, data);
+ 
+ 	data = DSI_CLKOUT_TIMING_CTRL_T_CLK_POST(phy_shared_timings->clk_post) |
+@@ -1639,36 +1607,6 @@
+ 	return len;
+ }
+ 
+-static int dsidbg_count, dsidbg_dumped;
+-static int dsidbg_clk_logged;	/* one positive link-clock sample per boot */
+-
+-static void dsidbg_dump(void)
+-{
+-	void __iomem *r = ioremap(0xae94000, 0x1000);
+-	int o;
+-
+-	if (!r)
+-		return;
+-	for (o = 0; o < 0x924; o += 4) {
+-		u32 v = readl(r + o);
+-
+-		if (v)
+-			pr_info("DSIREG %08x %08x\n", 0xae94000 + o, v);
+-	}
+-	iounmap(r);
+-
+-	r = ioremap(0xae6b800, 0x2c0);	/* DPU INTF_1 */
+-	if (!r)
+-		return;
+-	for (o = 0; o < 0x2c0; o += 4) {
+-		u32 v = readl(r + o);
+-
+-		if (v)
+-			pr_info("INTFREG %08x %08x\n", 0xae6b800 + o, v);
+-	}
+-	iounmap(r);
+-}
+-
+ static void dsi_err_worker(struct work_struct *work)
+ {
+ 	struct msm_dsi_host *msm_host =
+@@ -1679,7 +1617,7 @@
+ 	if (status & DSI_ERR_STATE_MDP_FIFO_UNDERFLOW)
+ 		dsi_sw_reset(msm_host);
+ 	/*
+-	 * D1 (2026-10-30): the "sw reset on every FIFO error" DSIDBG experiment is
++	 * D1 (2026-10-30): the "sw reset on every FIFO error" experiment is
+ 	 * removed. A software reset while the controller is running in video mode
+ 	 * tears down the FIFO that is being refilled, so the boot-time error burst
+ 	 * (first power-on, fifo_status=0xdddd1019) turned a transient into a panel
+@@ -1691,12 +1629,6 @@
+ 	/* It is safe to clear here because error irq is disabled. */
+ 	msm_host->err_work_state = 0;
+ 
+-	if (!dsidbg_dumped++)
+-		dsidbg_dump();
+-	if (dsidbg_count > 2000) {
+-		pr_err("DSIDBG leaving the DSI error irq masked after %d errors\n", dsidbg_count);
+-		return;
+-	}
+ 
+ 	/* enable dsi error interrupt */
+ 	dsi_intr_ctrl(msm_host, DSI_IRQ_MASK_ERROR, 1);
+@@ -1723,7 +1655,6 @@
+ 	status = dsi_read(msm_host, REG_DSI_TIMEOUT_STATUS);
+ 
+ 	if (status) {
+-		pr_err_ratelimited("DSIDBG timeout_status=0x%08x\n", status);
+ 		dsi_write(msm_host, REG_DSI_TIMEOUT_STATUS, status);
+ 		msm_host->err_work_state |= DSI_ERR_STATE_TIMEOUT;
+ 	}
+@@ -1753,8 +1684,6 @@
+ 
+ 	/* fifo underflow, overflow */
+ 	if (status) {
+-		pr_err_ratelimited("DSIDBG fifo_status=0x%08x\n", status);
+-		dsidbg_count++;
+ 		dsi_write(msm_host, REG_DSI_FIFO_STATUS, status);
+ 		msm_host->err_work_state |= DSI_ERR_STATE_FIFO;
+ 		if (status & DSI_FIFO_STATUS_CMD_MDP_FIFO_UNDERFLOW)
+@@ -2504,7 +2433,7 @@
+ 	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
+ 
+ 	DBG("");
+-	/* DSIDBG: downstream also sets bit 24 */
++	/* downstream also sets bit 24 */
+ 	dsi_write(msm_host, REG_DSI_PHY_RESET, DSI_PHY_RESET_RESET | BIT(24));
+ 	/* Make sure fully reset */
+ 	wmb();
+@@ -2588,7 +2517,6 @@
+ 	if (!(msm_host->mode_flags & MIPI_DSI_MODE_VIDEO))
+ 		return;
+ 
+-	pr_info("DSIDBG enable_video\n");
+ 	dsi_sw_reset(msm_host);
+ 	dsi_write(msm_host, REG_DSI_CTRL,
+ 		  dsi_read(msm_host, REG_DSI_CTRL) & ~DSI_CTRL_CMD_MODE_EN);
+@@ -2641,41 +2569,6 @@
+  *
+  * Only STALLED is actionable; UNREADABLE must not fail a power-on.
+  */
+-#define DSI_LINK_CLK_UNREADABLE	0
+-#define DSI_LINK_CLK_OK		1
+-#define DSI_LINK_CLK_STALLED	2
+-
+-static int dsi_link_clock_state(struct msm_dsi_host *msm_host)
+-{
+-	u32 status = dsi_read(msm_host, DSI_6G_CLK_STATUS);
+-	u32 need = DSI_CLK_STATUS_DYN_BYTECLK | DSI_CLK_STATUS_DYN_PCLK;
+-
+-	if (!status)
+-		return DSI_LINK_CLK_UNREADABLE;
+-
+-	return (status & need) == need ? DSI_LINK_CLK_OK : DSI_LINK_CLK_STALLED;
+-}
+-
+-/*
+- * Wait (bounded) for either a healthy link or a definitive stall. Stops early on
+- * STALLED so the caller can retry the rate, and on UNREADABLE only when the whole
+- * timeout expires - an unclocked register must not be mistaken for a dead link.
+- */
+-static int dsi_wait_link_clocks(struct msm_dsi_host *msm_host, unsigned int timeout_us)
+-{
+-	unsigned int waited;
+-	int state = DSI_LINK_CLK_UNREADABLE;
+-
+-	for (waited = 0; waited < timeout_us; waited += 200) {
+-		state = dsi_link_clock_state(msm_host);
+-		if (state != DSI_LINK_CLK_UNREADABLE)
+-			return state;
+-		usleep_range(100, 200);
+-	}
+-
+-	return state;
+-}
+-
+ int msm_dsi_host_power_on(struct mipi_dsi_host *host,
+ 			struct msm_dsi_phy_shared_timings *phy_shared_timings,
+ 			bool is_bonded_dsi, struct msm_dsi_phy *phy)
+@@ -2712,43 +2605,6 @@
+ 		goto fail_disable_reg;
+ 	}
+ 
+-	/*
+-	 * D1 (2026-10-30): verify the link clocks are actually toggling before the
+-	 * DPU is handed this link.
+-	 *
+-	 * clk_set_rate() cannot report the failure: update_config() in clk-rcg2.c
+-	 * polls CMD_UPDATE for 500us, then WARNs and returns -EBUSY, but CCF's
+-	 * clk_change_rate() discards a driver's set_rate return value, so
+-	 * dsi_link_clk_set_rate_6g() returns 0 even when the 6 GHz link rate never
+-	 * took. The controller then runs with DYN BYTECLK/PCLK gated off
+-	 * (CLK_STATUS = 0x343 measured on the failing boot), the DPU overflows the
+-	 * FIFO (0xdddd1019) and the panel sits black with the backlight on until a
+-	 * fresh power-on cycle - the "two power-button presses" recovery.
+-	 *
+-	 * Note the 6G register offset: CLK_STATUS is at 0x120 here, not the 0x11c
+-	 * the generated dsi.xml.h names (that is CLK_CTRL on 6G hardware).
+-	 */
+-	if (dsi_wait_link_clocks(msm_host, 20000) == DSI_LINK_CLK_STALLED)
+-		pr_err("%s: link clocks stalled after enable (clk_status=%08x, fifo=%08x)\n",
+-		       __func__, dsi_read(msm_host, DSI_6G_CLK_STATUS),
+-		       dsi_read(msm_host, DSI_6G_FIFO_STATUS));
+-
+-	/*
+-	 * Log the healthy value once per boot. Without this, "no stalled message"
+-	 * is only the absence of evidence - it cannot distinguish a healthy link
+-	 * from a check that read the wrong register. One positive sample per boot
+-	 * makes the verification self-proving.
+-	 */
+-	{
+-		int st_now = dsi_link_clock_state(msm_host);
+-
+-		pr_info("%s: after clk enable state=%s (clk_status=%08x, power_on#%d)\n",
+-			__func__,
+-			st_now == DSI_LINK_CLK_OK ? "ok" :
+-			st_now == DSI_LINK_CLK_STALLED ? "STALLED" : "unreadable",
+-			dsi_read(msm_host, DSI_6G_CLK_STATUS), ++dsidbg_clk_logged);
+-	}
+-
+ 	ret = pinctrl_pm_select_default_state(&msm_host->pdev->dev);
+ 	if (ret) {
+ 		pr_err("%s: failed to set pinctrl default state, %d\n",
+@@ -2760,26 +2616,6 @@
+ 	dsi_sw_reset(msm_host);
+ 	dsi_ctrl_enable(msm_host, phy_shared_timings, phy);
+ 
+-	/*
+-	 * Post-enable sample. The first power-on after probe reads CLK_STATUS as
+-	 * 0x00000000 for the first tens of ms, so the pre-enable check is blind;
+-	 * by the time video is enabled the register answers. Recording this value
+-	 * on every power-on is what shows the first attempt failing and the later
+-	 * DPMS off/on (the user's "two power presses") succeeding.
+-	 */
+-	{
+-		int st_end = dsi_wait_link_clocks(msm_host, 150000);
+-		u32 cs_end = dsi_read(msm_host, DSI_6G_CLK_STATUS);
+-
+-		if (st_end == DSI_LINK_CLK_STALLED)
+-			pr_err("%s: after video enable link STALLED (clk_status=%08x, lane=%08x)\n",
+-			       __func__, cs_end, dsi_read(msm_host, 0x0a8));
+-		else
+-			pr_info("%s: after video enable state=%s (clk_status=%08x, lane=%08x)\n",
+-				__func__, st_end == DSI_LINK_CLK_OK ? "ok" : "unreadable",
+-				cs_end, dsi_read(msm_host, 0x0a8));
+-	}
+-
+ 	msm_host->power_on = true;
+ 	mutex_unlock(&msm_host->dev_mutex);
+ 
+--- a/drivers/gpu/drm/msm/dsi/dsi_manager.c
++++ b/drivers/gpu/drm/msm/dsi/dsi_manager.c
+@@ -275,8 +275,6 @@
+ 	dsi_mgr_phy_disable(id);
+ }
+ 
+-static bool dsi_tpg;
+-module_param(dsi_tpg, bool, 0600);
+ 
+ static void dsi_mgr_bridge_pre_enable(struct drm_bridge *bridge)
+ {
+@@ -313,11 +311,6 @@
+ 		}
+ 	}
+ 
+-	if (dsi_tpg) {	/* DSIDBG: DSI-internal test pattern, bypasses the DPU */
+-		pr_info("DSIDBG enabling DSI test pattern\n");
+-		msm_dsi_manager_tpg_enable();
+-	}
+-
+ 	return;
+ 
+ host1_en_fail:
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_core_perf.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_core_perf.c
+@@ -284,9 +284,6 @@
+ 
+ static u64 _dpu_core_perf_get_core_clk_rate(struct dpu_kms *kms)
+ {
+-	if (1)	/* DSIDBG: force max core clock */
+-		return kms->perf.max_core_clk_rate;
+-
+ 	u64 clk_rate;
+ 	struct drm_crtc *crtc;
+ 	struct dpu_crtc_state *dpu_cstate;
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.c
+@@ -278,7 +278,6 @@
+ {
+ 	struct dpu_hw_blk_reg_map *c = &intf->hw;
+ 	/* Note: Display interface select is handled in top block hw layer */
+-	pr_info("DSIDBG intf%d timing engine %d\n", intf->idx - INTF_0, enable);	/* DSIDBG */
+ 	DPU_REG_WRITE(c, INTF_TIMING_ENGINE_EN, enable != 0);
+ }
+ 

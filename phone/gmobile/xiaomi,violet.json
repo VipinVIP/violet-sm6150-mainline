@@ -1,0 +1,11 @@
+{
+  "name": "Xiaomi Redmi Note 7 Pro",
+  "x-res": 1080,
+  "y-res": 2340,
+  "cutouts": [
+    {
+      "name": "notch",
+      "path": "M 480 0 L 480 80 L 600 80 L 600 0 Z"
+    }
+  ]
+}

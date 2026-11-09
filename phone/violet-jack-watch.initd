@@ -1,0 +1,13 @@
+#!/sbin/openrc-run
+name="violet jack watcher"
+description="Follow the 3.5 mm jack and switch the PulseAudio card profile"
+
+command="/usr/local/sbin/violet-jack-watch-run"
+command_background="yes"
+pidfile="/run/${RC_SVCNAME}.pid"
+output_log="/var/log/violet-jack-watch.log"
+error_log="/var/log/violet-jack-watch.log"
+
+depend() {
+	after pulseaudio
+}

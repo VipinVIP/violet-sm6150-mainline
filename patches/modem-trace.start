@@ -1,0 +1,19 @@
+#!/bin/sh
+# Diagnostic (not a fix): log which QRTR services exist, and rmtfs/tqftpserv/pd-mapper state, once a second for
+# 130 s after boot, to see what is missing when the modem's first start dies with "fatal error without message".
+case "$(uname -r)" in *sm6150*) ;; *) exit 0 ;; esac
+(
+L=/var/log/modem-trace.log
+: > $L
+i=0
+while [ $i -lt 130 ]; do
+	up=$(cut -d' ' -f1 /proc/uptime)
+	rp=""
+	for d in /sys/class/remoteproc/remoteproc*; do [ "$(cat $d/name 2>/dev/null)" = modem ] && rp=$(cat $d/state); done
+	svc=$(timeout 2 qrtr-lookup 2>/dev/null | awk 'NR>1{print $1"@"$4}' | sort -u | tr '\n' ' ')
+	n=$(echo "$svc" | wc -w)
+	echo "$up modem=$rp rmtfs=$(pgrep -x rmtfs | head -1) tftp=$(pgrep -x tqftpserv | head -1) nsvc=$n has14n1=$(echo $svc | grep -c ' 14@1\|^14@1') has4096n1=$(echo $svc | grep -c '4096@1')" >> $L
+	i=$((i + 1)); sleep 1
+done
+) >/dev/null 2>&1 &
+exit 0

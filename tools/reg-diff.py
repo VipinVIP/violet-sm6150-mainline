@@ -34,8 +34,8 @@ def parse(path, mainline=False):
         rails[name] = (u, int(m.group(1)))
     return rails
 
-r10 = parse('$PROJECT/reg-r10.txt')
-ml  = parse('$PROJECT/reg-mainline2.txt', mainline=True)
+r10 = parse('/home/vipi/violet-mainline/reg-r10.txt')
+ml  = parse('/home/vipi/violet-mainline/reg-mainline2.txt', mainline=True)
 
 print("r10 rails:", len(r10), " mainline rails:", len(ml))
 
